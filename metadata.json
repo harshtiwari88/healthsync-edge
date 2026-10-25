@@ -1,0 +1,6 @@
+{
+  "name": "SwasthyaSetu — ASHA Field Triage & District 24 Command",
+  "description": "Offline-first rural tele-triage PWA for ASHA frontline health workers in India with live District 24 Hospital Command Center analytics and emergency SMS dispatch.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
