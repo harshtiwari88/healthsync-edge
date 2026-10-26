@@ -1,36 +1,60 @@
-import React, {useState} from 'react';
+import React, {useState, useEffect} from 'react';
 import {motion, AnimatePresence} from 'motion/react';
 import {
   X,
   Binary,
   CheckCircle2,
+  AlertTriangle,
   Copy,
   ShieldCheck,
-  Cpu,
   Activity,
+  FlaskConical,
 } from 'lucide-react';
-import {TriageRecord, unpackSmsToFhirJson} from '../types/triage';
+import {TriageRecord} from '../types/triage';
+import {
+  buildFhirBundleFromDecoded,
+  decodeSMSPayload,
+} from '../utils/binarySmsCodec';
 
 interface BinarySmsDecoderDrawerProps {
   record: TriageRecord | null;
+  isOpen: boolean;
+  initialPayload?: string;
   mode: 'decode' | 'vitals';
   onClose: () => void;
 }
 
 export const BinarySmsDecoderDrawer: React.FC<BinarySmsDecoderDrawerProps> = ({
   record,
+  isOpen,
+  initialPayload,
   mode,
   onClose,
 }) => {
+  const [testPayloadInput, setTestPayloadInput] = useState<string>('');
   const [copied, setCopied] = useState(false);
 
-  if (!record) return null;
+  useEffect(() => {
+    if (initialPayload) {
+      setTestPayloadInput(initialPayload);
+    } else if (record?.binarySmsPayload) {
+      setTestPayloadInput(record.binarySmsPayload);
+    }
+  }, [initialPayload, record]);
 
-  const {packedTelemetry, fhirBundle} = unpackSmsToFhirJson(record);
-  const fhirJsonString = JSON.stringify(fhirBundle, null, 2);
+  if (!isOpen) return null;
 
-  const handleCopyJson = () => {
-    navigator.clipboard?.writeText(fhirJsonString);
+  const decoded = decodeSMSPayload(testPayloadInput);
+  const fhirBundle = buildFhirBundleFromDecoded(decoded, {
+    patientName: record?.patientName,
+    abhaId: record?.abhaId,
+    age: record?.age,
+    gender: record?.gender,
+  });
+  const fhirJson = JSON.stringify(fhirBundle, null, 2);
+
+  const handleCopy = () => {
+    navigator.clipboard?.writeText(fhirJson);
     setCopied(true);
     setTimeout(() => setCopied(false), 1800);
   };
@@ -38,41 +62,39 @@ export const BinarySmsDecoderDrawer: React.FC<BinarySmsDecoderDrawerProps> = ({
   return (
     <AnimatePresence>
       <div
-        className="fixed inset-0 z-50 flex justify-end bg-slate-900/55 backdrop-blur-xs"
+        className="fixed inset-0 z-50 flex justify-end bg-slate-900/60 backdrop-blur-xs"
         role="dialog"
         aria-modal="true"
-        aria-labelledby="decoder-drawer-title"
+        aria-labelledby="sms-decoder-drawer-heading"
       >
         <motion.aside
           initial={{x: '100%'}}
           animate={{x: 0}}
           exit={{x: '100%'}}
-          transition={{duration: 0.2, ease: [0.16, 1, 0.3, 1]}}
+          transition={{type: 'spring', stiffness: 320, damping: 32}}
           className="w-full max-w-xl bg-white h-full shadow-2xl border-l border-slate-200 flex flex-col"
         >
           {/* Drawer Header */}
-          <div className="px-6 py-4 bg-slate-900 text-white flex items-center justify-between gap-3">
+          <div className="px-6 py-4 bg-[#0F172A] text-white flex items-center justify-between gap-3">
             <div className="flex items-center gap-3 min-w-0">
-              <div className="w-10 h-10 rounded-xl bg-[#0F766E] flex items-center justify-center shrink-0">
+              <div className="w-10 h-10 rounded-xl bg-[#0D9488] flex items-center justify-center shrink-0">
                 {mode === 'decode' ? (
-                  <Binary className="w-5 h-5 text-emerald-200" />
+                  <Binary className="w-5 h-5 text-white" />
                 ) : (
-                  <Activity className="w-5 h-5 text-emerald-200" />
+                  <Activity className="w-5 h-5 text-white" />
                 )}
               </div>
               <div className="min-w-0">
-                <h2 id="decoder-drawer-title" className="text-base font-bold truncate">
+                <h2 id="sms-decoder-drawer-heading" className="text-base font-bold truncate">
                   {mode === 'decode'
-                    ? 'Baseband Binary SMS → FHIR Decoder'
-                    : `Patient Vitals & Edge-AI Payload · ${record.patientId}`}
+                    ? 'Bitwise Base64 Binary SMS Decoder'
+                    : `Clinical Vitals & Telemetry · ${record?.patientId ?? decoded.patientId}`}
                 </h2>
                 <p className="text-xs text-slate-300 truncate">
-                  {record.patientName} ({record.age}
-                  {record.gender}) · {record.villageCode} · ABHA {record.abhaId}
+                  Pure JavaScript DataView + CRC-16-CCITT Reverse Unpacker
                 </p>
               </div>
             </div>
-
             <button
               type="button"
               onClick={onClose}
@@ -83,186 +105,171 @@ export const BinarySmsDecoderDrawer: React.FC<BinarySmsDecoderDrawerProps> = ({
             </button>
           </div>
 
-          {/* Drawer Body */}
           <div className="flex-1 overflow-y-auto p-6 space-y-6">
-            {/* Clinical Vitals & Edge-AI Summary */}
-            <section className="space-y-3">
+            {/* Live Interactive SMS Payload Decoder Input */}
+            <section className="space-y-2.5">
               <div className="flex items-center justify-between">
-                <h3 className="text-xs font-bold text-slate-500">
-                  Clinical Snapshot &amp; Edge-AI Flags
-                </h3>
-                <span
-                  className={`text-xs font-bold ${
-                    record.severity === 'emergency'
-                      ? 'text-[#EF4444]'
-                      : record.severity === 'moderate'
-                      ? 'text-[#F59E0B]'
-                      : 'text-[#10B981]'
+                <label
+                  htmlFor="live-sms-decoder-input"
+                  className="text-xs font-bold text-slate-900 inline-flex items-center gap-1.5"
+                >
+                  <FlaskConical className="w-4 h-4 text-[#0D9488]" />
+                  <span>Paste or Edit `HS#` SMS Payload to Test Real-Time Bit Unpacking:</span>
+                </label>
+                <span className="font-mono text-[11px] text-slate-500 tabular-nums">
+                  {testPayloadInput.length} chars
+                </span>
+              </div>
+
+              <input
+                id="live-sms-decoder-input"
+                type="text"
+                value={testPayloadInput}
+                onChange={(e) => setTestPayloadInput(e.target.value)}
+                placeholder="HS#..."
+                className="w-full min-h-[48px] px-4 rounded-xl bg-slate-950 text-[#06B6D4] font-mono text-sm border border-slate-800"
+              />
+
+              {decoded.valid ? (
+                <div
+                  className={`rounded-xl px-3.5 py-2.5 text-xs font-bold flex items-center justify-between ${
+                    decoded.crcValid
+                      ? 'bg-emerald-50 border border-emerald-200 text-emerald-900'
+                      : 'bg-red-50 border border-red-300 text-red-900'
                   }`}
                 >
-                  {record.severity === 'emergency'
-                    ? 'RED · CRITICAL EMERGENCY'
-                    : record.severity === 'moderate'
-                    ? 'YELLOW · MODERATE RISK'
-                    : 'GREEN · ROUTINE'}
-                </span>
-              </div>
-
-              <div className="grid grid-cols-4 gap-2.5 text-center font-mono tabular-nums">
-                <div className="rounded-2xl bg-slate-50 border border-slate-200 p-3">
-                  <span className="block text-[11px] font-sans text-slate-500">BP (mmHg)</span>
-                  <span className="text-sm font-bold text-slate-900">
-                    {record.vitals.systolic}/{record.vitals.diastolic}
+                  <span className="inline-flex items-center gap-1.5">
+                    {decoded.crcValid ? (
+                      <ShieldCheck className="w-4 h-4 text-[#10B981]" />
+                    ) : (
+                      <AlertTriangle className="w-4 h-4 text-[#EF4444]" />
+                    )}
+                    {decoded.crcValid
+                      ? '18-Byte Binary Frame & CRC-16 Checksum Verified'
+                      : decoded.error}
+                  </span>
+                  <span className="font-mono tabular-nums">
+                    CRC {decoded.receivedCrcHex}
                   </span>
                 </div>
-                <div className="rounded-2xl bg-slate-50 border border-slate-200 p-3">
-                  <span className="block text-[11px] font-sans text-slate-500">SpO₂</span>
-                  <span className="text-sm font-bold text-slate-900">{record.vitals.spo2}%</span>
+              ) : (
+                <div className="rounded-xl px-3.5 py-2.5 text-xs font-bold bg-red-50 border border-red-300 text-red-900">
+                  {decoded.error}
                 </div>
-                <div className="rounded-2xl bg-slate-50 border border-slate-200 p-3">
-                  <span className="block text-[11px] font-sans text-slate-500">Temp</span>
-                  <span className="text-sm font-bold text-slate-900">
-                    {record.vitals.temperature.toFixed(1)}°F
-                  </span>
-                </div>
-                <div className="rounded-2xl bg-slate-50 border border-slate-200 p-3">
-                  <span className="block text-[11px] font-sans text-slate-500">Channel</span>
-                  <span className="text-xs font-bold text-[#0F766E]">{record.channel}</span>
-                </div>
-              </div>
+              )}
+            </section>
 
-              <div className="rounded-2xl bg-slate-50 border border-slate-200 p-4 space-y-2 text-xs text-slate-700">
-                <div>
-                  <span className="font-bold text-slate-900">Symptoms: </span>
-                  {record.symptoms.length > 0 ? record.symptoms.join(' · ') : 'None flagged'}
-                </div>
-                <div className="flex flex-wrap items-center gap-3">
-                  <span className="inline-flex items-center gap-1.5 font-semibold">
-                    <Cpu className="w-3.5 h-3.5 text-[#0F766E]" />
-                    Conjunctiva Anemia:{' '}
-                    <strong
-                      className={
-                        record.edgeAi?.anemiaSuspected ? 'text-[#EF4444]' : 'text-slate-600'
-                      }
+            {/* Decoded Numerical Vitals Output */}
+            {decoded.valid && (
+              <>
+                <section className="space-y-3">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-xs font-bold text-slate-700">
+                      Decoded Numerical Vitals &amp; Identifiers
+                    </h3>
+                    <span
+                      className={`text-xs font-bold ${
+                        decoded.severity === 'emergency'
+                          ? 'text-[#EF4444]'
+                          : decoded.severity === 'moderate'
+                          ? 'text-[#F59E0B]'
+                          : 'text-[#10B981]'
+                      }`}
                     >
-                      {record.edgeAi?.anemiaSuspected
-                        ? `Suspected Severe (Hb ${record.edgeAi.estimatedHb ?? 7.4} g/dL)`
-                        : 'Not Flagged'}
-                    </strong>
-                  </span>
-                  <span>·</span>
-                  <span className="font-semibold">
-                    Cough Acoustic AI:{' '}
-                    <strong
-                      className={
-                        record.edgeAi?.respiratoryRiskHigh ? 'text-[#EF4444]' : 'text-slate-600'
-                      }
+                      {decoded.severity.toUpperCase()}
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-5 gap-2 text-center font-mono tabular-nums">
+                    <div className="rounded-2xl bg-slate-50 border border-slate-200 p-2.5">
+                      <span className="block text-[10px] font-sans text-slate-500">BP</span>
+                      <strong className="text-xs text-slate-900">
+                        {decoded.vitals.systolic}/{decoded.vitals.diastolic}
+                      </strong>
+                    </div>
+                    <div className="rounded-2xl bg-slate-50 border border-slate-200 p-2.5">
+                      <span className="block text-[10px] font-sans text-slate-500">SpO₂</span>
+                      <strong className="text-xs text-slate-900">{decoded.vitals.spo2}%</strong>
+                    </div>
+                    <div className="rounded-2xl bg-slate-50 border border-slate-200 p-2.5">
+                      <span className="block text-[10px] font-sans text-slate-500">Temp</span>
+                      <strong className="text-xs text-slate-900">
+                        {decoded.vitals.temperature.toFixed(1)}°F
+                      </strong>
+                    </div>
+                    <div className="rounded-2xl bg-slate-50 border border-slate-200 p-2.5">
+                      <span className="block text-[10px] font-sans text-slate-500">HR</span>
+                      <strong className="text-xs text-slate-900">
+                        {decoded.vitals.heartRate} bpm
+                      </strong>
+                    </div>
+                    <div className="rounded-2xl bg-slate-50 border border-slate-200 p-2.5">
+                      <span className="block text-[10px] font-sans text-slate-500">Node</span>
+                      <strong className="text-xs text-[#0D9488]">{decoded.villageCode}</strong>
+                    </div>
+                  </div>
+
+                  {/* Bitwise Breakdown */}
+                  <div className="rounded-2xl border border-slate-200 overflow-hidden text-xs">
+                    <div className="bg-slate-50 px-4 py-2 border-b border-slate-200 font-mono text-[11px] text-slate-600">
+                      Hex Dump ({decoded.byteLength}B): {decoded.hexDump}
+                    </div>
+                    <div className="divide-y divide-slate-100">
+                      <div className="px-4 py-2 flex justify-between">
+                        <span className="text-slate-600">Patient &amp; Sub-Center IDs</span>
+                        <span className="font-mono font-semibold text-slate-900">
+                          {decoded.patientId} · {decoded.villageCode}
+                        </span>
+                      </div>
+                      <div className="px-4 py-2 flex justify-between">
+                        <span className="text-slate-600">Unpacked Symptoms (6-bit mask)</span>
+                        <span className="font-mono font-semibold text-slate-900">
+                          0b{decoded.symptomBitmask.toString(2).padStart(6, '0')} →{' '}
+                          {decoded.symptoms.join(', ') || 'None'}
+                        </span>
+                      </div>
+                      <div className="px-4 py-2 flex justify-between">
+                        <span className="text-slate-600">Edge-AI Flags (2-bit mask)</span>
+                        <span className="font-mono font-semibold text-[#0D9488]">
+                          Pallor: {decoded.anemiaSuspected ? 'YES' : 'NO'} · Resp:{' '}
+                          {decoded.respiratoryRiskHigh ? 'HIGH' : 'NORM'}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                </section>
+
+                {/* FHIR JSON Output */}
+                <section className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-xs font-bold text-slate-900">
+                      ABDM HL7 FHIR R4 Observation Bundle
+                    </h3>
+                    <button
+                      type="button"
+                      onClick={handleCopy}
+                      className="min-h-[34px] px-3 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-xs font-semibold text-slate-800 inline-flex items-center gap-1.5 cursor-pointer"
                     >
-                      {record.edgeAi?.respiratoryRiskHigh
-                        ? `High Respiratory Risk (${record.edgeAi.coughPeakHz ?? 880} Hz)`
-                        : 'Normal'}
-                    </strong>
-                  </span>
-                </div>
-                <p className="text-slate-600 pt-1 border-t border-slate-200">
-                  {record.clinicalNotes}
-                </p>
-              </div>
-            </section>
-
-            {/* Step 1: Raw 160-Character Baseband Binary SMS Wire Frame */}
-            <section className="space-y-2.5">
-              <div className="flex items-center justify-between">
-                <h3 className="text-xs font-bold text-slate-900">
-                  1. Incoming 160-Char GSM 7-Bit / Base64 SMS Wire Frame
-                </h3>
-                <span className="font-mono text-xs text-emerald-700 font-bold inline-flex items-center gap-1 tabular-nums">
-                  <ShieldCheck className="w-3.5 h-3.5 text-[#10B981]" />
-                  {record.binarySmsPayload.length}/160 chars · CRC Verified
-                </span>
-              </div>
-
-              <div className="rounded-2xl bg-slate-900 text-emerald-300 font-mono text-xs p-4 break-all leading-relaxed border border-slate-800">
-                {record.binarySmsPayload}
-              </div>
-            </section>
-
-            {/* Step 2: Bit-Packed Byte Unpacking Matrix */}
-            <section className="space-y-2.5">
-              <h3 className="text-xs font-bold text-slate-900">
-                2. Bit-Packed Base64 Frame Unpacking ({packedTelemetry.base64})
-              </h3>
-              <div className="rounded-2xl border border-slate-200 overflow-hidden text-xs">
-                <div className="bg-slate-50 px-4 py-2 border-b border-slate-200 font-mono text-[11px] text-slate-600 flex items-center justify-between">
-                  <span>Raw Hex Bytes: {packedTelemetry.hexBytes}</span>
-                  <span>8-Byte Binary Payload</span>
-                </div>
-                <div className="divide-y divide-slate-100">
-                  <div className="px-4 py-2.5 flex justify-between">
-                    <span className="text-slate-600">Bytes [0..1] Magic Header</span>
-                    <span className="font-mono font-semibold text-slate-900">
-                      0x48 0x53 (&quot;HS&quot; HealthSync v1)
-                    </span>
+                      {copied ? (
+                        <>
+                          <CheckCircle2 className="w-3.5 h-3.5 text-[#10B981]" />
+                          <span>Copied</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-3.5 h-3.5 text-slate-600" />
+                          <span>Copy JSON</span>
+                        </>
+                      )}
+                    </button>
                   </div>
-                  <div className="px-4 py-2.5 flex justify-between">
-                    <span className="text-slate-600">Bytes [2..3] Blood Pressure</span>
-                    <span className="font-mono font-semibold text-slate-900 tabular-nums">
-                      Sys {record.vitals.systolic} / Dia {record.vitals.diastolic} mmHg
-                    </span>
-                  </div>
-                  <div className="px-4 py-2.5 flex justify-between">
-                    <span className="text-slate-600">Bytes [4..5] SpO₂ &amp; Temp Offset</span>
-                    <span className="font-mono font-semibold text-slate-900 tabular-nums">
-                      {record.vitals.spo2}% · {record.vitals.temperature.toFixed(1)}°F
-                    </span>
-                  </div>
-                  <div className="px-4 py-2.5 flex justify-between">
-                    <span className="text-slate-600">Byte [6] Symptom Bitmask (5-bit)</span>
-                    <span className="font-mono font-semibold text-slate-900 tabular-nums">
-                      0b{packedTelemetry.symptomMask.toString(2).padStart(5, '0')} (
-                      {record.symptoms.length} active)
-                    </span>
-                  </div>
-                  <div className="px-4 py-2.5 flex justify-between">
-                    <span className="text-slate-600">Byte [7] Triage Tier + Edge-AI Flags</span>
-                    <span className="font-mono font-semibold text-[#0F766E] tabular-nums">
-                      AI Mask 0b{packedTelemetry.aiMask.toString(2).padStart(2, '0')} ·{' '}
-                      {record.severity.toUpperCase()}
-                    </span>
-                  </div>
-                </div>
-              </div>
-            </section>
 
-            {/* Step 3: Unpacked Server-Side HL7 FHIR R4 / ABDM JSON */}
-            <section className="space-y-2.5">
-              <div className="flex items-center justify-between">
-                <h3 className="text-xs font-bold text-slate-900">
-                  3. Reconstructed Server-Side ABDM HL7 FHIR R4 Bundle
-                </h3>
-                <button
-                  type="button"
-                  onClick={handleCopyJson}
-                  className="min-h-[34px] px-3 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-xs font-semibold text-slate-800 inline-flex items-center gap-1.5 cursor-pointer"
-                >
-                  {copied ? (
-                    <>
-                      <CheckCircle2 className="w-3.5 h-3.5 text-[#10B981]" />
-                      <span>Copied JSON</span>
-                    </>
-                  ) : (
-                    <>
-                      <Copy className="w-3.5 h-3.5 text-slate-600" />
-                      <span>Copy FHIR JSON</span>
-                    </>
-                  )}
-                </button>
-              </div>
-
-              <pre className="rounded-2xl bg-slate-950 text-slate-100 font-mono text-[11px] p-4 overflow-x-auto leading-relaxed border border-slate-800 max-h-72">
-                {fhirJsonString}
-              </pre>
-            </section>
+                  <pre className="rounded-2xl bg-slate-950 text-slate-100 font-mono text-[11px] p-4 overflow-x-auto leading-relaxed border border-slate-800 max-h-64">
+                    {fhirJson}
+                  </pre>
+                </section>
+              </>
+            )}
           </div>
         </motion.aside>
       </div>

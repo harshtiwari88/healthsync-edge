@@ -12,17 +12,19 @@ export type AmbulanceDispatchStatus = 'Unassigned' | 'Dispatched';
 
 export type SymptomKey =
   | 'Fever'
+  | 'High BP'
+  | 'Severe Chest Pain'
+  | 'Dizziness'
   | 'Cough'
-  | 'Difficulty Breathing'
-  | 'Chest Pain'
-  | 'Dizziness';
+  | 'Bleeding';
 
 export const ALL_SYMPTOMS: SymptomKey[] = [
   'Fever',
-  'Cough',
-  'Difficulty Breathing',
-  'Chest Pain',
+  'High BP',
+  'Severe Chest Pain',
   'Dizziness',
+  'Cough',
+  'Bleeding',
 ];
 
 export interface VitalsSnapshot {
@@ -30,13 +32,35 @@ export interface VitalsSnapshot {
   diastolic: number;
   spo2: number;
   temperature: number;
+  heartRate: number;
+}
+
+export interface ConjunctivaPixelMetrics {
+  avgR: number;
+  avgG: number;
+  avgB: number;
+  redGreenBlueRatio: number;
+  erythemaIndex: number;
+  estimatedHb: number;
+  pallorDetected: boolean;
+  diagnosticLabel: string;
+  capturedDataUrl?: string;
+}
+
+export interface CoughAudioMetrics {
+  dominantFrequencyHz: number;
+  rmsIntensity: number;
+  highRespiratoryRisk: boolean;
+  diagnosticLabel: string;
 }
 
 export interface EdgeAiDiagnostics {
   anemiaSuspected: boolean;
   estimatedHb?: number;
+  conjunctivaMetrics?: ConjunctivaPixelMetrics;
   respiratoryRiskHigh: boolean;
   coughPeakHz?: number;
+  coughMetrics?: CoughAudioMetrics;
 }
 
 export interface TriageRecord {
@@ -90,7 +114,8 @@ export interface TriageEvaluation {
   severity: SeverityLevel;
   scoreCode: 'TR1' | 'TR2' | 'TR3';
   triggers: string[];
-  protocol: string;
+  protocolEn: string;
+  protocolHi: string;
 }
 
 export function evaluateVitalStatus(
@@ -114,6 +139,10 @@ export function evaluateVitalStatus(
       if (value >= 103.0 || value < 95.0) return 'emergency';
       if (value > 100.0) return 'moderate';
       return 'routine';
+    case 'heartRate':
+      if (value >= 130 || value < 45) return 'emergency';
+      if (value > 100 || value < 55) return 'moderate';
+      return 'routine';
   }
 }
 
@@ -125,47 +154,54 @@ export function evaluateTriage(
   const redReasons: string[] = [];
   const yellowReasons: string[] = [];
 
-  // RED (CRITICAL EMERGENCY): BP >= 160 (or > 160) or SpO2 < 90% or Chest Pain
   if (vitals.systolic >= 160 || vitals.systolic < 80) {
     redReasons.push(`Critical Systolic BP (${vitals.systolic}/${vitals.diastolic} mmHg)`);
   }
   if (vitals.diastolic >= 105) {
-    redReasons.push(`Hypertensive Emergency Diastolic (${vitals.diastolic} mmHg)`);
+    redReasons.push(`Critical Diastolic BP (${vitals.diastolic} mmHg)`);
   }
   if (vitals.spo2 < 90) {
     redReasons.push(`Severe Hypoxia (SpO₂ ${vitals.spo2}% < 90%)`);
   }
-  if (symptoms.includes('Chest Pain')) {
-    redReasons.push('Acute Chest Pain Flagged');
+  if (vitals.heartRate >= 130 || vitals.heartRate < 45) {
+    redReasons.push(`Critical Heart Rate (${vitals.heartRate} BPM)`);
+  }
+  if (symptoms.includes('Severe Chest Pain')) {
+    redReasons.push('Severe Chest Pain Reported');
+  }
+  if (symptoms.includes('Bleeding')) {
+    redReasons.push('Active Hemorrhage / Bleeding Flagged');
   }
 
-  // YELLOW (Moderate Risk): BP > 130 or Temp > 100°F or Moderate SpO2 / Symptoms / Edge-AI
   if (vitals.systolic > 130 && vitals.systolic < 160) {
-    yellowReasons.push(`Elevated BP (${vitals.systolic}/${vitals.diastolic} mmHg > 130)`);
+    yellowReasons.push(`Elevated BP (${vitals.systolic}/${vitals.diastolic} mmHg)`);
   } else if (vitals.diastolic >= 90 && vitals.diastolic < 105 && vitals.systolic <= 130) {
     yellowReasons.push(`Elevated Diastolic BP (${vitals.diastolic} mmHg)`);
   }
-
   if (vitals.temperature > 100.0) {
-    yellowReasons.push(`Pyrexia / Fever (${vitals.temperature.toFixed(1)}°F > 100°F)`);
+    yellowReasons.push(`Fever (${vitals.temperature.toFixed(1)}°F > 100°F)`);
   }
-
   if (vitals.spo2 >= 90 && vitals.spo2 <= 94) {
     yellowReasons.push(`Borderline SpO₂ (${vitals.spo2}%)`);
   }
-
-  if (symptoms.includes('Difficulty Breathing')) {
-    yellowReasons.push('Dyspnea / Difficulty Breathing');
+  if (vitals.heartRate > 100 && vitals.heartRate < 130) {
+    yellowReasons.push(`Tachycardia (${vitals.heartRate} BPM)`);
   }
-
+  if (symptoms.includes('High BP') && vitals.systolic <= 130) {
+    yellowReasons.push('History / Symptom of High BP');
+  }
+  if (symptoms.includes('Dizziness')) {
+    yellowReasons.push('Dizziness / Syncope Warning');
+  }
   if (edgeAi?.anemiaSuspected) {
     yellowReasons.push(
-      `Edge-AI: Suspected Severe Anemia (Hb ${edgeAi.estimatedHb ?? 7.4} g/dL)`
+      `Camera Pallor Detected (Est. Hb ${edgeAi.estimatedHb?.toFixed(1) ?? '< 8.5'} g/dL)`
     );
   }
-
   if (edgeAi?.respiratoryRiskHigh) {
-    yellowReasons.push('Edge-AI: High Respiratory Risk Acoustic Signature');
+    yellowReasons.push(
+      `Cough Spectral Risk (${edgeAi.coughPeakHz ?? 890} Hz Bronchial Signature)`
+    );
   }
 
   if (redReasons.length > 0) {
@@ -173,8 +209,10 @@ export function evaluateTriage(
       severity: 'emergency',
       scoreCode: 'TR3',
       triggers: [...redReasons, ...yellowReasons],
-      protocol:
-        'CRITICAL EMERGENCY: Transmit Encrypted Baseband SMS immediately, position patient semi-upright, and dispatch 108 ALS Ambulance.',
+      protocolEn:
+        'CRITICAL RED ALERT: Position patient semi-upright, keep airway clear, transmit Encrypted Baseband SMS immediately, and prepare for 108 Ambulance.',
+      protocolHi:
+        'सावधान दीदी! यह गंभीर रेड इमरजेंसी है। मरीज़ को सहारा देकर बिठाएं, तुरंत एन्क्रिप्टेड इमरजेंसी एसएमएस भेजें और 108 एम्बुलेंस बुलाएं।',
     };
   }
 
@@ -183,174 +221,20 @@ export function evaluateTriage(
       severity: 'moderate',
       scoreCode: 'TR2',
       triggers: yellowReasons,
-      protocol:
-        'MODERATE RISK: Queue PHC Medical Officer tele-triage review today and repeat vitals check in 2 hours.',
+      protocolEn:
+        'MODERATE RISK: Schedule same-day PHC Medical Officer tele-consultation and re-verify vitals within 2 hours.',
+      protocolHi:
+        'मध्यम जोखिम: आज ही पीएचसी डॉक्टर से टेली-परामर्श कराएं और दो घंटे में दोबारा जांच करें।',
     };
   }
 
   return {
     severity: 'routine',
     scoreCode: 'TR1',
-    triggers: ['All physiological vitals & Edge-AI checks within normal limits'],
-    protocol:
-      'ROUTINE: Save to ABDM longitudinal health record and schedule standard monthly community follow-up.',
-  };
-}
-
-export function computeCrcHex(input: string): string {
-  let hash = 0x92a1;
-  for (let i = 0; i < input.length; i++) {
-    hash = ((hash << 5) - hash + input.charCodeAt(i)) & 0xffff;
-  }
-  return `x${hash.toString(16).padStart(3, '0').slice(-3)}`;
-}
-
-export function encodeBitPackedBase64(
-  vitals: VitalsSnapshot,
-  symptoms: SymptomKey[],
-  edgeAi?: EdgeAiDiagnostics,
-  severity?: SeverityLevel
-): {base64: string; hexBytes: string; symptomMask: number; aiMask: number} {
-  let symMask = 0;
-  ALL_SYMPTOMS.forEach((sym, i) => {
-    if (symptoms.includes(sym)) symMask |= 1 << i;
-  });
-
-  let aiMask = 0;
-  if (edgeAi?.anemiaSuspected) aiMask |= 1;
-  if (edgeAi?.respiratoryRiskHigh) aiMask |= 2;
-
-  const sevNum = severity === 'emergency' ? 3 : severity === 'moderate' ? 2 : 1;
-  const tempTenths = Math.min(255, Math.max(0, Math.round((vitals.temperature - 90) * 10)));
-
-  const bytes = [
-    0x48, // 'H'
-    0x53, // 'S'
-    Math.min(255, Math.max(0, Math.round(vitals.systolic))),
-    Math.min(255, Math.max(0, Math.round(vitals.diastolic))),
-    Math.min(100, Math.max(0, Math.round(vitals.spo2))),
-    tempTenths,
-    symMask,
-    (sevNum << 4) | aiMask,
-  ];
-
-  const binStr = bytes.map((b) => String.fromCharCode(b)).join('');
-  const base64 = typeof btoa === 'function' ? btoa(binStr) : 'SFM999==';
-  const hexBytes = bytes.map((b) => b.toString(16).toUpperCase().padStart(2, '0')).join(' ');
-
-  return {base64, hexBytes, symptomMask: symMask, aiMask};
-}
-
-export function buildEncryptedEmergencySms(params: {
-  patientId: string;
-  villageCode: string;
-  vitals: VitalsSnapshot;
-  symptoms: SymptomKey[];
-  edgeAi?: EdgeAiDiagnostics;
-  severity: SeverityLevel;
-}): string {
-  const {patientId, villageCode, vitals, symptoms, edgeAi, severity} = params;
-  const cleanPt = patientId.replace(/[^A-Z0-9]/gi, '');
-  const cleanVil = villageCode.replace(/[^A-Z0-9]/gi, '');
-  const trCode = severity === 'emergency' ? 'TR3' : severity === 'moderate' ? 'TR2' : 'TR1';
-  const {base64} = encodeBitPackedBase64(vitals, symptoms, edgeAi, severity);
-  const core = `HS#${cleanPt}#${cleanVil}#BP${vitals.systolic}/${vitals.diastolic}#SPO2${vitals.spo2}#T${vitals.temperature.toFixed(
-    1
-  )}#${trCode}#B64:${base64}`;
-  const hash = computeCrcHex(core);
-  return `${core}#HASH${hash}`.slice(0, 160);
-}
-
-export function unpackSmsToFhirJson(record: TriageRecord) {
-  const packed = encodeBitPackedBase64(
-    record.vitals,
-    record.symptoms,
-    record.edgeAi,
-    record.severity
-  );
-
-  return {
-    packedTelemetry: packed,
-    fhirBundle: {
-      resourceType: 'Bundle',
-      id: `abdm-edge-${record.patientId.toLowerCase()}`,
-      type: 'transaction',
-      timestamp: new Date(record.createdAtMs).toISOString(),
-      meta: {
-        profile: ['https://nrces.in/ndhm/fhir/r4/StructureDefinition/DocumentBundle'],
-        tag: [
-          {
-            system: 'https://healthsync.edge/transport',
-            code: 'GSM-7BIT-BASE64-SMS',
-            display: 'Unpacked from 160-char Baseband Emergency SMS',
-          },
-        ],
-      },
-      entry: [
-        {
-          resource: {
-            resourceType: 'Patient',
-            id: record.patientId,
-            identifier: [
-              {
-                system: 'https://healthid.ndhm.gov.in',
-                value: record.abhaId,
-              },
-            ],
-            name: [{text: record.patientName}],
-            gender:
-              record.gender === 'F' ? 'female' : record.gender === 'M' ? 'male' : 'other',
-            age: record.age,
-            address: [{district: 'District 24', text: `${record.villageCode} - ${record.villageName}`}],
-          },
-        },
-        {
-          resource: {
-            resourceType: 'Observation',
-            status: 'final',
-            interpretation: [
-              {
-                coding: [
-                  {
-                    code:
-                      record.severity === 'emergency'
-                        ? 'CRIT'
-                        : record.severity === 'moderate'
-                        ? 'MOD'
-                        : 'NORM',
-                    display: record.severity.toUpperCase(),
-                  },
-                ],
-              },
-            ],
-            component: [
-              {
-                code: {coding: [{system: 'http://loinc.org', code: '8480-6', display: 'Systolic BP'}]},
-                valueQuantity: {value: record.vitals.systolic, unit: 'mmHg'},
-              },
-              {
-                code: {coding: [{system: 'http://loinc.org', code: '8462-4', display: 'Diastolic BP'}]},
-                valueQuantity: {value: record.vitals.diastolic, unit: 'mmHg'},
-              },
-              {
-                code: {coding: [{system: 'http://loinc.org', code: '2708-6', display: 'Oxygen saturation'}]},
-                valueQuantity: {value: record.vitals.spo2, unit: '%'},
-              },
-              {
-                code: {coding: [{system: 'http://loinc.org', code: '8310-5', display: 'Body temperature'}]},
-                valueQuantity: {value: record.vitals.temperature, unit: 'degF'},
-              },
-            ],
-            symptomsReported: record.symptoms,
-            edgeAiScreening: {
-              conjunctivaAnemiaFlag: Boolean(record.edgeAi?.anemiaSuspected),
-              estimatedHbGdL: record.edgeAi?.estimatedHb ?? null,
-              coughRespiratoryRiskFlag: Boolean(record.edgeAi?.respiratoryRiskHigh),
-              coughSpectralPeakHz: record.edgeAi?.coughPeakHz ?? null,
-            },
-          },
-        },
-      ],
-    },
+    triggers: ['All physiological vitals & camera/audio checks nominal'],
+    protocolEn:
+      'ROUTINE GREEN: Vitals within normal physiological baseline. Save to ABDM offline health record.',
+    protocolHi:
+      'सामान्य स्थिति: मरीज़ के सभी जीवन संकेत सामान्य हैं। रिकॉर्ड सुरक्षित करें।',
   };
 }
