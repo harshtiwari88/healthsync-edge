@@ -1,33 +1,37 @@
-import {useState, useEffect, useMemo} from 'react';
+import React, {useState, useEffect, useMemo} from 'react';
+import {motion, AnimatePresence} from 'motion/react';
 import {
-  Activity,
   AlertTriangle,
   Ambulance,
   CheckCircle2,
-  Clock,
   Cpu,
   Download,
   Eye,
-  Filter,
-  HeartPulse,
-  MapPin,
+  Layers,
+  Lock,
+  Play,
   Radio,
   RefreshCw,
-  Search,
-  ShieldCheck,
   Terminal,
   Volume2,
   VolumeX,
   X,
+  Copy,
+  Check,
 } from 'lucide-react';
 import {SeverityLevel, SyncChannel, TriageRecord} from '../types/triage';
 import {VILLAGE_SUB_CENTERS} from '../data/initialData';
-import {decodeSMSPayload} from '../utils/binarySmsCodec';
+import {
+  buildFhirBundleFromDecoded,
+  decodeSMSPayload,
+} from '../utils/binarySmsCodec';
+import {SystemHardwareTelemetry} from '../utils/deviceTelemetry';
 import {BinarySmsDecoderDrawer} from './BinarySmsDecoderDrawer';
 
 interface DistrictCommandDashboardProps {
   dmoEmail: string;
   records: TriageRecord[];
+  hardwareTelemetry: SystemHardwareTelemetry;
   activeEmergencyBanner: TriageRecord | null;
   isSirenRinging: boolean;
   onAcknowledgeEmergency: () => void;
@@ -36,29 +40,36 @@ interface DistrictCommandDashboardProps {
   onSyncOfflineQueue: () => number;
 }
 
-export function DistrictCommandDashboard({
+export const DistrictCommandDashboard: React.FC<DistrictCommandDashboardProps> = ({
   dmoEmail,
   records,
+  hardwareTelemetry,
   activeEmergencyBanner,
   isSirenRinging,
   onAcknowledgeEmergency,
   onTestSiren,
   onDispatchAmbulance,
   onSyncOfflineQueue,
-}: DistrictCommandDashboardProps) {
-  const [clockText, setClockText] = useState<string>('');
+}) => {
+  const [clockUtc, setClockUtc] = useState<string>('');
   const [selectedVillageCode, setSelectedVillageCode] = useState<string | null>(null);
-  const [searchQuery, setSearchQuery] = useState<string>('');
   const [severityFilter, setSeverityFilter] = useState<'ALL' | SeverityLevel>('ALL');
   const [channelFilter, setChannelFilter] = useState<'ALL' | SyncChannel>('ALL');
-  const [syncNotice, setSyncNotice] = useState<string | null>(null);
 
-  // Live "Paste SMS Payload to Test Decoder" state
-  const [pasteSmsInput, setPasteSmsInput] = useState<string>(
+  // Geospatial Tactical Map Layer Toggles
+  const [show4gCoverage, setShow4gCoverage] = useState<boolean>(true);
+  const [showBlackoutZones, setShowBlackoutZones] = useState<boolean>(true);
+  const [showSignalRelays, setShowSignalRelays] = useState<boolean>(true);
+
+  // Embedded Interactive SMS Binary Payload Decoder Console State
+  const [decoderInput, setDecoderInput] = useState<string>(
     () => records[0]?.binarySmsPayload ?? ''
   );
+  const [unpackStage, setUnpackStage] = useState<number>(4); // 0=idle, 1..4=step-by-step animation
+  const [isUnpacking, setIsUnpacking] = useState<boolean>(false);
+  const [copiedFhir, setCopiedFhir] = useState<boolean>(false);
 
-  // Drawer state for inspecting full binary unpack or ABDM FHIR vitals payload
+  // Side Drawer for Secondary Inspection
   const [drawerState, setDrawerState] = useState<{
     isOpen: boolean;
     record: TriageRecord | null;
@@ -71,900 +82,821 @@ export function DistrictCommandDashboard({
   });
 
   useEffect(() => {
-    const tick = () => {
-      const now = new Date();
-      setClockText(
-        now.toLocaleTimeString('en-IN', {
+    const updateClock = () => {
+      setClockUtc(
+        new Date().toLocaleTimeString('en-IN', {
           hour: '2-digit',
           minute: '2-digit',
           second: '2-digit',
-          hour12: true,
+          hour12: false,
         })
       );
     };
-    tick();
-    const id = window.setInterval(tick, 1000);
-    return () => window.clearInterval(id);
+    updateClock();
+    const t = window.setInterval(updateClock, 1000);
+    return () => window.clearInterval(t);
   }, []);
 
-  // Keep default test decoder input populated if empty when records arrive
   useEffect(() => {
-    if (!pasteSmsInput && records.length > 0) {
-      setPasteSmsInput(records[0].binarySmsPayload);
+    if (!decoderInput && records.length > 0) {
+      setDecoderInput(records[0].binarySmsPayload);
     }
-  }, [records, pasteSmsInput]);
+  }, [records, decoderInput]);
 
-  const inlineDecoded = useMemo(
-    () => (pasteSmsInput.trim() ? decodeSMSPayload(pasteSmsInput) : null),
-    [pasteSmsInput]
+  const decodedPacket = useMemo(
+    () => decodeSMSPayload(decoderInput),
+    [decoderInput]
   );
 
-  // Real-time KPI Metrics
-  const totalScreenings = records.length;
-  const pendingSyncs = records.filter((r) => r.syncStatus === 'Queued Offline').length;
-  const moderateYellowCount = records.filter((r) => r.severity === 'moderate').length;
-  const criticalRedRecords = records.filter((r) => r.severity === 'emergency');
-  const unassignedRedCount = criticalRedRecords.filter(
+  const matchedRecordForFhir = useMemo(
+    () =>
+      records.find(
+        (r) =>
+          r.binarySmsPayload === decoderInput.trim() ||
+          r.patientId === decodedPacket.patientId
+      ) ?? null,
+    [records, decoderInput, decodedPacket.patientId]
+  );
+
+  const fhirBundleJson = useMemo(() => {
+    if (!decodedPacket.valid) return '';
+    return JSON.stringify(
+      buildFhirBundleFromDecoded(decodedPacket, {
+        patientName: matchedRecordForFhir?.patientName,
+        abhaId: matchedRecordForFhir?.abhaId,
+        age: matchedRecordForFhir?.age,
+        gender: matchedRecordForFhir?.gender,
+      }),
+      null,
+      2
+    );
+  }, [decodedPacket, matchedRecordForFhir]);
+
+  const triggerStepByStepUnpack = (payloadToLoad?: string) => {
+    if (typeof payloadToLoad === 'string') {
+      setDecoderInput(payloadToLoad);
+    }
+    setIsUnpacking(true);
+    setUnpackStage(1);
+    window.setTimeout(() => setUnpackStage(2), 220);
+    window.setTimeout(() => setUnpackStage(3), 460);
+    window.setTimeout(() => {
+      setUnpackStage(4);
+      setIsUnpacking(false);
+    }, 720);
+  };
+
+  // Telemetry Counters
+  const smsGatewayCount = records.filter(
+    (r) => r.channel === 'Emergency SMS' || r.syncStatus === 'Queued Offline'
+  ).length;
+  const criticalRecords = records.filter((r) => r.severity === 'emergency');
+  const unassignedRedCount = criticalRecords.filter(
     (r) => r.dispatchStatus === 'Unassigned'
   ).length;
 
-  // Village Sub-Center aggregation for interactive SVG map
-  const villageStats = useMemo(() => {
-    return VILLAGE_SUB_CENTERS.map((village) => {
-      const vilRecords = records.filter((r) => r.villageCode === village.code);
-      const redCount = vilRecords.filter((r) => r.severity === 'emergency').length;
-      const openRedCount = vilRecords.filter(
+  // Geospatial Sub-Center Stats
+  const villageNodes = useMemo(() => {
+    return VILLAGE_SUB_CENTERS.map((v) => {
+      const list = records.filter((r) => r.villageCode === v.code);
+      const redOpen = list.filter(
         (r) => r.severity === 'emergency' && r.dispatchStatus === 'Unassigned'
       ).length;
-      const yellowCount = vilRecords.filter((r) => r.severity === 'moderate').length;
-
-      const highestRisk: SeverityLevel =
-        redCount > 0 ? 'emergency' : yellowCount > 0 ? 'moderate' : 'routine';
-
+      const redTotal = list.filter((r) => r.severity === 'emergency').length;
+      const yellowTotal = list.filter((r) => r.severity === 'moderate').length;
+      const risk: SeverityLevel =
+        redTotal > 0 ? 'emergency' : yellowTotal > 0 ? 'moderate' : 'routine';
       return {
-        ...village,
-        totalCases: vilRecords.length,
-        redCount,
-        openRedCount,
-        yellowCount,
-        highestRisk,
+        ...v,
+        totalCases: list.length,
+        redOpen,
+        redTotal,
+        yellowTotal,
+        risk,
       };
     });
   }, [records]);
 
-  const selectedVillageDetail = villageStats.find((v) => v.code === selectedVillageCode) || null;
-
-  // High-Priority Alert Feed sorted with Critical RED unassigned first
-  const priorityAlertFeed = useMemo(() => {
+  // Sorted Live Alert Feed (Critical Unassigned RED float to top)
+  const alertStream = useMemo(() => {
     return [...records]
-      .filter((r) =>
-        selectedVillageCode ? r.villageCode === selectedVillageCode : true
-      )
+      .filter((r) => {
+        if (selectedVillageCode && r.villageCode !== selectedVillageCode) return false;
+        if (severityFilter !== 'ALL' && r.severity !== severityFilter) return false;
+        if (channelFilter !== 'ALL' && r.channel !== channelFilter) return false;
+        return true;
+      })
       .sort((a, b) => {
-        const score = (rec: TriageRecord) => {
+        const rank = (rec: TriageRecord) => {
           if (rec.severity === 'emergency' && rec.dispatchStatus === 'Unassigned') return 4;
           if (rec.severity === 'emergency') return 3;
           if (rec.severity === 'moderate') return 2;
           return 1;
         };
-        const diff = score(b) - score(a);
-        if (diff !== 0) return diff;
-        return b.createdAtMs - a.createdAtMs;
+        const d = rank(b) - rank(a);
+        return d !== 0 ? d : b.createdAtMs - a.createdAtMs;
       });
-  }, [records, selectedVillageCode]);
+  }, [records, selectedVillageCode, severityFilter, channelFilter]);
 
-  // Longitudinal Registry Table filtering
-  const filteredTableRecords = useMemo(() => {
-    return records.filter((r) => {
-      if (selectedVillageCode && r.villageCode !== selectedVillageCode) return false;
-      if (severityFilter !== 'ALL' && r.severity !== severityFilter) return false;
-      if (channelFilter !== 'ALL' && r.channel !== channelFilter) return false;
-      if (searchQuery.trim() !== '') {
-        const q = searchQuery.toLowerCase();
-        const hay =
-          `${r.patientId} ${r.patientName} ${r.villageCode} ${r.villageName} ${r.abhaId} ${r.ashaWorker} ${r.binarySmsPayload}`.toLowerCase();
-        if (!hay.includes(q)) return false;
-      }
-      return true;
-    });
-  }, [records, selectedVillageCode, severityFilter, channelFilter, searchQuery]);
-
-  const handleManualSyncFlush = () => {
-    const flushed = onSyncOfflineQueue();
-    setSyncNotice(
-      flushed > 0
-        ? `Synchronized ${flushed} queued field record(s) into District 24 Registry`
-        : 'All sub-center queues are up to date (0 pending)'
-    );
-    window.setTimeout(() => setSyncNotice(null), 3500);
-  };
-
-  const handleExportCsv = () => {
+  const handleExportRegistryCsv = () => {
     const headers = [
       'Patient_ID',
-      'Patient_Name',
-      'ABHA_ID',
-      'Age',
-      'Gender',
-      'Village_Code',
-      'Sub_Center',
-      'ASHA_Worker',
+      'Subject_Name',
+      'Village_Node',
       'BP_mmHg',
       'SpO2_Pct',
+      'HR_BPM',
       'Temp_F',
-      'HeartRate_BPM',
-      'Symptoms',
       'Severity',
       'Channel',
-      'Sync_Status',
-      'Binary_SMS_Payload',
-      'Dispatch_Status',
-      'Timestamp',
+      'Dispatch',
+      'Packet_160B',
     ];
-    const rows = filteredTableRecords.map((r) => [
+    const rows = alertStream.map((r) => [
       r.patientId,
-      `"${r.patientName.replace(/"/g, '""')}"`,
-      r.abhaId,
-      r.age,
-      r.gender,
+      `"${r.patientName}"`,
       r.villageCode,
-      `"${r.villageName}"`,
-      `"${r.ashaWorker}"`,
       `${r.vitals.systolic}/${r.vitals.diastolic}`,
       r.vitals.spo2,
-      r.vitals.temperature.toFixed(1),
       r.vitals.heartRate,
-      `"${r.symptoms.join('; ')}"`,
+      r.vitals.temperature.toFixed(1),
       r.severity.toUpperCase(),
       r.channel,
-      r.syncStatus,
-      r.binarySmsPayload,
       r.ambulanceUnit ? `${r.dispatchStatus} (${r.ambulanceUnit})` : r.dispatchStatus,
-      r.timestamp,
+      r.binarySmsPayload,
     ]);
-    const csvContent = [headers.join(','), ...rows.map((row) => row.join(','))].join('\n');
-    const blob = new Blob([csvContent], {type: 'text/csv;charset=utf-8;'});
+    const blob = new Blob(
+      [[headers.join(','), ...rows.map((x) => x.join(','))].join('\n')],
+      {type: 'text/csv;charset=utf-8;'}
+    );
     const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `healthsync_district24_registry_${new Date().toISOString().slice(0, 10)}.csv`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `healthsync_os_warroom_${Date.now()}.csv`;
+    a.click();
     URL.revokeObjectURL(url);
   };
 
   return (
-    <div className="min-h-[calc(100vh-56px)] bg-[#F8FAFC] text-[#0F172A] flex flex-col">
-      {/* FLASHING RED EMERGENCY BANNER + SIREN ACKNOWLEDGE BAR */}
+    <div className="os-grid-surface min-h-[calc(100vh-52px)] pb-16 text-slate-100 flex flex-col">
+      {/* ACTIVE CYBER-RED EMERGENCY SIREN HAZARD BANNER */}
       {(activeEmergencyBanner || isSirenRinging) && (
         <div
           role="alert"
-          className="bg-[#EF4444] text-white border-b-2 border-red-900 shadow-lg animate-pulse"
+          className="bg-[#EF4444]/20 border-b-2 border-[#EF4444] hazard-alert-frame"
         >
-          <div className="max-w-[1440px] mx-auto px-4 lg:px-6 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div className="flex items-start sm:items-center gap-3">
-              <div className="w-10 h-10 rounded-lg bg-red-950/50 border border-white/30 flex items-center justify-center shrink-0">
-                <AlertTriangle className="w-6 h-6 text-white" />
-              </div>
+          <div className="max-w-[1440px] mx-auto px-4 lg:px-6 py-3 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <AlertTriangle className="w-6 h-6 text-[#EF4444] shrink-0" />
               <div>
-                <p className="text-xs sm:text-sm font-black uppercase tracking-wider">
+                <p className="font-mono text-xs sm:text-sm font-bold text-white">
                   CRITICAL EMERGENCY RECEIVED FROM SUB-CENTER{' '}
                   {activeEmergencyBanner?.villageCode ?? 'VIL-204'}
                 </p>
                 {activeEmergencyBanner && (
-                  <p className="text-xs font-medium text-red-100 mt-0.5">
-                    Patient {activeEmergencyBanner.patientName} ({activeEmergencyBanner.patientId}) ·
-                    BP {activeEmergencyBanner.vitals.systolic}/
+                  <p className="font-mono text-xs text-red-200 tabular-nums">
+                    {activeEmergencyBanner.patientId} · {activeEmergencyBanner.patientName} · BP{' '}
+                    {activeEmergencyBanner.vitals.systolic}/
                     {activeEmergencyBanner.vitals.diastolic} mmHg · SpO₂{' '}
-                    {activeEmergencyBanner.vitals.spo2}% · Channel:{' '}
-                    {activeEmergencyBanner.channel}
+                    {activeEmergencyBanner.vitals.spo2}% · {activeEmergencyBanner.channel}
                   </p>
                 )}
               </div>
             </div>
 
-            <div className="flex items-center gap-2 shrink-0">
+            <div className="flex items-center gap-2">
               {activeEmergencyBanner &&
                 activeEmergencyBanner.dispatchStatus === 'Unassigned' && (
                   <button
                     type="button"
                     onClick={() => onDispatchAmbulance(activeEmergencyBanner.id)}
-                    className="h-10 px-4 rounded-lg bg-white text-red-700 hover:bg-red-50 text-xs font-black uppercase tracking-wider flex items-center gap-1.5 shadow-sm cursor-pointer transition-colors"
+                    className="min-h-[40px] px-3.5 rounded-lg bg-[#EF4444] hover:bg-red-500 text-white font-mono text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
                   >
                     <Ambulance className="w-4 h-4" />
-                    Dispatch 108 Now
+                    <span>Dispatch ALS-108</span>
                   </button>
                 )}
               <button
                 type="button"
                 onClick={onAcknowledgeEmergency}
-                className="h-10 px-4 rounded-lg bg-slate-950 hover:bg-slate-900 text-white border border-white/30 text-xs font-black uppercase tracking-wider flex items-center gap-1.5 cursor-pointer transition-colors"
+                className="min-h-[40px] px-3.5 rounded-lg bg-[#090D16] hover:bg-slate-900 border border-[#EF4444] text-white font-mono text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
               >
-                <VolumeX className="w-4 h-4 text-amber-300" />
-                MUTE SIREN / ACKNOWLEDGE EMERGENCY
+                <VolumeX className="w-4 h-4 text-[#F59E0B]" />
+                <span>Mute Siren / Acknowledge</span>
               </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* COMMAND SUB-HEADER */}
-      <div className="bg-[#0F172A] text-white border-b border-slate-800">
-        <div className="max-w-[1440px] mx-auto px-4 lg:px-6 py-3.5 flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-[#0D9488] to-[#06B6D4] flex items-center justify-center shadow-sm">
-              <HeartPulse className="w-5 h-5 text-white" />
-            </div>
+      {/* TOP WAR-ROOM TELEMETRY RIBBON */}
+      <div className="bg-[#060911] border-b border-slate-800">
+        <div className="max-w-[1440px] mx-auto px-4 lg:px-6 py-3 grid grid-cols-2 lg:grid-cols-4 gap-3">
+          {/* Metric 1: System Latency */}
+          <div className="rounded-lg bg-[#0D1322] border border-slate-800 px-3.5 py-2.5 flex items-center justify-between">
             <div>
-              <div className="flex items-center gap-2.5">
-                <h1 className="text-base sm:text-lg font-extrabold tracking-tight">
-                  District 24 Triage Command Portal
-                </h1>
-                <span className="hidden md:inline-flex items-center gap-1 text-[11px] font-mono font-semibold text-teal-300 bg-teal-950/80 border border-teal-700/70 px-2 py-0.5 rounded">
-                  <ShieldCheck className="w-3.5 h-3.5" />
-                  ABDM HICM NODE
+              <span className="block font-mono text-[10px] text-slate-400">
+                SYSTEM LATENCY (RTT)
+              </span>
+              <div className="mt-0.5 flex items-baseline gap-1.5">
+                <span className="text-xl font-mono font-bold text-[#06B6D4] tabular-nums">
+                  {hardwareTelemetry.rttLatencyMs || 12}
                 </span>
+                <span className="font-mono text-xs text-slate-500">ms</span>
               </div>
-              <p className="text-xs text-slate-400">
-                Officer on Duty: <span className="text-slate-200 font-semibold">{dmoEmail}</span> ·
-                Live WebSocket + Baseband SMS Gateway Active
-              </p>
             </div>
+            <span className="font-mono text-[11px] text-emerald-400">● WS LIVE</span>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2.5">
-            {/* Sync Queue Flush */}
+          {/* Metric 2: Active SMS Gateway Queue */}
+          <div className="rounded-lg bg-[#0D1322] border border-slate-800 px-3.5 py-2.5 flex items-center justify-between">
+            <div>
+              <span className="block font-mono text-[10px] text-slate-400">
+                ACTIVE SMS GATEWAY QUEUE
+              </span>
+              <div className="mt-0.5 flex items-baseline gap-1.5">
+                <span className="text-xl font-mono font-bold text-[#F59E0B] tabular-nums">
+                  {smsGatewayCount}
+                </span>
+                <span className="font-mono text-xs text-slate-500">PACKETS</span>
+              </div>
+            </div>
             <button
               type="button"
-              onClick={handleManualSyncFlush}
-              className="h-9 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold text-slate-200 flex items-center gap-1.5 cursor-pointer transition-colors"
+              onClick={onSyncOfflineQueue}
+              title="Flush Pending CRDT Sync Queue"
+              className="min-h-[34px] px-2.5 rounded bg-[#090D16] hover:bg-slate-900 border border-slate-700 font-mono text-[11px] text-[#06B6D4] inline-flex items-center gap-1 cursor-pointer"
             >
-              <RefreshCw className="w-3.5 h-3.5 text-[#06B6D4]" />
-              <span>Sync Health Check</span>
-              {pendingSyncs > 0 && (
-                <span className="ml-1 px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 font-mono text-[10px]">
-                  {pendingSyncs} queued
-                </span>
-              )}
+              <RefreshCw className="w-3 h-3" />
+              <span>Sync</span>
             </button>
+          </div>
 
-            {/* Test Web Audio Siren Button */}
+          {/* Metric 3: Total Emergency Triage Stream */}
+          <div className="rounded-lg bg-[#0D1322] border border-slate-800 px-3.5 py-2.5 flex items-center justify-between">
+            <div>
+              <span className="block font-mono text-[10px] text-slate-400">
+                EMERGENCY TRIAGE STREAM
+              </span>
+              <div className="mt-0.5 flex items-baseline gap-2">
+                <span className="text-xl font-mono font-bold text-[#EF4444] tabular-nums">
+                  {criticalRecords.length} RED
+                </span>
+                <span className="font-mono text-xs text-slate-400 tabular-nums">
+                  / {records.length} TOTAL
+                </span>
+              </div>
+            </div>
             <button
               type="button"
               onClick={onTestSiren}
-              className="h-9 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-bold text-cyan-300 flex items-center gap-1.5 cursor-pointer transition-colors"
-              title="Trigger Web Audio API Hi-Lo Emergency Siren Burst"
+              className="min-h-[34px] px-2.5 rounded bg-[#EF4444]/15 hover:bg-[#EF4444]/25 border border-[#EF4444]/50 font-mono text-[11px] text-[#EF4444] inline-flex items-center gap-1 cursor-pointer whitespace-nowrap"
             >
-              <Volume2 className="w-3.5 h-3.5" />
-              Test Siren Sound
+              <Volume2 className="w-3 h-3" />
+              <span>Siren</span>
             </button>
+          </div>
 
-            {/* Live IST Clock */}
-            <div className="h-9 px-3 rounded-lg bg-slate-900 border border-slate-800 flex items-center gap-1.5 text-xs font-mono text-slate-200 tabular-nums">
-              <Clock className="w-3.5 h-3.5 text-teal-400" />
-              <span>{clockText || '--:--:--'} IST</span>
+          {/* Metric 4: Local SQLCipher DB Status */}
+          <div className="rounded-lg bg-[#0D1322] border border-slate-800 px-3.5 py-2.5 flex items-center justify-between">
+            <div>
+              <span className="block font-mono text-[10px] text-slate-400">
+                LOCAL SQLCIPHER DB STATUS
+              </span>
+              <div className="mt-0.5 flex items-center gap-1.5">
+                <Lock className="w-3.5 h-3.5 text-[#06B6D4]" />
+                <span className="font-mono text-sm font-bold text-slate-100">
+                  AES-256 MOUNTED
+                </span>
+              </div>
             </div>
-
-            {/* Red Alert Counter */}
-            <div
-              className={`h-9 px-3 rounded-lg flex items-center gap-2 text-xs font-extrabold border ${
-                unassignedRedCount > 0
-                  ? 'bg-red-600 text-white border-red-400 shadow-sm'
-                  : 'bg-slate-800 text-slate-300 border-slate-700'
-              }`}
-            >
-              <AlertTriangle className="w-3.5 h-3.5" />
-              <span className="tabular-nums">{unassignedRedCount} Open RED Alerts</span>
-            </div>
+            <span className="font-mono text-[11px] text-slate-400 tabular-nums">
+              {clockUtc || '--:--:--'} IST
+            </span>
           </div>
         </div>
       </div>
 
-      {syncNotice && (
-        <div className="bg-teal-900 text-teal-50 text-xs font-semibold px-4 py-2 text-center border-b border-teal-700">
-          {syncNotice}
-        </div>
-      )}
-
-      {/* MAIN CONTENT CONTAINER */}
+      {/* MAIN TACTICAL WAR-ROOM WORKSPACE */}
       <main className="max-w-[1440px] w-full mx-auto px-4 lg:px-6 py-5 space-y-5 flex-1">
-        {/* 1. METRICS ROW (4 KPI SUMMARY CARDS) */}
-        <section className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
-          <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-xs flex items-start justify-between">
-            <div>
-              <p className="text-xs font-bold uppercase tracking-wider text-slate-500">
-                Total Screenings Today
-              </p>
-              <p className="text-3xl font-black text-slate-900 tabular-nums mt-1.5">
-                {totalScreenings}
-              </p>
-              <p className="text-xs text-teal-700 font-semibold mt-1">
-                Across {VILLAGE_SUB_CENTERS.length} Rural Sub-Centers
-              </p>
-            </div>
-            <div className="w-10 h-10 rounded-lg bg-teal-50 border border-teal-200 flex items-center justify-center text-[#0D9488]">
-              <Activity className="w-5 h-5" />
-            </div>
-          </div>
-
-          <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-xs flex items-start justify-between">
-            <div>
-              <p className="text-xs font-bold uppercase tracking-wider text-slate-500">
-                Pending Syncs
-              </p>
-              <p className="text-3xl font-black text-slate-900 tabular-nums mt-1.5">
-                {pendingSyncs}
-              </p>
-              <p className="text-xs text-slate-500 font-medium mt-1">
-                Stored in local offline queue
-              </p>
-            </div>
-            <div className="w-10 h-10 rounded-lg bg-cyan-50 border border-cyan-200 flex items-center justify-center text-[#06B6D4]">
-              <Radio className="w-5 h-5" />
-            </div>
-          </div>
-
-          <div className="bg-white rounded-xl border border-amber-200/90 p-4 shadow-xs flex items-start justify-between">
-            <div>
-              <p className="text-xs font-bold uppercase tracking-wider text-amber-700">
-                Moderate Yellow Risk
-              </p>
-              <p className="text-3xl font-black text-amber-600 tabular-nums mt-1.5">
-                {moderateYellowCount}
-              </p>
-              <p className="text-xs text-amber-800/80 font-medium mt-1">
-                Same-day PHC MO tele-review
-              </p>
-            </div>
-            <div className="w-10 h-10 rounded-lg bg-amber-50 border border-amber-200 flex items-center justify-center text-[#F59E0B]">
-              <Clock className="w-5 h-5" />
-            </div>
-          </div>
-
-          <div
-            className={`rounded-xl border p-4 shadow-xs flex items-start justify-between ${
-              unassignedRedCount > 0
-                ? 'bg-red-50/70 border-red-300'
-                : 'bg-white border-slate-200'
-            }`}
-          >
-            <div>
-              <p className="text-xs font-bold uppercase tracking-wider text-red-700">
-                Critical RED Emergencies
-              </p>
-              <div className="flex items-baseline gap-2 mt-1.5">
-                <p className="text-3xl font-black text-[#EF4444] tabular-nums">
-                  {criticalRedRecords.length}
-                </p>
-                <span className="text-xs font-bold text-red-700">
-                  ({unassignedRedCount} awaiting 108)
-                </span>
-              </div>
-              <p className="text-xs text-red-800/80 font-medium mt-1">
-                Immediate 108 ALS dispatch SLA
-              </p>
-            </div>
-            <div className="w-10 h-10 rounded-lg bg-red-100 border border-red-200 flex items-center justify-center text-[#EF4444]">
-              <AlertTriangle className="w-5 h-5" />
-            </div>
-          </div>
-        </section>
-
-        {/* 2. LIVE BINARY SMS PAYLOAD TEST DECODER BAR */}
-        <section className="bg-white rounded-xl border border-slate-200 p-4 shadow-xs">
-          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
-            <div className="flex items-center gap-2.5 shrink-0">
-              <div className="w-9 h-9 rounded-lg bg-slate-900 text-teal-400 flex items-center justify-center">
-                <Terminal className="w-4 h-4" />
-              </div>
+        {/* PRIMARY 2-COLUMN SPLIT: GEOSPATIAL COVERAGE MAP (7 COLS) + LIVE ALERT FEED (5 COLS) */}
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-stretch">
+          {/* LEFT 7 COLS: GEOSPATIAL COVERAGE VECTOR MAP WITH RF LAYER TOGGLES */}
+          <section className="lg:col-span-7 rounded-xl bg-[#0D1322] border border-slate-800 overflow-hidden flex flex-col justify-between">
+            <div className="px-4 py-3 bg-[#090D16] border-b border-slate-800 flex flex-wrap items-center justify-between gap-2">
               <div>
-                <h2 className="text-xs font-extrabold uppercase tracking-wider text-slate-900">
-                  Paste SMS Payload to Test Decoder
-                </h2>
-                <p className="text-[11px] text-slate-500">
-                  Bitwise 18-byte Base64 (`HS#...`) unpacker + CRC-16-CCITT integrity verification
+                <h1 className="text-sm font-semibold text-slate-100">
+                  District 24 Geospatial RF &amp; Sub-Center Telemetry Map
+                </h1>
+                <p className="font-mono text-[11px] text-slate-400">
+                  Commander: {dmoEmail} · Sector 26.84°N, 80.94°E
                 </p>
               </div>
-            </div>
 
-            <div className="flex-1 flex flex-col sm:flex-row items-stretch sm:items-center gap-2 max-w-3xl">
-              <input
-                type="text"
-                value={pasteSmsInput}
-                onChange={(e) => setPasteSmsInput(e.target.value)}
-                placeholder="Paste HS# Base64 SMS frame (e.g. HS#...)"
-                className="flex-1 h-10 px-3 rounded-lg bg-slate-950 text-teal-300 font-mono text-xs border border-slate-700 focus:outline-none focus:border-[#0D9488]"
-              />
-              <button
-                type="button"
-                onClick={() =>
-                  setDrawerState({
-                    isOpen: true,
-                    record: null,
-                    initialPayload: pasteSmsInput,
-                    mode: 'decode',
-                  })
-                }
-                className="h-10 px-4 rounded-lg bg-[#0D9488] hover:bg-teal-700 text-white text-xs font-bold flex items-center justify-center gap-1.5 shrink-0 cursor-pointer transition-colors"
-              >
-                <Cpu className="w-3.5 h-3.5" />
-                Inspect Full Byte Frame
-              </button>
-            </div>
-          </div>
+              {/* Interactive Layer Toggle Controls */}
+              <div className="flex flex-wrap items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setShow4gCoverage((v) => !v)}
+                  aria-pressed={show4gCoverage}
+                  className={`min-h-[34px] px-2.5 rounded border font-mono text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer whitespace-nowrap transition-colors ${
+                    show4gCoverage
+                      ? 'bg-[#06B6D4]/20 border-[#06B6D4] text-[#06B6D4]'
+                      : 'bg-[#0D1322] border-slate-700 text-slate-400'
+                  }`}
+                >
+                  <Layers className="w-3 h-3" />
+                  <span>3G/4G Coverage</span>
+                </button>
 
-          {/* Inline Real-Time Decoded Output Preview */}
-          {inlineDecoded && (
-            <div
-              className={`mt-3 rounded-lg border px-3.5 py-2.5 text-xs flex flex-wrap items-center justify-between gap-2 ${
-                inlineDecoded.valid && inlineDecoded.crcValid
-                  ? 'bg-slate-50 border-slate-200 text-slate-800'
-                  : 'bg-red-50 border-red-200 text-red-800'
-              }`}
-            >
-              {inlineDecoded.valid ? (
-                <>
-                  <div className="flex flex-wrap items-center gap-x-4 gap-y-1 font-mono text-[11px]">
-                    <span className="font-bold text-slate-900">
-                      ID: {inlineDecoded.patientId} ({inlineDecoded.villageCode})
-                    </span>
-                    <span>
-                      BP:{' '}
-                      <strong className="text-slate-900">
-                        {inlineDecoded.vitals.systolic}/{inlineDecoded.vitals.diastolic}
-                      </strong>{' '}
-                      mmHg
-                    </span>
-                    <span>
-                      SpO₂:{' '}
-                      <strong className="text-slate-900">{inlineDecoded.vitals.spo2}%</strong>
-                    </span>
-                    <span>
-                      Temp:{' '}
-                      <strong className="text-slate-900">
-                        {inlineDecoded.vitals.temperature.toFixed(1)}°F
-                      </strong>
-                    </span>
-                    <span>
-                      HR:{' '}
-                      <strong className="text-slate-900">
-                        {inlineDecoded.vitals.heartRate} bpm
-                      </strong>
-                    </span>
-                    <span>
-                      Symptoms:{' '}
-                      <strong className="text-slate-900">
-                        {inlineDecoded.symptoms.length > 0
-                          ? inlineDecoded.symptoms.join(', ')
-                          : 'None'}
-                      </strong>
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span
-                      className={`px-2 py-0.5 rounded font-bold uppercase text-[10px] ${
-                        inlineDecoded.severity === 'emergency'
-                          ? 'bg-red-100 text-red-700 border border-red-300'
-                          : inlineDecoded.severity === 'moderate'
-                          ? 'bg-amber-100 text-amber-800 border border-amber-300'
-                          : 'bg-emerald-100 text-emerald-800 border border-emerald-300'
-                      }`}
-                    >
-                      {inlineDecoded.severity}
-                    </span>
-                    <span
-                      className={`px-2 py-0.5 rounded font-mono font-bold text-[10px] ${
-                        inlineDecoded.crcValid
-                          ? 'bg-emerald-100 text-emerald-800'
-                          : 'bg-red-200 text-red-900'
-                      }`}
-                    >
-                      CRC16 {inlineDecoded.computedCrcHex}{' '}
-                      {inlineDecoded.crcValid ? 'VALID' : 'TAMPERED'}
-                    </span>
-                  </div>
-                </>
-              ) : (
-                <span className="font-semibold">
-                  Decoder Error: {inlineDecoded.error}
-                </span>
-              )}
-            </div>
-          )}
-        </section>
+                <button
+                  type="button"
+                  onClick={() => setShowBlackoutZones((v) => !v)}
+                  aria-pressed={showBlackoutZones}
+                  className={`min-h-[34px] px-2.5 rounded border font-mono text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer whitespace-nowrap transition-colors ${
+                    showBlackoutZones
+                      ? 'bg-[#F59E0B]/20 border-[#F59E0B] text-[#F59E0B]'
+                      : 'bg-[#0D1322] border-slate-700 text-slate-400'
+                  }`}
+                >
+                  <AlertTriangle className="w-3 h-3" />
+                  <span>Blackout Zones</span>
+                </button>
 
-        {/* 3. MAIN 2-COLUMN COMMAND GRID: 60% SUB-CENTER MAP + 40% HIGH-PRIORITY ALERT FEED */}
-        <section className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
-          {/* LEFT 60% (7 cols): Interactive District 24 Village Sub-Center Telemetry Map */}
-          <div className="lg:col-span-7 bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden">
-            <div className="px-4 py-3.5 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2">
-              <div className="flex items-center gap-2">
-                <MapPin className="w-4 h-4 text-[#0D9488]" />
-                <div>
-                  <h2 className="text-sm font-extrabold text-slate-900">
-                    District 24 Village Sub-Center Risk Telemetry Map
-                  </h2>
-                  <p className="text-[11px] text-slate-500">
-                    Click any village pin to filter incoming emergency alerts & longitudinal records
-                  </p>
-                </div>
-              </div>
-
-              <div className="flex items-center gap-3 text-[11px] font-semibold">
-                <span className="flex items-center gap-1 text-emerald-700">
-                  <span className="w-2.5 h-2.5 rounded-full bg-[#10B981]" /> Routine
-                </span>
-                <span className="flex items-center gap-1 text-amber-700">
-                  <span className="w-2.5 h-2.5 rounded-full bg-[#F59E0B]" /> Moderate
-                </span>
-                <span className="flex items-center gap-1 text-red-700">
-                  <span className="w-2.5 h-2.5 rounded-full bg-[#EF4444]" /> Emergency
-                </span>
-                {selectedVillageCode && (
-                  <button
-                    type="button"
-                    onClick={() => setSelectedVillageCode(null)}
-                    className="ml-1 px-2 py-0.5 rounded bg-slate-900 text-white text-[10px] font-bold flex items-center gap-1 cursor-pointer"
-                  >
-                    {selectedVillageCode} <X className="w-3 h-3" />
-                  </button>
-                )}
+                <button
+                  type="button"
+                  onClick={() => setShowSignalRelays((v) => !v)}
+                  aria-pressed={showSignalRelays}
+                  className={`min-h-[34px] px-2.5 rounded border font-mono text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer whitespace-nowrap transition-colors ${
+                    showSignalRelays
+                      ? 'bg-[#EF4444]/20 border-[#EF4444] text-red-300'
+                      : 'bg-[#0D1322] border-slate-700 text-slate-400'
+                  }`}
+                >
+                  <Radio className="w-3 h-3" />
+                  <span>Signal Relays</span>
+                </button>
               </div>
             </div>
 
-            {/* Interactive Topographic SVG Canvas */}
-            <div className="relative bg-[#0F172A] aspect-[16/10] w-full overflow-hidden select-none">
+            {/* Dark Vector Map Viewport */}
+            <div className="relative bg-[#05080F] flex-1 min-h-[360px] overflow-hidden os-scanlines">
               <svg
-                viewBox="0 0 100 64"
-                className="w-full h-full"
-                aria-label="District 24 Sub-Center Interactive Map"
+                viewBox="0 0 100 66"
+                className="w-full h-full cursor-crosshair"
+                aria-label="District 24 Tactical Coverage Map"
               >
                 <defs>
                   <pattern
-                    id="commandGrid"
-                    width="8"
-                    height="8"
+                    id="tacticalCoordGrid"
+                    width="10"
+                    height="10"
                     patternUnits="userSpaceOnUse"
                   >
                     <path
-                      d="M 8 0 L 0 0 0 8"
+                      d="M 10 0 L 0 0 0 10"
                       fill="none"
-                      stroke="rgba(148,163,184,0.09)"
-                      strokeWidth="0.25"
+                      stroke="rgba(6,182,212,0.08)"
+                      strokeWidth="0.22"
+                    />
+                  </pattern>
+                  <pattern
+                    id="blackoutHatch"
+                    width="3"
+                    height="3"
+                    patternTransform="rotate(45 0 0)"
+                    patternUnits="userSpaceOnUse"
+                  >
+                    <line
+                      x1="0"
+                      y1="0"
+                      x2="0"
+                      y2="3"
+                      stroke="rgba(245,158,11,0.45)"
+                      strokeWidth="0.6"
                     />
                   </pattern>
                 </defs>
 
-                <rect width="100" height="64" fill="url(#commandGrid)" />
+                <rect width="100" height="66" fill="url(#tacticalCoordGrid)" />
 
-                {/* District Boundary Polygon */}
+                {/* District Perimeter Vector */}
                 <path
-                  d="M 9,14 L 30,6 L 64,8 L 91,17 L 88,49 L 61,58 L 24,55 L 8,38 Z"
-                  fill="rgba(13,148,136,0.09)"
-                  stroke="rgba(20,184,166,0.35)"
+                  d="M 8,14 L 29,5 L 66,7 L 93,18 L 89,52 L 62,61 L 23,58 L 7,39 Z"
+                  fill="rgba(15,23,42,0.72)"
+                  stroke="rgba(6,182,212,0.4)"
                   strokeWidth="0.45"
                 />
 
-                {/* River & Highway Corridors */}
-                <path
-                  d="M 5,28 Q 35,22 52,32 T 96,26"
-                  fill="none"
-                  stroke="rgba(6,182,212,0.28)"
-                  strokeWidth="1.1"
-                />
-                <line
-                  x1="50"
-                  y1="31"
-                  x2="24"
-                  y2="20"
-                  stroke="rgba(148,163,184,0.28)"
-                  strokeDasharray="1.2,1.2"
-                  strokeWidth="0.35"
-                />
-                <line
-                  x1="50"
-                  y1="31"
-                  x2="75"
-                  y2="18"
-                  stroke="rgba(148,163,184,0.28)"
-                  strokeDasharray="1.2,1.2"
-                  strokeWidth="0.35"
-                />
-                <line
-                  x1="50"
-                  y1="31"
-                  x2="31"
-                  y2="46"
-                  stroke="rgba(148,163,184,0.28)"
-                  strokeDasharray="1.2,1.2"
-                  strokeWidth="0.35"
-                />
-                <line
-                  x1="50"
-                  y1="31"
-                  x2="74"
-                  y2="44"
-                  stroke="rgba(148,163,184,0.28)"
-                  strokeDasharray="1.2,1.2"
-                  strokeWidth="0.35"
-                />
+                {/* LAYER 1: 3G/4G Cellular Propagation Contours */}
+                {show4gCoverage && (
+                  <g>
+                    <circle
+                      cx="50"
+                      cy="33"
+                      r="20"
+                      fill="rgba(6,182,212,0.08)"
+                      stroke="rgba(6,182,212,0.32)"
+                      strokeWidth="0.3"
+                      strokeDasharray="1.5 1"
+                    />
+                    <circle
+                      cx="68"
+                      cy="20"
+                      r="12"
+                      fill="rgba(6,182,212,0.06)"
+                      stroke="rgba(6,182,212,0.25)"
+                      strokeWidth="0.25"
+                    />
+                    <text
+                      x="50"
+                      y="15"
+                      textAnchor="middle"
+                      fill="#06B6D4"
+                      fontSize="2"
+                      fontFamily="monospace"
+                    >
+                      LTE BAND-40 (-82 dBm)
+                    </text>
+                  </g>
+                )}
 
-                {/* Central District 24 Tertiary Hospital Hub */}
-                <g transform="translate(50, 31)">
+                {/* LAYER 2: Zero-Network RF Blackout Zones */}
+                {showBlackoutZones && (
+                  <g>
+                    <polygon
+                      points="12,18 35,14 33,34 14,35"
+                      fill="url(#blackoutHatch)"
+                      stroke="#F59E0B"
+                      strokeWidth="0.4"
+                    />
+                    <text
+                      x="23.5"
+                      y="17"
+                      textAnchor="middle"
+                      fill="#F59E0B"
+                      fontSize="1.9"
+                      fontFamily="monospace"
+                    >
+                      RF BLACKOUT · RAMPUR SECTOR
+                    </text>
+
+                    <polygon
+                      points="69,36 90,34 86,54 67,52"
+                      fill="url(#blackoutHatch)"
+                      stroke="#EF4444"
+                      strokeWidth="0.4"
+                    />
+                    <text
+                      x="78"
+                      y="56.5"
+                      textAnchor="middle"
+                      fill="#EF4444"
+                      fontSize="1.9"
+                      fontFamily="monospace"
+                    >
+                      ZERO-DATA ZONE · GSM SMS ONLY
+                    </text>
+                  </g>
+                )}
+
+                {/* LAYER 3: Emergency Signal Relays & Baseband Links */}
+                {showSignalRelays && (
+                  <g>
+                    {/* Relay Towers */}
+                    {[
+                      {id: 'RLY-N1', rx: 38, ry: 22},
+                      {id: 'RLY-E2', rx: 66, ry: 38},
+                    ].map((relay) => (
+                      <g key={relay.id}>
+                        <line
+                          x1={relay.rx}
+                          y1={relay.ry}
+                          x2={50}
+                          y2={33}
+                          stroke="#F59E0B"
+                          strokeWidth="0.38"
+                          strokeDasharray="1 0.8"
+                        />
+                        <polygon
+                          points={`${relay.rx},${relay.ry - 2} ${relay.rx - 1.8},${relay.ry + 1.5} ${relay.rx + 1.8},${relay.ry + 1.5}`}
+                          fill="#F59E0B"
+                        />
+                        <text
+                          x={relay.rx}
+                          y={relay.ry - 2.8}
+                          textAnchor="middle"
+                          fill="#F59E0B"
+                          fontSize="1.9"
+                          fontFamily="monospace"
+                        >
+                          {relay.id}
+                        </text>
+                      </g>
+                    ))}
+                  </g>
+                )}
+
+                {/* District 24 Command Hub */}
+                <g transform="translate(50, 33)">
                   <rect
                     x="-3"
                     y="-3"
                     width="6"
                     height="6"
-                    rx="1.2"
-                    fill="#0D9488"
-                    stroke="#FFFFFF"
-                    strokeWidth="0.5"
+                    rx="1"
+                    fill="#06B6D4"
+                    stroke="#090D16"
+                    strokeWidth="0.6"
                   />
                   <text
                     x="0"
-                    y="1"
+                    y="1.1"
                     textAnchor="middle"
-                    fill="#FFFFFF"
+                    fill="#090D16"
                     fontSize="3.2"
                     fontWeight="bold"
+                    fontFamily="monospace"
                   >
-                    H
+                    HQ
                   </text>
                   <text
                     x="0"
-                    y="6"
+                    y="6.2"
                     textAnchor="middle"
-                    fill="#99F6E4"
-                    fontSize="2.3"
+                    fill="#06B6D4"
+                    fontSize="2.2"
                     fontWeight="bold"
+                    fontFamily="monospace"
                   >
-                    DIST-24 HQ
+                    DIST-24 WAR-ROOM
                   </text>
                 </g>
 
-                {/* Sub-Center Pins */}
-                {villageStats.map((v) => {
-                  const mapY = Math.max(10, Math.min(54, v.y * 0.62));
-                  const isSelected = selectedVillageCode === v.code;
-                  const pinColor =
-                    v.highestRisk === 'emergency'
+                {/* Village Sub-Center Nodes */}
+                {villageNodes.map((v) => {
+                  const vy = Math.max(11, Math.min(56, v.y * 0.64));
+                  const selected = selectedVillageCode === v.code;
+                  const nodeColor =
+                    v.risk === 'emergency'
                       ? '#EF4444'
-                      : v.highestRisk === 'moderate'
+                      : v.risk === 'moderate'
                       ? '#F59E0B'
-                      : '#10B981';
+                      : '#06B6D4';
 
                   return (
                     <g
                       key={v.code}
-                      transform={`translate(${v.x}, ${mapY})`}
-                      onClick={() =>
-                        setSelectedVillageCode(isSelected ? null : v.code)
-                      }
+                      transform={`translate(${v.x}, ${vy})`}
+                      onClick={() => setSelectedVillageCode(selected ? null : v.code)}
                       className="cursor-pointer"
                     >
-                      {v.openRedCount > 0 && (
+                      {showSignalRelays && v.risk === 'emergency' && (
+                        <line
+                          x1={0}
+                          y1={0}
+                          x2={50 - v.x}
+                          y2={33 - vy}
+                          stroke="rgba(239,68,68,0.55)"
+                          strokeWidth="0.35"
+                          strokeDasharray="1.4 1"
+                        />
+                      )}
+
+                      {v.redOpen > 0 && (
                         <circle
-                          r="5.2"
+                          r="5"
                           fill="none"
                           stroke="#EF4444"
                           strokeWidth="0.5"
-                          opacity="0.75"
                         >
                           <animate
                             attributeName="r"
-                            from="2.8"
+                            from="2.6"
                             to="6.8"
-                            dur="1.4s"
+                            dur="1.3s"
                             repeatCount="indefinite"
                           />
                           <animate
                             attributeName="opacity"
-                            from="0.9"
+                            from="0.95"
                             to="0"
-                            dur="1.4s"
+                            dur="1.3s"
                             repeatCount="indefinite"
                           />
                         </circle>
                       )}
 
                       <circle
-                        r={isSelected ? '3.3' : '2.6'}
-                        fill={pinColor}
-                        stroke="#FFFFFF"
-                        strokeWidth={isSelected ? '0.8' : '0.45'}
+                        r={selected ? '3.1' : '2.4'}
+                        fill={nodeColor}
+                        stroke="#090D16"
+                        strokeWidth="0.6"
                       />
+                      {selected && (
+                        <rect
+                          x="-4.6"
+                          y="-4.6"
+                          width="9.2"
+                          height="9.2"
+                          fill="none"
+                          stroke="#FFFFFF"
+                          strokeWidth="0.4"
+                        />
+                      )}
                       <text
                         x="0"
-                        y="-4.2"
+                        y="-3.8"
                         textAnchor="middle"
                         fill="#F8FAFC"
-                        fontSize="2.4"
+                        fontSize="2.3"
                         fontWeight="bold"
+                        fontFamily="monospace"
                       >
                         {v.code}
                       </text>
                       <text
                         x="0"
-                        y="5.6"
+                        y="5.2"
                         textAnchor="middle"
-                        fill="#CBD5E1"
-                        fontSize="2.1"
+                        fill="#94A3B8"
+                        fontSize="1.95"
+                        fontFamily="monospace"
                       >
-                        {v.name.replace('PHC ', '').replace('SC ', '')} ({v.totalCases})
+                        [{v.totalCases}]
                       </text>
                     </g>
                   );
                 })}
               </svg>
 
-              {/* Selected Village Overlay Card */}
-              {selectedVillageDetail && (
-                <div className="absolute bottom-3 left-3 right-3 sm:right-auto sm:w-80 bg-slate-900/95 backdrop-blur-md border border-slate-700 rounded-xl p-3 text-white shadow-xl">
-                  <div className="flex items-start justify-between gap-2">
-                    <div>
-                      <span className="text-[10px] font-mono font-bold text-teal-300 uppercase">
-                        {selectedVillageDetail.code} · {selectedVillageDetail.block}
-                      </span>
-                      <h3 className="text-sm font-extrabold">
-                        {selectedVillageDetail.name}
-                      </h3>
-                      <p className="text-[11px] text-slate-300">
-                        ASHA: {selectedVillageDetail.ashaName} ·{' '}
-                        {selectedVillageDetail.phcDistanceKm} km to HQ
-                      </p>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => setSelectedVillageCode(null)}
-                      className="text-slate-400 hover:text-white p-1 cursor-pointer"
-                    >
-                      <X className="w-4 h-4" />
-                    </button>
-                  </div>
-                  <div className="grid grid-cols-3 gap-2 mt-2.5 pt-2.5 border-t border-slate-800 text-center text-[11px]">
-                    <div>
-                      <span className="text-slate-400 block">Total</span>
-                      <strong className="text-sm font-black">
-                        {selectedVillageDetail.totalCases}
-                      </strong>
-                    </div>
-                    <div>
-                      <span className="text-amber-300 block">Yellow</span>
-                      <strong className="text-sm font-black text-amber-400">
-                        {selectedVillageDetail.yellowCount}
-                      </strong>
-                    </div>
-                    <div>
-                      <span className="text-red-300 block">RED</span>
-                      <strong className="text-sm font-black text-red-400">
-                        {selectedVillageDetail.redCount}
-                      </strong>
-                    </div>
-                  </div>
+              {/* Map Legend & Filter Lock Indicator */}
+              <div className="px-4 py-2 bg-[#090D16]/95 border-t border-slate-800 flex flex-wrap items-center justify-between gap-2 font-mono text-[11px]">
+                <div className="flex items-center gap-4 text-slate-400">
+                  <span className="text-[#06B6D4]">● NOMINAL</span>
+                  <span className="text-[#F59E0B]">▲ MODERATE</span>
+                  <span className="text-[#EF4444]">✖ CRITICAL RED</span>
                 </div>
-              )}
-            </div>
-          </div>
-
-          {/* RIGHT 40% (5 cols): High-Priority Real-Time Emergency Alert Feed */}
-          <div className="lg:col-span-5 bg-white rounded-xl border border-slate-200 shadow-xs flex flex-col max-h-[560px]">
-            <div className="px-4 py-3.5 border-b border-slate-200 flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <span className="w-2.5 h-2.5 rounded-full bg-[#EF4444] animate-ping" />
-                <div>
-                  <h2 className="text-sm font-extrabold text-slate-900">
-                    High-Priority Incoming Alert Feed
-                  </h2>
-                  <p className="text-[11px] text-slate-500">
-                    Live RED SMS & Data dispatches sorted by clinical urgency
-                  </p>
-                </div>
+                {selectedVillageCode ? (
+                  <button
+                    type="button"
+                    onClick={() => setSelectedVillageCode(null)}
+                    className="px-2 py-0.5 rounded bg-[#06B6D4]/20 border border-[#06B6D4] text-[#06B6D4] inline-flex items-center gap-1 cursor-pointer"
+                  >
+                    <span>SECTOR LOCK: {selectedVillageCode}</span>
+                    <X className="w-3 h-3" />
+                  </button>
+                ) : (
+                  <span className="text-slate-500">CLICK SECTOR NODE TO ISOLATE STREAM</span>
+                )}
               </div>
-              <span className="text-xs font-mono font-bold px-2 py-0.5 rounded bg-slate-100 text-slate-700">
-                {priorityAlertFeed.length} records
-              </span>
+            </div>
+          </section>
+
+          {/* RIGHT 5 COLS: HIGH-PRIORITY PULSING ALERT FEED */}
+          <section className="lg:col-span-5 rounded-xl bg-[#0D1322] border border-slate-800 flex flex-col max-h-[520px]">
+            <div className="px-4 py-3 bg-[#090D16] border-b border-slate-800 flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h2 className="text-sm font-semibold text-slate-100">
+                  Live Triage Telemetry Feed
+                </h2>
+                <p className="font-mono text-[11px] text-slate-400 tabular-nums">
+                  {unassignedRedCount} Unassigned Critical · {alertStream.length} Shown
+                </p>
+              </div>
+
+              <div className="flex items-center gap-1.5 font-mono text-[11px]">
+                <select
+                  aria-label="Filter Severity"
+                  value={severityFilter}
+                  onChange={(e) =>
+                    setSeverityFilter(e.target.value as 'ALL' | SeverityLevel)
+                  }
+                  className="h-8 px-2 rounded bg-[#0D1322] border border-slate-700 text-slate-200 cursor-pointer"
+                >
+                  <option value="ALL">ALL SEV</option>
+                  <option value="emergency">RED CRIT</option>
+                  <option value="moderate">AMBER MOD</option>
+                  <option value="routine">CYAN NOM</option>
+                </select>
+                <select
+                  aria-label="Filter Transport Channel"
+                  value={channelFilter}
+                  onChange={(e) =>
+                    setChannelFilter(e.target.value as 'ALL' | SyncChannel)
+                  }
+                  className="h-8 px-2 rounded bg-[#0D1322] border border-slate-700 text-slate-200 cursor-pointer"
+                >
+                  <option value="ALL">ALL CH</option>
+                  <option value="Emergency SMS">GSM SMS</option>
+                  <option value="Data">DATA</option>
+                </select>
+                <button
+                  type="button"
+                  onClick={handleExportRegistryCsv}
+                  title="Export CSV"
+                  className="h-8 px-2 rounded bg-[#0D1322] hover:bg-slate-800 border border-slate-700 text-[#06B6D4] cursor-pointer"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                </button>
+              </div>
             </div>
 
-            <div className="p-3 space-y-3 overflow-y-auto flex-1">
-              {priorityAlertFeed.map((rec) => {
+            <div className="p-3 space-y-2.5 overflow-y-auto flex-1">
+              {alertStream.map((rec) => {
                 const isRed = rec.severity === 'emergency';
                 const isYellow = rec.severity === 'moderate';
+                const isOpenRed = isRed && rec.dispatchStatus === 'Unassigned';
+
                 return (
                   <div
                     key={rec.id}
-                    className={`rounded-xl border p-3.5 transition-all ${
-                      isRed && rec.dispatchStatus === 'Unassigned'
-                        ? 'bg-red-50/75 border-red-300 shadow-xs'
+                    className={`rounded-lg border p-3 space-y-2.5 transition-colors ${
+                      isOpenRed
+                        ? 'bg-[#EF4444]/10 border-[#EF4444] hazard-alert-frame'
                         : isRed
-                        ? 'bg-white border-red-200'
+                        ? 'bg-[#090D16] border-[#EF4444]/50'
                         : isYellow
-                        ? 'bg-amber-50/40 border-amber-200'
-                        : 'bg-slate-50/70 border-slate-200'
+                        ? 'bg-[#090D16] border-[#F59E0B]/50'
+                        : 'bg-[#090D16] border-slate-800'
                     }`}
                   >
                     <div className="flex items-start justify-between gap-2">
                       <div>
-                        <div className="flex flex-wrap items-center gap-1.5">
+                        <div className="font-mono text-[11px] flex flex-wrap items-center gap-2 tabular-nums">
                           <span
-                            className={`text-[10px] font-black uppercase px-2 py-0.5 rounded ${
+                            className={`font-bold ${
                               isRed
-                                ? 'bg-[#EF4444] text-white'
+                                ? 'text-[#EF4444]'
                                 : isYellow
-                                ? 'bg-[#F59E0B] text-slate-950'
-                                : 'bg-[#10B981] text-white'
+                                ? 'text-[#F59E0B]'
+                                : 'text-[#06B6D4]'
                             }`}
                           >
-                            {rec.severity}
+                            {isRed ? '✖ CRIT-RED' : isYellow ? '▲ MODERATE' : '● ROUTINE'}
                           </span>
-                          <span className="text-xs font-mono font-bold text-slate-700">
-                            {rec.patientId}
-                          </span>
-                          <span className="text-[11px] font-mono font-semibold text-teal-800 bg-teal-50 border border-teal-200 px-1.5 py-0.5 rounded">
-                            {rec.villageCode}
-                          </span>
-                          <span
-                            className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
-                              rec.channel === 'Emergency SMS'
-                                ? 'bg-slate-900 text-amber-300 font-mono'
-                                : 'bg-cyan-50 text-cyan-800 border border-cyan-200'
-                            }`}
-                          >
-                            {rec.channel}
-                          </span>
+                          <span className="text-slate-600">·</span>
+                          <span className="text-slate-200 font-semibold">{rec.patientId}</span>
+                          <span className="text-slate-600">·</span>
+                          <span className="text-[#06B6D4]">{rec.villageCode}</span>
+                          <span className="text-slate-600">·</span>
+                          <span className="text-[#F59E0B]">{rec.channel}</span>
                         </div>
-                        <h3 className="text-sm font-extrabold text-slate-900 mt-1">
+                        <h3 className="text-sm font-semibold text-white mt-0.5">
                           {rec.patientName}{' '}
-                          <span className="text-xs font-medium text-slate-500">
-                            ({rec.age}y/{rec.gender}) · {rec.villageName}
+                          <span className="font-mono text-xs text-slate-400">
+                            ({rec.age}Y/{rec.gender})
                           </span>
                         </h3>
                       </div>
-                      <span className="text-[11px] font-mono text-slate-500 shrink-0">
+                      <span className="font-mono text-[10px] text-slate-500 tabular-nums shrink-0">
                         {rec.timestamp}
                       </span>
                     </div>
 
-                    {/* Vitals Snapshot Strip */}
-                    <div className="grid grid-cols-4 gap-1.5 mt-2.5 bg-white/90 rounded-lg border border-slate-200/90 p-2 text-center">
+                    {/* High-Density Telemetry Metrics Row */}
+                    <div className="grid grid-cols-4 gap-1.5 rounded bg-[#05080F] border border-slate-800/90 px-2.5 py-1.5 font-mono text-xs text-center tabular-nums">
                       <div>
-                        <span className="text-[10px] text-slate-500 block">BP</span>
+                        <span className="block text-[9px] text-slate-500">NIBP</span>
                         <strong
-                          className={`text-xs font-mono font-extrabold ${
-                            rec.vitals.systolic >= 160 ? 'text-red-600' : 'text-slate-900'
-                          }`}
+                          className={
+                            rec.vitals.systolic >= 160 ? 'text-[#EF4444]' : 'text-slate-100'
+                          }
                         >
                           {rec.vitals.systolic}/{rec.vitals.diastolic}
                         </strong>
                       </div>
                       <div>
-                        <span className="text-[10px] text-slate-500 block">SpO₂</span>
+                        <span className="block text-[9px] text-slate-500">SpO₂</span>
                         <strong
-                          className={`text-xs font-mono font-extrabold ${
-                            rec.vitals.spo2 < 90 ? 'text-red-600' : 'text-slate-900'
-                          }`}
+                          className={rec.vitals.spo2 < 90 ? 'text-[#EF4444]' : 'text-[#06B6D4]'}
                         >
                           {rec.vitals.spo2}%
                         </strong>
                       </div>
                       <div>
-                        <span className="text-[10px] text-slate-500 block">Temp</span>
-                        <strong className="text-xs font-mono font-extrabold text-slate-900">
-                          {rec.vitals.temperature.toFixed(1)}°F
-                        </strong>
+                        <span className="block text-[9px] text-slate-500">HR</span>
+                        <strong className="text-[#F59E0B]">{rec.vitals.heartRate}</strong>
                       </div>
                       <div>
-                        <span className="text-[10px] text-slate-500 block">Pulse</span>
-                        <strong className="text-xs font-mono font-extrabold text-slate-900">
-                          {rec.vitals.heartRate}
+                        <span className="block text-[9px] text-slate-500">TEMP</span>
+                        <strong className="text-slate-100">
+                          {rec.vitals.temperature.toFixed(1)}°
                         </strong>
                       </div>
                     </div>
 
-                    {/* Action Buttons */}
-                    <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+                    {/* Action Controls */}
+                    <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5">
                       <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => triggerStepByStepUnpack(rec.binarySmsPayload)}
+                          className="min-h-[34px] px-2.5 rounded bg-[#11192C] hover:bg-slate-800 border border-slate-700 font-mono text-[11px] text-[#06B6D4] inline-flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                        >
+                          <Cpu className="w-3.5 h-3.5" />
+                          <span>Unpack SMS</span>
+                        </button>
                         <button
                           type="button"
                           onClick={() =>
@@ -974,29 +906,15 @@ export function DistrictCommandDashboard({
                               mode: 'vitals',
                             })
                           }
-                          className="h-8 px-2.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-[11px] font-bold text-slate-700 flex items-center gap-1 cursor-pointer"
+                          className="min-h-[34px] px-2.5 rounded bg-[#11192C] hover:bg-slate-800 border border-slate-700 font-mono text-[11px] text-slate-300 inline-flex items-center gap-1 cursor-pointer whitespace-nowrap"
                         >
-                          <Eye className="w-3.5 h-3.5 text-[#0D9488]" />
-                          View Vitals
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setDrawerState({
-                              isOpen: true,
-                              record: rec,
-                              mode: 'decode',
-                            })
-                          }
-                          className="h-8 px-2.5 rounded-lg border border-slate-300 bg-slate-900 hover:bg-slate-800 text-[11px] font-mono font-bold text-teal-300 flex items-center gap-1 cursor-pointer"
-                        >
-                          <Cpu className="w-3.5 h-3.5" />
-                          Decode SMS
+                          <Eye className="w-3.5 h-3.5" />
+                          <span>FHIR</span>
                         </button>
                       </div>
 
                       {rec.dispatchStatus === 'Dispatched' ? (
-                        <span className="inline-flex items-center gap-1 text-[11px] font-bold text-emerald-800 bg-emerald-100 border border-emerald-300 px-2.5 py-1 rounded-lg">
+                        <span className="font-mono text-[11px] font-semibold text-emerald-400 inline-flex items-center gap-1 tabular-nums">
                           <CheckCircle2 className="w-3.5 h-3.5" />
                           {rec.ambulanceUnit} · ETA {rec.etaMinutes}m
                         </span>
@@ -1004,14 +922,14 @@ export function DistrictCommandDashboard({
                         <button
                           type="button"
                           onClick={() => onDispatchAmbulance(rec.id)}
-                          className={`h-8 px-3 rounded-lg text-xs font-extrabold flex items-center gap-1.5 cursor-pointer transition-colors ${
+                          className={`min-h-[34px] px-3 rounded font-mono text-[11px] font-bold inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap transition-colors ${
                             isRed
-                              ? 'bg-[#EF4444] hover:bg-red-700 text-white shadow-xs'
-                              : 'bg-[#0D9488] hover:bg-teal-700 text-white'
+                              ? 'bg-[#EF4444] hover:bg-red-500 text-white'
+                              : 'bg-[#06B6D4] hover:bg-cyan-400 text-[#090D16]'
                           }`}
                         >
                           <Ambulance className="w-3.5 h-3.5" />
-                          Dispatch Ambulatory Care
+                          <span>Dispatch ALS-108</span>
                         </button>
                       )}
                     </div>
@@ -1019,188 +937,196 @@ export function DistrictCommandDashboard({
                 );
               })}
             </div>
-          </div>
-        </section>
+          </section>
+        </div>
 
-        {/* 4. BOTTOM LONGITUDINAL PATIENT TRIAGE REGISTRY TABLE */}
-        <section className="bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden">
-          <div className="px-4 py-3.5 border-b border-slate-200 flex flex-col md:flex-row md:items-center justify-between gap-3">
-            <div>
-              <h2 className="text-sm font-extrabold text-slate-900">
-                Patient Triage Longitudinal Registry (`healthsync_records`)
-              </h2>
-              <p className="text-[11px] text-slate-500">
-                Real-time persisted records synced via WebSocket, BroadcastChannel & LocalStorage
-              </p>
+        {/* EMBEDDED SMS BINARY PAYLOAD DECODER CONSOLE WITH STEP-BY-STEP UNPACKING ANIMATION */}
+        <section className="rounded-xl bg-[#0D1322] border border-slate-800 overflow-hidden">
+          <div className="px-4 py-3 bg-[#090D16] border-b border-slate-800 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5">
+              <Terminal className="w-4 h-4 text-[#F59E0B]" />
+              <div>
+                <h2 className="text-sm font-semibold text-slate-100">
+                  Embedded SMS Binary Payload Decoder &amp; FHIR Unpacker
+                </h2>
+                <p className="font-mono text-[11px] text-slate-400">
+                  Paste 160-character `HS3#` CRC32 packet (or legacy `HS#` packet) and execute
+                  bitstream demux
+                </p>
+              </div>
             </div>
 
-            <div className="flex flex-wrap items-center gap-2">
-              <div className="relative">
-                <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-                <input
-                  type="text"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Search ID, name, village, HS#..."
-                  className="h-9 pl-8 pr-3 rounded-lg border border-slate-300 text-xs text-slate-900 focus:outline-none focus:border-[#0D9488] w-56"
-                />
-              </div>
+            <span className="font-mono text-xs text-[#06B6D4] tabular-nums">
+              LEN: {decoderInput.trim().length} CHARS ·{' '}
+              {decodedPacket.valid ? decodedPacket.protocolVersion : 'AWAITING VALID FRAME'}
+            </span>
+          </div>
 
-              <div className="flex items-center gap-1.5">
-                <Filter className="w-3.5 h-3.5 text-slate-400" />
-                <select
-                  value={severityFilter}
-                  onChange={(e) =>
-                    setSeverityFilter(e.target.value as 'ALL' | SeverityLevel)
-                  }
-                  aria-label="Filter by severity"
-                  className="h-9 px-2.5 rounded-lg border border-slate-300 text-xs font-semibold text-slate-700 bg-white"
-                >
-                  <option value="ALL">All Severities</option>
-                  <option value="emergency">Critical RED</option>
-                  <option value="moderate">Moderate Yellow</option>
-                  <option value="routine">Routine Green</option>
-                </select>
-
-                <select
-                  value={channelFilter}
-                  onChange={(e) =>
-                    setChannelFilter(e.target.value as 'ALL' | SyncChannel)
-                  }
-                  aria-label="Filter by channel"
-                  className="h-9 px-2.5 rounded-lg border border-slate-300 text-xs font-semibold text-slate-700 bg-white"
-                >
-                  <option value="ALL">All Channels</option>
-                  <option value="Data">4G/2G Data</option>
-                  <option value="Emergency SMS">Emergency SMS</option>
-                </select>
-              </div>
-
+          <div className="p-4 sm:p-5 space-y-4">
+            {/* Console Input Bar + Unpack Bitstream Trigger */}
+            <div className="flex flex-col md:flex-row items-stretch md:items-center gap-2.5">
+              <input
+                type="text"
+                aria-label="Raw Base64 SMS Payload String"
+                value={decoderInput}
+                onChange={(e) => setDecoderInput(e.target.value)}
+                placeholder="Paste raw HS3#... 160-character Base64 SMS packet"
+                className="flex-1 min-h-[46px] px-3.5 rounded-lg bg-[#05080F] border border-slate-700 font-mono text-xs text-[#06B6D4] focus:border-[#06B6D4]"
+              />
               <button
                 type="button"
-                onClick={handleExportCsv}
-                className="h-9 px-3 rounded-lg border border-slate-300 bg-slate-50 hover:bg-slate-100 text-xs font-bold text-slate-800 flex items-center gap-1.5 cursor-pointer"
+                disabled={isUnpacking}
+                onClick={() => triggerStepByStepUnpack()}
+                className="min-h-[46px] px-5 rounded-lg bg-[#F59E0B] hover:bg-amber-400 disabled:opacity-60 text-[#090D16] font-mono text-xs font-bold inline-flex items-center justify-center gap-2 cursor-pointer shrink-0 whitespace-nowrap transition-colors"
               >
-                <Download className="w-3.5 h-3.5 text-[#0D9488]" />
-                Export CSV
+                <Play className="w-4 h-4 fill-current" />
+                <span>{isUnpacking ? 'Unpacking Bitstream...' : 'Unpack Bitstream'}</span>
               </button>
             </div>
-          </div>
 
-          <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse">
-              <thead>
-                <tr className="bg-slate-50 border-b border-slate-200 text-[11px] font-bold uppercase tracking-wider text-slate-500">
-                  <th className="py-2.5 px-4">Patient</th>
-                  <th className="py-2.5 px-3">Sub-Center</th>
-                  <th className="py-2.5 px-3">Vitals Snapshot</th>
-                  <th className="py-2.5 px-3">Severity</th>
-                  <th className="py-2.5 px-3">Channel & Sync</th>
-                  <th className="py-2.5 px-3">Bit-Packed SMS Frame</th>
-                  <th className="py-2.5 px-4 text-right">Dispatch / Inspect</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-200 text-xs">
-                {filteredTableRecords.map((r) => (
-                  <tr key={r.id} className="hover:bg-slate-50/80 transition-colors">
-                    <td className="py-3 px-4">
-                      <div className="font-bold text-slate-900">
-                        {r.patientName}{' '}
-                        <span className="font-mono text-[11px] text-slate-500">
-                          ({r.patientId})
-                        </span>
-                      </div>
-                      <div className="text-[11px] text-slate-500 font-mono">
-                        {r.age}y/{r.gender} · ABHA {r.abhaId}
-                      </div>
-                    </td>
-                    <td className="py-3 px-3">
-                      <span className="font-mono font-bold text-teal-800">
-                        {r.villageCode}
-                      </span>
-                      <div className="text-[11px] text-slate-500">{r.villageName}</div>
-                    </td>
-                    <td className="py-3 px-3 font-mono text-[11px] tabular-nums">
-                      <span className="font-bold text-slate-900">
-                        {r.vitals.systolic}/{r.vitals.diastolic}
-                      </span>{' '}
-                      mmHg · SpO₂ <span className="font-bold">{r.vitals.spo2}%</span> ·{' '}
-                      {r.vitals.temperature.toFixed(1)}°F
-                    </td>
-                    <td className="py-3 px-3">
-                      <span
-                        className={`inline-block px-2 py-0.5 rounded text-[10px] font-black uppercase ${
-                          r.severity === 'emergency'
-                            ? 'bg-red-100 text-red-700 border border-red-300'
-                            : r.severity === 'moderate'
-                            ? 'bg-amber-100 text-amber-800 border border-amber-300'
-                            : 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+            {!decodedPacket.valid ? (
+              <div className="rounded-lg bg-[#EF4444]/15 border border-[#EF4444] px-4 py-3 font-mono text-xs text-red-200">
+                DECODER FAULT: {decodedPacket.error}
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+                {/* Left 6 Cols: Step-by-Step Pipeline Stages 1..3 */}
+                <div className="lg:col-span-6 space-y-3 font-mono text-xs">
+                  {/* Stage 1: Frame Demux & Hex Buffer */}
+                  <AnimatePresence>
+                    {unpackStage >= 1 && (
+                      <motion.div
+                        initial={{opacity: 0, y: 6}}
+                        animate={{opacity: 1, y: 0}}
+                        transition={{duration: 0.16}}
+                        className="rounded-lg bg-[#05080F] border border-slate-800 p-3 space-y-1.5"
+                      >
+                        <div className="flex items-center justify-between text-[11px] text-[#06B6D4]">
+                          <span>[STAGE 01] BASE64 DEMUX &rarr; {decodedPacket.byteLength}B BUFFER</span>
+                          <span>MAGIC 0x32 OK</span>
+                        </div>
+                        <p className="text-[11px] text-slate-400 break-all leading-relaxed">
+                          {decodedPacket.hexDump}
+                        </p>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+
+                  {/* Stage 2: CRC32 & CRDT Vector Clock Verification */}
+                  <AnimatePresence>
+                    {unpackStage >= 2 && (
+                      <motion.div
+                        initial={{opacity: 0, y: 6}}
+                        animate={{opacity: 1, y: 0}}
+                        transition={{duration: 0.16}}
+                        className={`rounded-lg border p-3 space-y-1 ${
+                          decodedPacket.crcValid
+                            ? 'bg-[#05080F] border-emerald-500/40'
+                            : 'bg-[#EF4444]/15 border-[#EF4444]'
                         }`}
                       >
-                        {r.severity}
-                      </span>
-                    </td>
-                    <td className="py-3 px-3">
-                      <div className="font-semibold text-slate-800">{r.channel}</div>
-                      <div className="text-[11px] text-slate-500">
-                        {r.syncStatus} · {r.timestamp}
-                      </div>
-                    </td>
-                    <td className="py-3 px-3">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setPasteSmsInput(r.binarySmsPayload);
-                          setDrawerState({
-                            isOpen: true,
-                            record: r,
-                            mode: 'decode',
-                          });
-                        }}
-                        className="font-mono text-[11px] bg-slate-900 text-teal-300 px-2 py-1 rounded hover:bg-slate-800 cursor-pointer"
-                        title="Click to decode binary SMS frame"
+                        <div className="flex items-center justify-between text-[11px]">
+                          <span
+                            className={
+                              decodedPacket.crcValid ? 'text-emerald-400' : 'text-[#EF4444]'
+                            }
+                          >
+                            [STAGE 02] {decodedPacket.crcValid ? 'CRC32 VERIFIED' : 'CRC32 CORRUPTED'}
+                          </span>
+                          <span className="text-slate-300 tabular-nums">
+                            {decodedPacket.computedCrcHex} == {decodedPacket.receivedCrcHex}
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-[#F59E0B] tabular-nums">
+                          CRDT Vector Clock &rarr; node_id: {decodedPacket.crdtNodeId}, seq:{' '}
+                          {decodedPacket.crdtSeq}
+                        </div>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+
+                  {/* Stage 3: Unpacked Bitwise Hardware Registers */}
+                  <AnimatePresence>
+                    {unpackStage >= 3 && (
+                      <motion.div
+                        initial={{opacity: 0, y: 6}}
+                        animate={{opacity: 1, y: 0}}
+                        transition={{duration: 0.16}}
+                        className="rounded-lg bg-[#05080F] border border-slate-800 p-3 space-y-2"
                       >
-                        {r.binarySmsPayload}
-                      </button>
-                    </td>
-                    <td className="py-3 px-4 text-right">
-                      {r.dispatchStatus === 'Dispatched' ? (
-                        <span className="text-[11px] font-bold text-emerald-700">
-                          {r.ambulanceUnit} ({r.etaMinutes}m)
-                        </span>
-                      ) : r.severity === 'emergency' ? (
-                        <button
-                          type="button"
-                          onClick={() => onDispatchAmbulance(r.id)}
-                          className="h-7 px-2.5 rounded bg-[#EF4444] hover:bg-red-700 text-white text-[11px] font-bold cursor-pointer"
-                        >
-                          Dispatch 108
-                        </button>
-                      ) : (
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setDrawerState({
-                              isOpen: true,
-                              record: r,
-                              mode: 'vitals',
-                            })
-                          }
-                          className="h-7 px-2.5 rounded border border-slate-300 hover:bg-slate-100 text-[11px] font-semibold text-slate-700 cursor-pointer"
-                        >
-                          FHIR Bundle
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+                        <div className="flex items-center justify-between text-[11px] text-[#F59E0B]">
+                          <span>[STAGE 03] BITWISE REGISTER EXTRACTION</span>
+                          <span>
+                            {decodedPacket.patientId} · {decodedPacket.villageCode}
+                          </span>
+                        </div>
+                        <div className="divide-y divide-slate-800/80 text-[11px] tabular-nums">
+                          {decodedPacket.registers.map((r) => (
+                            <div
+                              key={r.registerName}
+                              className="py-1.5 flex items-center justify-between gap-2"
+                            >
+                              <span className="text-slate-400">{r.fieldLabel}</span>
+                              <span className="text-[#06B6D4]">{r.binaryString}</span>
+                              <strong className="text-slate-100">{r.rawValue}</strong>
+                            </div>
+                          ))}
+                        </div>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </div>
+
+                {/* Right 6 Cols: Stage 4 Complete ABDM FHIR R4 JSON Clinical Expansion */}
+                <div className="lg:col-span-6">
+                  <AnimatePresence>
+                    {unpackStage >= 4 && (
+                      <motion.div
+                        initial={{opacity: 0, y: 6}}
+                        animate={{opacity: 1, y: 0}}
+                        transition={{duration: 0.18}}
+                        className="rounded-lg bg-[#05080F] border border-slate-800 p-3 h-full flex flex-col justify-between space-y-2"
+                      >
+                        <div className="flex items-center justify-between font-mono text-[11px]">
+                          <span className="text-emerald-400 font-semibold">
+                            [STAGE 04] EXPANDED HL7 FHIR R4 CLINICAL BUNDLE
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              navigator.clipboard?.writeText(fhirBundleJson);
+                              setCopiedFhir(true);
+                              setTimeout(() => setCopiedFhir(false), 1800);
+                            }}
+                            className="px-2.5 py-1 rounded bg-[#11192C] hover:bg-slate-800 border border-slate-700 text-[#06B6D4] inline-flex items-center gap-1 cursor-pointer"
+                          >
+                            {copiedFhir ? (
+                              <>
+                                <Check className="w-3 h-3 text-emerald-400" />
+                                <span>Copied</span>
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="w-3 h-3" />
+                                <span>Copy FHIR JSON</span>
+                              </>
+                            )}
+                          </button>
+                        </div>
+
+                        <pre className="font-mono text-[11px] text-slate-200 overflow-x-auto max-h-[290px] leading-relaxed">
+                          {fhirBundleJson}
+                        </pre>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </div>
+              </div>
+            )}
           </div>
         </section>
       </main>
 
-      {/* BINARY SMS & FHIR UNPACKING DRAWER */}
       <BinarySmsDecoderDrawer
         record={drawerState.record}
         isOpen={drawerState.isOpen}
@@ -1210,4 +1136,4 @@ export function DistrictCommandDashboard({
       />
     </div>
   );
-}
+};

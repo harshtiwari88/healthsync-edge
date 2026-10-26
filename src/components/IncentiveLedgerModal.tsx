@@ -6,7 +6,6 @@ import {
   CheckCircle2,
   FileCheck2,
   Download,
-  ShieldCheck,
 } from 'lucide-react';
 import {IncentiveEntry} from '../types/triage';
 
@@ -68,7 +67,7 @@ export const IncentiveLedgerModal: React.FC<IncentiveLedgerModalProps> = ({
     <AnimatePresence>
       {isOpen && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-xs p-4"
           role="dialog"
           aria-modal="true"
           aria-labelledby="incentive-modal-title"
@@ -77,20 +76,17 @@ export const IncentiveLedgerModal: React.FC<IncentiveLedgerModalProps> = ({
             initial={{opacity: 0, scale: 0.96, y: 10}}
             animate={{opacity: 1, scale: 1, y: 0}}
             exit={{opacity: 0, scale: 0.96, y: 10}}
-            transition={{duration: 0.18}}
-            className="w-full max-w-lg rounded-3xl bg-white border border-slate-200 shadow-2xl overflow-hidden flex flex-col max-h-[88vh]"
+            transition={{duration: 0.16}}
+            className="w-full max-w-lg rounded-xl bg-[#090D16] border border-slate-800 shadow-2xl overflow-hidden flex flex-col max-h-[86vh] text-slate-100"
           >
-            {/* Header */}
-            <div className="bg-[#0F766E] text-white px-6 py-4 flex items-center justify-between gap-3">
+            <div className="bg-[#060911] px-5 py-4 border-b border-slate-800 flex items-center justify-between gap-3">
               <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-2xl bg-white/15 flex items-center justify-center shrink-0">
-                  <IndianRupee className="w-5 h-5 text-emerald-200" />
-                </div>
+                <IndianRupee className="w-5 h-5 text-[#06B6D4] shrink-0" />
                 <div>
-                  <h2 id="incentive-modal-title" className="text-base font-bold">
-                    Mera Incentive — ASHA Performance Ledger
+                  <h2 id="incentive-modal-title" className="text-sm font-semibold text-white">
+                    NHM PFMS Incentive Telemetry Ledger
                   </h2>
-                  <p className="text-xs text-teal-100">
+                  <p className="font-mono text-[11px] text-slate-400">
                     {ashaName} · {ashaId} · VIL-204
                   </p>
                 </div>
@@ -99,78 +95,59 @@ export const IncentiveLedgerModal: React.FC<IncentiveLedgerModalProps> = ({
                 type="button"
                 onClick={onClose}
                 aria-label="Close Incentive Modal"
-                className="min-h-[44px] min-w-[44px] rounded-xl bg-white/10 hover:bg-white/20 flex items-center justify-center cursor-pointer"
+                className="min-h-[38px] min-w-[38px] rounded-lg bg-[#11192C] border border-slate-700 flex items-center justify-center cursor-pointer"
               >
-                <X className="w-5 h-5" />
+                <X className="w-4 h-4" />
               </button>
             </div>
 
-            {/* Summary Strip */}
-            <div className="grid grid-cols-2 gap-3 p-5 bg-slate-50 border-b border-slate-200">
-              <div className="rounded-2xl bg-white border border-slate-200 p-3.5">
-                <span className="text-xs font-semibold text-slate-500">Earned Today</span>
-                <p className="mt-1 font-mono text-2xl font-bold text-[#0F766E] tabular-nums">
-                  ₹{todayTotal}
-                </p>
-                <span className="text-[11px] text-emerald-700 font-medium">
-                  {entries.length} Verified Tasks
+            <div className="grid grid-cols-2 gap-3 p-4 bg-[#0D1322] border-b border-slate-800 font-mono tabular-nums">
+              <div className="rounded-lg bg-[#090D16] border border-slate-800 p-3">
+                <span className="text-[10px] text-slate-400">EARNED TODAY</span>
+                <p className="mt-1 text-2xl font-bold text-[#06B6D4]">₹{todayTotal}</p>
+                <span className="text-[11px] text-emerald-400">
+                  {entries.length} SIGNED EVENTS
                 </span>
               </div>
-              <div className="rounded-2xl bg-white border border-slate-200 p-3.5">
-                <span className="text-xs font-semibold text-slate-500">Monthly PFMS Cycle</span>
-                <p className="mt-1 font-mono text-2xl font-bold text-slate-900 tabular-nums">
-                  ₹{monthlyProjected}
-                </p>
-                <span className="text-[11px] text-slate-500">Direct Benefit Transfer Ready</span>
+              <div className="rounded-lg bg-[#090D16] border border-slate-800 p-3">
+                <span className="text-[10px] text-slate-400">MONTHLY PFMS CYCLE</span>
+                <p className="mt-1 text-2xl font-bold text-[#F59E0B]">₹{monthlyProjected}</p>
+                <span className="text-[11px] text-slate-400">DBT VOUCHER READY</span>
               </div>
             </div>
 
-            {/* Daily Task Breakdown List */}
-            <div className="flex-1 overflow-y-auto px-6 py-4 divide-y divide-slate-100">
+            <div className="flex-1 overflow-y-auto px-5 py-3 divide-y divide-slate-800/80">
               {entries.map((entry) => (
-                <div key={entry.id} className="py-3.5 flex items-center justify-between gap-3">
+                <div key={entry.id} className="py-3 flex items-center justify-between gap-3">
                   <div className="min-w-0">
-                    <p className="text-sm font-bold text-slate-900">{entry.taskTitle}</p>
-                    <p className="text-xs text-slate-500 mt-0.5">
-                      <span className="font-mono">{entry.programCode}</span> · {entry.patientRef} ·{' '}
-                      {entry.timestamp}
+                    <p className="text-xs font-semibold text-slate-100">{entry.taskTitle}</p>
+                    <p className="font-mono text-[11px] text-slate-400 mt-0.5">
+                      {entry.programCode} · {entry.patientRef} · {entry.timestamp}
                     </p>
                   </div>
-                  <div className="text-right shrink-0">
-                    <span className="font-mono text-base font-bold text-[#0F766E] tabular-nums">
-                      +₹{entry.amountInr}
-                    </span>
-                    {entry.abdmVerified && (
-                      <div className="text-[10px] font-semibold text-emerald-700 flex items-center justify-end gap-1">
-                        <ShieldCheck className="w-3 h-3 text-[#10B981]" />
-                        <span>ABDM Signed</span>
-                      </div>
-                    )}
-                  </div>
+                  <span className="font-mono text-sm font-bold text-[#06B6D4] tabular-nums shrink-0">
+                    +₹{entry.amountInr}
+                  </span>
                 </div>
               ))}
             </div>
 
-            {/* Claim Banner & Primary Action */}
-            <div className="p-5 bg-slate-50 border-t border-slate-200 space-y-3">
+            <div className="p-4 bg-[#060911] border-t border-slate-800 space-y-3">
               {claimGenerated && (
-                <div className="rounded-2xl bg-emerald-50 border border-emerald-200 p-3 flex items-center gap-2.5 text-xs text-emerald-950">
-                  <CheckCircle2 className="w-4 h-4 text-[#10B981] shrink-0" />
-                  <span>
-                    Monthly BMO Claim Voucher <strong className="font-mono">{claimGenerated}</strong>{' '}
-                    signed &amp; downloaded for PFMS disbursal.
-                  </span>
+                <div className="rounded-lg bg-emerald-500/15 border border-emerald-500/40 p-2.5 flex items-center gap-2 font-mono text-xs text-emerald-300">
+                  <CheckCircle2 className="w-4 h-4 shrink-0" />
+                  <span>Signed Claim {claimGenerated} exported.</span>
                 </div>
               )}
 
               <button
                 type="button"
                 onClick={handleGenerateClaim}
-                className="w-full min-h-[50px] px-5 rounded-xl bg-[#0F766E] hover:bg-teal-800 text-white text-sm font-bold inline-flex items-center justify-center gap-2 transition-colors cursor-pointer"
+                className="w-full min-h-[48px] px-4 rounded-lg bg-[#06B6D4] hover:bg-cyan-400 text-[#090D16] font-mono text-xs font-bold inline-flex items-center justify-center gap-2 cursor-pointer transition-colors"
               >
                 <FileCheck2 className="w-4 h-4" />
-                <span>Generate Monthly BMO Claim</span>
-                <Download className="w-4 h-4 opacity-80" />
+                <span>Export Signed BMO Claim Voucher</span>
+                <Download className="w-4 h-4" />
               </button>
             </div>
           </motion.div>

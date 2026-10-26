@@ -27,52 +27,61 @@ export const PWAInstallButton: React.FC<PWAInstallButtonProps> = ({compact = fal
       <button
         type="button"
         onClick={handleClick}
-        className={`inline-flex items-center justify-center gap-1.5 rounded-lg border border-slate-200 bg-white font-medium text-slate-700 hover:bg-slate-50 hover:text-slate-900 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-          compact ? 'min-h-[44px] px-3 text-xs' : 'min-h-[40px] px-3.5 py-2 text-xs'
+        className={`inline-flex items-center justify-center gap-1.5 rounded-lg border border-slate-700 bg-[#0D1322] font-mono font-semibold text-slate-200 hover:bg-slate-800 hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+          compact ? 'h-9 px-3 text-xs' : 'h-9 px-3.5 text-xs'
         }`}
-        title="Install Offline Field PWA"
+        title="Install Offline Field OS PWA"
       >
-        <Download className="w-3.5 h-3.5 text-[#0F766E] shrink-0" />
-        <span>{isIOS ? 'Install on iOS' : compact ? 'Install' : 'Install PWA'}</span>
+        <Download className="w-3.5 h-3.5 text-[#06B6D4] shrink-0" />
+        <span>{isIOS ? 'Install iOS' : compact ? 'Install OS' : 'Install Field OS'}</span>
       </button>
 
       {showGuide && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-xs p-4"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-xs p-4"
           role="dialog"
           aria-modal="true"
           aria-labelledby="pwa-install-title"
         >
-          <div className="w-full max-w-sm rounded-2xl bg-white p-6 shadow-xl border border-slate-200">
+          <div className="w-full max-w-sm rounded-xl bg-[#090D16] p-6 shadow-2xl border border-slate-800 text-slate-100">
             <div className="flex items-start justify-between gap-3">
               <div className="flex items-center gap-2.5">
-                <div className="w-9 h-9 rounded-xl bg-teal-50 text-[#0F766E] flex items-center justify-center shrink-0">
-                  <Smartphone className="w-5 h-5" />
+                <div className="w-9 h-9 rounded-lg bg-[#06B6D4]/15 border border-[#06B6D4]/50 text-[#06B6D4] flex items-center justify-center shrink-0">
+                  <Smartphone className="w-4 h-4" />
                 </div>
-                <h3 id="pwa-install-title" className="text-base font-bold text-slate-900">
-                  Install Offline Field App
+                <h3 id="pwa-install-title" className="text-sm font-semibold text-white">
+                  Install HealthSync OS Offline
                 </h3>
               </div>
               <button
                 type="button"
                 onClick={() => setShowGuide(false)}
-                className="min-h-[44px] min-w-[44px] -m-2 flex items-center justify-center text-slate-400 hover:text-slate-700 rounded-lg cursor-pointer"
+                className="min-h-[38px] min-w-[38px] flex items-center justify-center text-slate-400 hover:text-white rounded-lg cursor-pointer"
                 aria-label="Close install instructions"
               >
-                <X className="w-5 h-5" />
+                <X className="w-4 h-4" />
               </button>
             </div>
 
-            <div className="mt-4 space-y-2.5 text-sm text-slate-600 leading-relaxed">
+            <div className="mt-4 space-y-2.5 text-xs text-slate-300 leading-relaxed">
               {isIOS ? (
                 <>
-                  <p>1. Tap the <strong>Share</strong> icon in your Safari toolbar.</p>
-                  <p>2. Scroll down and tap <strong>Add to Home Screen</strong> to cache SwasthyaSetu for offline village visits.</p>
+                  <p>1. Tap the <strong>Share</strong> icon in Safari.</p>
+                  <p>
+                    2. Select <strong>Add to Home Screen</strong> to cache HealthSync OS v3.2 for
+                    zero-network field deployments.
+                  </p>
                 </>
               ) : (
                 <>
-                  <p>SwasthyaSetu is configured with offline service-worker caching for zero-network sub-centers.</p>
-                  <p>Open the app in a top-level browser tab and click the address-bar <strong>Install App</strong> icon (or browser menu → <strong>Install SwasthyaSetu</strong>).</p>
+                  <p>
+                    Service Worker precaching &amp; IndexedDB vaults are active for zero-network
+                    rural operations.
+                  </p>
+                  <p>
+                    Open in a standalone browser tab and click the address-bar{' '}
+                    <strong>Install App</strong> icon to mount locally.
+                  </p>
                 </>
               )}
             </div>
@@ -80,9 +89,9 @@ export const PWAInstallButton: React.FC<PWAInstallButtonProps> = ({compact = fal
             <button
               type="button"
               onClick={() => setShowGuide(false)}
-              className="mt-5 w-full min-h-[48px] rounded-xl bg-[#0F766E] text-white text-sm font-semibold hover:bg-teal-800 transition-colors cursor-pointer"
+              className="mt-5 w-full min-h-[44px] rounded-lg bg-[#06B6D4] hover:bg-cyan-400 text-[#090D16] font-mono text-xs font-bold transition-colors cursor-pointer"
             >
-              Got It
+              Acknowledge
             </button>
           </div>
         </div>

@@ -8,7 +8,6 @@ import {
   Copy,
   ShieldCheck,
   Activity,
-  FlaskConical,
 } from 'lucide-react';
 import {TriageRecord} from '../types/triage';
 import {
@@ -62,7 +61,7 @@ export const BinarySmsDecoderDrawer: React.FC<BinarySmsDecoderDrawerProps> = ({
   return (
     <AnimatePresence>
       <div
-        className="fixed inset-0 z-50 flex justify-end bg-slate-900/60 backdrop-blur-xs"
+        className="fixed inset-0 z-50 flex justify-end bg-black/70 backdrop-blur-xs"
         role="dialog"
         aria-modal="true"
         aria-labelledby="sms-decoder-drawer-heading"
@@ -71,200 +70,137 @@ export const BinarySmsDecoderDrawer: React.FC<BinarySmsDecoderDrawerProps> = ({
           initial={{x: '100%'}}
           animate={{x: 0}}
           exit={{x: '100%'}}
-          transition={{type: 'spring', stiffness: 320, damping: 32}}
-          className="w-full max-w-xl bg-white h-full shadow-2xl border-l border-slate-200 flex flex-col"
+          transition={{duration: 0.18}}
+          className="w-full max-w-xl bg-[#090D16] text-slate-100 h-full shadow-2xl border-l border-slate-800 flex flex-col"
         >
-          {/* Drawer Header */}
-          <div className="px-6 py-4 bg-[#0F172A] text-white flex items-center justify-between gap-3">
+          <div className="px-5 py-4 bg-[#060911] border-b border-slate-800 flex items-center justify-between gap-3">
             <div className="flex items-center gap-3 min-w-0">
-              <div className="w-10 h-10 rounded-xl bg-[#0D9488] flex items-center justify-center shrink-0">
+              <div className="w-9 h-9 rounded-lg bg-[#06B6D4]/15 border border-[#06B6D4]/50 flex items-center justify-center shrink-0">
                 {mode === 'decode' ? (
-                  <Binary className="w-5 h-5 text-white" />
+                  <Binary className="w-4 h-4 text-[#06B6D4]" />
                 ) : (
-                  <Activity className="w-5 h-5 text-white" />
+                  <Activity className="w-4 h-4 text-[#F59E0B]" />
                 )}
               </div>
               <div className="min-w-0">
-                <h2 id="sms-decoder-drawer-heading" className="text-base font-bold truncate">
+                <h2
+                  id="sms-decoder-drawer-heading"
+                  className="text-sm font-semibold text-white truncate"
+                >
                   {mode === 'decode'
-                    ? 'Bitwise Base64 Binary SMS Decoder'
-                    : `Clinical Vitals & Telemetry · ${record?.patientId ?? decoded.patientId}`}
+                    ? 'Packet Bitstream & CRC32 Inspector'
+                    : `Clinical Telemetry Bundle · ${record?.patientId ?? decoded.patientId}`}
                 </h2>
-                <p className="text-xs text-slate-300 truncate">
-                  Pure JavaScript DataView + CRC-16-CCITT Reverse Unpacker
+                <p className="font-mono text-[11px] text-slate-400 truncate">
+                  {decoded.protocolVersion} · CRDT {decoded.crdtNodeId}:{decoded.crdtSeq}
                 </p>
               </div>
             </div>
             <button
               type="button"
               onClick={onClose}
-              aria-label="Close Decoder Drawer"
-              className="min-h-[44px] min-w-[44px] rounded-xl bg-white/10 hover:bg-white/20 flex items-center justify-center cursor-pointer"
+              aria-label="Close Inspector"
+              className="min-h-[40px] min-w-[40px] rounded-lg bg-[#11192C] hover:bg-slate-800 border border-slate-700 flex items-center justify-center cursor-pointer"
             >
-              <X className="w-5 h-5" />
+              <X className="w-4 h-4" />
             </button>
           </div>
 
-          <div className="flex-1 overflow-y-auto p-6 space-y-6">
-            {/* Live Interactive SMS Payload Decoder Input */}
-            <section className="space-y-2.5">
-              <div className="flex items-center justify-between">
-                <label
-                  htmlFor="live-sms-decoder-input"
-                  className="text-xs font-bold text-slate-900 inline-flex items-center gap-1.5"
-                >
-                  <FlaskConical className="w-4 h-4 text-[#0D9488]" />
-                  <span>Paste or Edit `HS#` SMS Payload to Test Real-Time Bit Unpacking:</span>
-                </label>
-                <span className="font-mono text-[11px] text-slate-500 tabular-nums">
+          <div className="flex-1 overflow-y-auto p-5 space-y-5">
+            <section className="space-y-2">
+              <div className="flex items-center justify-between font-mono text-[11px]">
+                <span className="text-slate-300">RAW BASE64 SMS PACKET</span>
+                <span className="text-[#06B6D4] tabular-nums">
                   {testPayloadInput.length} chars
                 </span>
               </div>
-
               <input
-                id="live-sms-decoder-input"
                 type="text"
+                aria-label="SMS Packet Input"
                 value={testPayloadInput}
                 onChange={(e) => setTestPayloadInput(e.target.value)}
-                placeholder="HS#..."
-                className="w-full min-h-[48px] px-4 rounded-xl bg-slate-950 text-[#06B6D4] font-mono text-sm border border-slate-800"
+                className="w-full min-h-[44px] px-3.5 rounded-lg bg-[#05080F] text-[#06B6D4] font-mono text-xs border border-slate-800"
               />
 
               {decoded.valid ? (
                 <div
-                  className={`rounded-xl px-3.5 py-2.5 text-xs font-bold flex items-center justify-between ${
+                  className={`rounded-lg px-3.5 py-2.5 font-mono text-xs flex items-center justify-between border ${
                     decoded.crcValid
-                      ? 'bg-emerald-50 border border-emerald-200 text-emerald-900'
-                      : 'bg-red-50 border border-red-300 text-red-900'
+                      ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-300'
+                      : 'bg-[#EF4444]/15 border-[#EF4444] text-red-200'
                   }`}
                 >
                   <span className="inline-flex items-center gap-1.5">
                     {decoded.crcValid ? (
-                      <ShieldCheck className="w-4 h-4 text-[#10B981]" />
+                      <ShieldCheck className="w-4 h-4 text-emerald-400" />
                     ) : (
                       <AlertTriangle className="w-4 h-4 text-[#EF4444]" />
                     )}
-                    {decoded.crcValid
-                      ? '18-Byte Binary Frame & CRC-16 Checksum Verified'
-                      : decoded.error}
+                    {decoded.crcValid ? 'CHECKSUM & BITSTREAM VERIFIED' : decoded.error}
                   </span>
-                  <span className="font-mono tabular-nums">
-                    CRC {decoded.receivedCrcHex}
-                  </span>
+                  <span className="tabular-nums">{decoded.receivedCrcHex}</span>
                 </div>
               ) : (
-                <div className="rounded-xl px-3.5 py-2.5 text-xs font-bold bg-red-50 border border-red-300 text-red-900">
+                <div className="rounded-lg px-3.5 py-2.5 font-mono text-xs bg-[#EF4444]/15 border border-[#EF4444] text-red-200">
                   {decoded.error}
                 </div>
               )}
             </section>
 
-            {/* Decoded Numerical Vitals Output */}
             {decoded.valid && (
               <>
-                <section className="space-y-3">
-                  <div className="flex items-center justify-between">
-                    <h3 className="text-xs font-bold text-slate-700">
-                      Decoded Numerical Vitals &amp; Identifiers
-                    </h3>
-                    <span
-                      className={`text-xs font-bold ${
-                        decoded.severity === 'emergency'
-                          ? 'text-[#EF4444]'
-                          : decoded.severity === 'moderate'
-                          ? 'text-[#F59E0B]'
-                          : 'text-[#10B981]'
-                      }`}
-                    >
-                      {decoded.severity.toUpperCase()}
-                    </span>
+                <section className="rounded-lg bg-[#0D1322] border border-slate-800 p-3.5 space-y-2 font-mono text-xs tabular-nums">
+                  <div className="text-[11px] text-slate-400">
+                    HEX HEADER: {decoded.hexDump}
                   </div>
-
-                  <div className="grid grid-cols-5 gap-2 text-center font-mono tabular-nums">
-                    <div className="rounded-2xl bg-slate-50 border border-slate-200 p-2.5">
-                      <span className="block text-[10px] font-sans text-slate-500">BP</span>
-                      <strong className="text-xs text-slate-900">
+                  <div className="grid grid-cols-4 gap-2 pt-2 border-t border-slate-800 text-center">
+                    <div>
+                      <span className="block text-[10px] text-slate-500">NIBP</span>
+                      <strong className="text-white">
                         {decoded.vitals.systolic}/{decoded.vitals.diastolic}
                       </strong>
                     </div>
-                    <div className="rounded-2xl bg-slate-50 border border-slate-200 p-2.5">
-                      <span className="block text-[10px] font-sans text-slate-500">SpO₂</span>
-                      <strong className="text-xs text-slate-900">{decoded.vitals.spo2}%</strong>
+                    <div>
+                      <span className="block text-[10px] text-slate-500">SpO₂</span>
+                      <strong className="text-[#06B6D4]">{decoded.vitals.spo2}%</strong>
                     </div>
-                    <div className="rounded-2xl bg-slate-50 border border-slate-200 p-2.5">
-                      <span className="block text-[10px] font-sans text-slate-500">Temp</span>
-                      <strong className="text-xs text-slate-900">
+                    <div>
+                      <span className="block text-[10px] text-slate-500">HR</span>
+                      <strong className="text-[#F59E0B]">{decoded.vitals.heartRate}</strong>
+                    </div>
+                    <div>
+                      <span className="block text-[10px] text-slate-500">TEMP</span>
+                      <strong className="text-white">
                         {decoded.vitals.temperature.toFixed(1)}°F
                       </strong>
-                    </div>
-                    <div className="rounded-2xl bg-slate-50 border border-slate-200 p-2.5">
-                      <span className="block text-[10px] font-sans text-slate-500">HR</span>
-                      <strong className="text-xs text-slate-900">
-                        {decoded.vitals.heartRate} bpm
-                      </strong>
-                    </div>
-                    <div className="rounded-2xl bg-slate-50 border border-slate-200 p-2.5">
-                      <span className="block text-[10px] font-sans text-slate-500">Node</span>
-                      <strong className="text-xs text-[#0D9488]">{decoded.villageCode}</strong>
-                    </div>
-                  </div>
-
-                  {/* Bitwise Breakdown */}
-                  <div className="rounded-2xl border border-slate-200 overflow-hidden text-xs">
-                    <div className="bg-slate-50 px-4 py-2 border-b border-slate-200 font-mono text-[11px] text-slate-600">
-                      Hex Dump ({decoded.byteLength}B): {decoded.hexDump}
-                    </div>
-                    <div className="divide-y divide-slate-100">
-                      <div className="px-4 py-2 flex justify-between">
-                        <span className="text-slate-600">Patient &amp; Sub-Center IDs</span>
-                        <span className="font-mono font-semibold text-slate-900">
-                          {decoded.patientId} · {decoded.villageCode}
-                        </span>
-                      </div>
-                      <div className="px-4 py-2 flex justify-between">
-                        <span className="text-slate-600">Unpacked Symptoms (6-bit mask)</span>
-                        <span className="font-mono font-semibold text-slate-900">
-                          0b{decoded.symptomBitmask.toString(2).padStart(6, '0')} →{' '}
-                          {decoded.symptoms.join(', ') || 'None'}
-                        </span>
-                      </div>
-                      <div className="px-4 py-2 flex justify-between">
-                        <span className="text-slate-600">Edge-AI Flags (2-bit mask)</span>
-                        <span className="font-mono font-semibold text-[#0D9488]">
-                          Pallor: {decoded.anemiaSuspected ? 'YES' : 'NO'} · Resp:{' '}
-                          {decoded.respiratoryRiskHigh ? 'HIGH' : 'NORM'}
-                        </span>
-                      </div>
                     </div>
                   </div>
                 </section>
 
-                {/* FHIR JSON Output */}
                 <section className="space-y-2">
                   <div className="flex items-center justify-between">
-                    <h3 className="text-xs font-bold text-slate-900">
-                      ABDM HL7 FHIR R4 Observation Bundle
-                    </h3>
+                    <span className="font-mono text-xs font-semibold text-slate-200">
+                      HL7 FHIR R4 OBSERVATION BUNDLE
+                    </span>
                     <button
                       type="button"
                       onClick={handleCopy}
-                      className="min-h-[34px] px-3 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-xs font-semibold text-slate-800 inline-flex items-center gap-1.5 cursor-pointer"
+                      className="min-h-[34px] px-3 rounded bg-[#11192C] hover:bg-slate-800 border border-slate-700 font-mono text-xs text-[#06B6D4] inline-flex items-center gap-1.5 cursor-pointer"
                     >
                       {copied ? (
                         <>
-                          <CheckCircle2 className="w-3.5 h-3.5 text-[#10B981]" />
+                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
                           <span>Copied</span>
                         </>
                       ) : (
                         <>
-                          <Copy className="w-3.5 h-3.5 text-slate-600" />
+                          <Copy className="w-3.5 h-3.5" />
                           <span>Copy JSON</span>
                         </>
                       )}
                     </button>
                   </div>
-
-                  <pre className="rounded-2xl bg-slate-950 text-slate-100 font-mono text-[11px] p-4 overflow-x-auto leading-relaxed border border-slate-800 max-h-64">
+                  <pre className="rounded-lg bg-[#05080F] text-slate-200 font-mono text-[11px] p-4 overflow-x-auto leading-relaxed border border-slate-800">
                     {fhirJson}
                   </pre>
                 </section>

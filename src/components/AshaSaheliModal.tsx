@@ -6,7 +6,6 @@ import {
   MicOff,
   Volume2,
   VolumeX,
-  Send,
   CheckCircle2,
   Bot,
   User,
@@ -41,7 +40,7 @@ interface AshaSaheliModalProps {
   onApplyFormPatch: (patch: SaheliFormPatch) => void;
 }
 
-const DEMO_CHIPS = [
+const DEMO_VOICE_STREAMS = [
   'BP 160/100 SpO2 88%',
   'Bukhar 102°F khansi',
   'Emergency First-Aid Steps',
@@ -58,10 +57,9 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
       id: 'm-welcome',
       sender: 'bot',
       lang: 'hi-IN',
-      text: 'नमस्ते सुनीता दीदी! मरीज़ का बीपी (जैसे BP 150 by 95), ऑक्सीजन (SpO2), बुखार या लक्षण बोलिए।',
+      text: 'नमस्ते सुनीता दीदी! मरीज़ का बीपी (BP 150 by 95), ऑक्सीजन (SpO2), बुखार या लक्षण बोलिए।',
     },
   ]);
-  const [inputText, setInputText] = useState<string>('');
   const [liveInterim, setLiveInterim] = useState<string>('');
   const [ttsEnabled, setTtsEnabled] = useState<boolean>(!audioMuted);
   const [isListening, setIsListening] = useState<boolean>(false);
@@ -113,8 +111,8 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
 
     if (parsed.isEmergencyFirstAidQuery) {
       botReply =
-        'दीदी, आपातकालीन प्राथमिक उपचार: 1. मरीज़ को सहारा देकर आधा बिठाएं। 2. गले और छाती के कपड़े ढीले करें। 3. नीचे लाल बटन से तुरंत एन्क्रिप्टेड इमरजेंसी एसएमएस भेजें और 108 एम्बुलेंस बुलाएं।';
-      summary = 'First-Aid Protocol Spoken Aloud';
+        'दीदी, आपातकालीन प्रोटोकॉल: 1. मरीज़ को सहारा देकर आधा बिठाएं। 2. श्वास मार्ग खुला रखें। 3. तुरंत 160-बाइट इमरजेंसी एसएमएस ट्रांसमिट करें।';
+      summary = 'Emergency Stabilization Protocol';
       onApplyFormPatch({
         clinicalNotes: 'Emergency First-Aid stabilization steps initiated via ASHA Saheli.',
         rawTranscript: trimmed,
@@ -129,16 +127,16 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
       summary = parsed.badges.map((b) => b.label).join(' · ');
       const hasCritical = parsed.badges.some((b) => b.tone === 'red');
       botReply = hasCritical
-        ? `सावधान दीदी! ${summary} गंभीर खतरे का संकेत है। मैंने फॉर्म भर दिया है, कृपया तुरंत एन्क्रिप्टेड एसएमएस भेजें!`
-        : `धन्यवाद दीदी! मैंने ${summary} मरीज़ के फॉर्म में दर्ज कर दिया है।`;
+        ? `सावधान दीदी! ${summary} गंभीर खतरे का संकेत है। वाइटल्स टेलीमेट्री अपडेट कर दिया गया है!`
+        : `धन्यवाद दीदी! ${summary} टेलीमेट्री कंट्रोलर में दर्ज कर दिया गया है।`;
     } else {
       onApplyFormPatch({
         clinicalNotes: `Voice Note: "${trimmed}"`,
         rawTranscript: trimmed,
       });
       botReply =
-        'दीदी, आपका नोट सुरक्षित कर लिया गया है। वाइटल्स भरने के लिए "BP 140 by 90" या "Oxygen 92" बोलें।';
-      summary = 'Voice note saved';
+        'दीदी, आपका नोट सुरक्षित कर लिया गया है। वाइटल्स के लिए "BP 140 by 90" बोलें।';
+      summary = 'Voice telemetry logged';
     }
 
     const botMsg: ChatMessage = {
@@ -150,7 +148,6 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
     };
 
     setMessages((prev) => [...prev, userMsg, botMsg]);
-    setInputText('');
     setLiveInterim('');
 
     if (ttsEnabled) {
@@ -169,7 +166,7 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
     const recognition = createBrowserSpeechRecognition('hi-IN');
     if (!recognition) {
       setSpeechStatusMsg(
-        'Web Speech API is not supported in this browser (use Chrome/Edge, or type/tap a test phrase below).'
+        'Web Speech API unavailable here — tap a Voice Stream Trigger below.'
       );
       return;
     }
@@ -190,7 +187,7 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
 
     recognition.onerror = (ev) => {
       setIsListening(false);
-      setSpeechStatusMsg(`Microphone recognition status: ${ev.error}. Check mic permissions.`);
+      setSpeechStatusMsg(`Speech status: ${ev.error}`);
     };
 
     recognition.onend = () => {
@@ -206,7 +203,6 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
       recognition.start();
     } catch {
       setIsListening(false);
-      setSpeechStatusMsg('Could not start SpeechRecognition.');
     }
   };
 
@@ -214,29 +210,27 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
     <AnimatePresence>
       {isOpen && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/65 backdrop-blur-xs p-3 sm:p-4"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-xs p-4"
           role="dialog"
           aria-modal="true"
           aria-labelledby="asha-saheli-dialog-title"
         >
           <motion.div
-            initial={{opacity: 0, scale: 0.95, y: 14}}
+            initial={{opacity: 0, scale: 0.96, y: 10}}
             animate={{opacity: 1, scale: 1, y: 0}}
-            exit={{opacity: 0, scale: 0.95, y: 14}}
-            transition={{type: 'spring', stiffness: 360, damping: 28}}
-            className="w-full max-w-md rounded-3xl bg-white border border-slate-200 shadow-2xl overflow-hidden flex flex-col max-h-[88vh]"
+            exit={{opacity: 0, scale: 0.96, y: 10}}
+            transition={{duration: 0.16}}
+            className="w-full max-w-md rounded-xl bg-[#090D16] border border-slate-800 shadow-2xl overflow-hidden flex flex-col max-h-[85vh] text-slate-100"
           >
-            <div className="bg-[#0F172A] text-white px-5 py-4 flex items-center justify-between gap-3">
-              <div className="flex items-center gap-3 min-w-0">
-                <div className="w-10 h-10 rounded-2xl bg-[#0D9488] flex items-center justify-center shrink-0">
-                  <Bot className="w-5 h-5 text-white" />
-                </div>
+            <div className="bg-[#060911] px-4 py-3.5 border-b border-slate-800 flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <Bot className="w-5 h-5 text-[#06B6D4] shrink-0" />
                 <div className="min-w-0">
-                  <h2 id="asha-saheli-dialog-title" className="text-base font-bold truncate">
-                    ASHA Saheli Voice Assistant
+                  <h2 id="asha-saheli-dialog-title" className="text-sm font-semibold truncate">
+                    ASHA Saheli · Two-Way Voice Console
                   </h2>
-                  <p className="text-xs text-[#06B6D4] truncate">
-                    Real Web Speech API + Hindi Audio Guidance
+                  <p className="font-mono text-[11px] text-[#06B6D4] truncate">
+                    ASR + SpeechSynthesis [hi-IN]
                   </p>
                 </div>
               </div>
@@ -251,25 +245,28 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
                       window.speechSynthesis.cancel();
                     }
                   }}
-                  title={ttsEnabled ? 'Mute TTS Voice' : 'Unmute TTS Voice'}
-                  className="min-h-[44px] min-w-[44px] rounded-xl bg-white/10 hover:bg-white/20 flex items-center justify-center cursor-pointer"
+                  className="min-h-[38px] min-w-[38px] rounded-lg bg-[#11192C] border border-slate-700 flex items-center justify-center cursor-pointer"
                 >
-                  {ttsEnabled ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
+                  {ttsEnabled ? (
+                    <Volume2 className="w-4 h-4 text-[#06B6D4]" />
+                  ) : (
+                    <VolumeX className="w-4 h-4 text-slate-500" />
+                  )}
                 </button>
                 <button
                   type="button"
                   onClick={onClose}
-                  aria-label="Close Voice Assistant"
-                  className="min-h-[44px] min-w-[44px] rounded-xl bg-white/10 hover:bg-white/20 flex items-center justify-center cursor-pointer"
+                  aria-label="Close Voice Console"
+                  className="min-h-[38px] min-w-[38px] rounded-lg bg-[#11192C] border border-slate-700 flex items-center justify-center cursor-pointer"
                 >
-                  <X className="w-5 h-5" />
+                  <X className="w-4 h-4" />
                 </button>
               </div>
             </div>
 
             <div
               ref={scrollRef}
-              className="flex-1 overflow-y-auto p-4 space-y-3.5 bg-[#F8FAFC] min-h-[250px]"
+              className="flex-1 overflow-y-auto p-4 space-y-3 bg-[#090D16] min-h-[240px]"
             >
               {messages.map((msg) => (
                 <div
@@ -279,41 +276,41 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
                   }`}
                 >
                   <div
-                    className={`w-8 h-8 rounded-full flex items-center justify-center shrink-0 mt-0.5 ${
+                    className={`w-7 h-7 rounded-full flex items-center justify-center shrink-0 mt-0.5 border ${
                       msg.sender === 'asha'
-                        ? 'bg-[#0F172A] text-white'
-                        : 'bg-teal-100 text-[#0D9488]'
+                        ? 'bg-[#F59E0B]/15 border-[#F59E0B]/50 text-[#F59E0B]'
+                        : 'bg-[#06B6D4]/15 border-[#06B6D4]/50 text-[#06B6D4]'
                     }`}
                   >
                     {msg.sender === 'asha' ? (
-                      <User className="w-4 h-4" />
+                      <User className="w-3.5 h-3.5" />
                     ) : (
-                      <Bot className="w-4 h-4" />
+                      <Bot className="w-3.5 h-3.5" />
                     )}
                   </div>
 
                   <div
-                    className={`max-w-[82%] rounded-2xl px-4 py-3 text-sm leading-relaxed ${
+                    className={`max-w-[82%] rounded-lg px-3.5 py-2.5 text-xs leading-relaxed border ${
                       msg.sender === 'asha'
-                        ? 'bg-[#0D9488] text-white rounded-tr-sm'
-                        : 'bg-white border border-slate-200 text-slate-900 rounded-tl-sm shadow-2xs'
+                        ? 'bg-[#06B6D4]/15 border-[#06B6D4]/50 text-white'
+                        : 'bg-[#0D1322] border-slate-800 text-slate-200'
                     }`}
                   >
-                    <p className="font-medium">{msg.text}</p>
+                    <p>{msg.text}</p>
                     {msg.sender === 'bot' && (
-                      <div className="mt-2 pt-2 border-t border-slate-100 flex items-center justify-between gap-2">
+                      <div className="mt-2 pt-2 border-t border-slate-800 flex items-center justify-between gap-2 font-mono text-[10px]">
                         {msg.appliedSummary ? (
-                          <span className="inline-flex items-center gap-1 text-[11px] font-bold text-[#0D9488]">
-                            <CheckCircle2 className="w-3.5 h-3.5 text-[#10B981] shrink-0" />
+                          <span className="inline-flex items-center gap-1 text-emerald-400">
+                            <CheckCircle2 className="w-3 h-3 shrink-0" />
                             <span>{msg.appliedSummary}</span>
                           </span>
                         ) : (
-                          <span className="text-[11px] text-slate-400">hi-IN SpeechSynthesis</span>
+                          <span className="text-slate-500">TTS READY</span>
                         )}
                         <button
                           type="button"
                           onClick={() => speakClinicalGuidance(msg.text, msg.lang, false)}
-                          className="px-2 py-1 rounded-lg bg-teal-50 hover:bg-teal-100 text-[#0D9488] text-[11px] font-bold inline-flex items-center gap-1 cursor-pointer shrink-0"
+                          className="px-2 py-0.5 rounded bg-[#090D16] border border-slate-700 text-[#06B6D4] inline-flex items-center gap-1 cursor-pointer"
                         >
                           <Volume2 className="w-3 h-3" />
                           <span>Play</span>
@@ -325,70 +322,54 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
               ))}
 
               {liveInterim && (
-                <div className="rounded-2xl bg-teal-50 border border-teal-200 px-4 py-2.5 text-xs font-semibold text-teal-950">
-                  Live Microphone Transcript: “{liveInterim}”
+                <div className="rounded-lg bg-[#06B6D4]/15 border border-[#06B6D4] px-3 py-2 font-mono text-xs text-cyan-100">
+                  &gt; {liveInterim}
                 </div>
               )}
 
               {speechStatusMsg && (
-                <div className="rounded-xl bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-900">
+                <div className="rounded-lg bg-[#F59E0B]/15 border border-[#F59E0B] px-3 py-2 font-mono text-xs text-amber-200">
                   {speechStatusMsg}
                 </div>
               )}
             </div>
 
-            <div className="px-4 py-3 bg-white border-t border-slate-200">
-              <p className="text-[11px] font-bold text-slate-500 mb-2">
-                Quick Voice Test Chips (Runs real regex parser + Hindi TTS):
-              </p>
+            <div className="p-4 bg-[#060911] border-t border-slate-800 space-y-3">
               <div className="flex flex-wrap gap-1.5">
-                {DEMO_CHIPS.map((chip) => (
+                {DEMO_VOICE_STREAMS.map((chip) => (
                   <button
                     key={chip}
                     type="button"
                     onClick={() => handleProcessInput(chip)}
-                    className="min-h-[38px] px-3 py-1.5 rounded-full border border-teal-200 bg-teal-50 hover:bg-teal-100 text-xs font-bold text-[#0D9488] transition-colors cursor-pointer"
+                    className="min-h-[34px] px-2.5 py-1 rounded bg-[#0D1322] hover:bg-slate-800 border border-slate-700 font-mono text-[11px] text-[#06B6D4] cursor-pointer"
                   >
                     {chip}
                   </button>
                 ))}
               </div>
-            </div>
 
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                handleProcessInput(inputText);
-              }}
-              className="p-3 bg-slate-50 border-t border-slate-200 flex items-center gap-2"
-            >
               <button
                 type="button"
                 onClick={toggleRealSpeechRecognition}
-                aria-label="Start or stop microphone recognition"
-                className={`min-h-[48px] min-w-[48px] rounded-xl flex items-center justify-center text-white transition-colors cursor-pointer shrink-0 ${
-                  isListening ? 'bg-[#EF4444] animate-pulse' : 'bg-[#0D9488] hover:bg-teal-700'
+                className={`w-full min-h-[48px] px-4 rounded-lg font-mono text-xs font-bold inline-flex items-center justify-center gap-2 cursor-pointer transition-colors ${
+                  isListening
+                    ? 'bg-[#EF4444] text-white'
+                    : 'bg-[#06B6D4] hover:bg-cyan-400 text-[#090D16]'
                 }`}
               >
-                {isListening ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
+                {isListening ? (
+                  <>
+                    <MicOff className="w-4 h-4" />
+                    <span>Listening Live... Tap to Complete</span>
+                  </>
+                ) : (
+                  <>
+                    <Mic className="w-4 h-4" />
+                    <span>Start Live Microphone Capture</span>
+                  </>
+                )}
               </button>
-
-              <input
-                type="text"
-                value={inputText}
-                onChange={(e) => setInputText(e.target.value)}
-                placeholder="Speak via mic or type e.g. BP 140 by 90..."
-                className="flex-1 min-h-[48px] px-3.5 rounded-xl border border-slate-300 bg-white text-sm text-slate-900"
-              />
-
-              <button
-                type="submit"
-                aria-label="Submit phrase"
-                className="min-h-[48px] min-w-[48px] rounded-xl bg-[#0F172A] hover:bg-slate-800 text-white flex items-center justify-center cursor-pointer shrink-0"
-              >
-                <Send className="w-4 h-4" />
-              </button>
-            </form>
+            </div>
           </motion.div>
         </div>
       )}
