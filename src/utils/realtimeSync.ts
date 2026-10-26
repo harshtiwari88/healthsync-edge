@@ -1,7 +1,9 @@
 import {TriageRecord} from '../types/triage';
 
-export const HEALTHSYNC_STORAGE_KEY = 'healthsync_records';
+export const HEALTHSYNC_STORAGE_KEY = 'healthsync_edge_v5_records';
 const BROADCAST_CHANNEL_NAME = 'healthsync_edge_realtime_bus';
+const IDB_NAME = 'healthsync_edge_idb';
+const IDB_STORE = 'triage_records';
 
 export type RealtimeEventMessage =
   | {
@@ -23,19 +25,48 @@ export type RealtimeEventMessage =
       connectedPeers: number;
     };
 
+/**
+ * Real Browser IndexedDB Mirror for Offline Persistence alongside LocalStorage
+ */
+function saveRecordsToIndexedDB(records: TriageRecord[]): void {
+  if (typeof window === 'undefined' || !('indexedDB' in window)) return;
+  try {
+    const request = window.indexedDB.open(IDB_NAME, 1);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(IDB_STORE)) {
+        db.createObjectStore(IDB_STORE, {keyPath: 'id'});
+      }
+    };
+    request.onsuccess = () => {
+      const db = request.result;
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_STORE);
+      records.forEach((rec) => {
+        store.put(rec);
+      });
+      tx.oncomplete = () => db.close();
+    };
+  } catch {
+    // Ignore IndexedDB sandbox restrictions if any
+  }
+}
+
 export function loadStoredRecords(fallback: TriageRecord[]): TriageRecord[] {
   if (typeof window === 'undefined') return fallback;
   try {
     const raw = window.localStorage.getItem(HEALTHSYNC_STORAGE_KEY);
     if (!raw) {
       window.localStorage.setItem(HEALTHSYNC_STORAGE_KEY, JSON.stringify(fallback));
+      saveRecordsToIndexedDB(fallback);
       return fallback;
     }
     const parsed = JSON.parse(raw) as TriageRecord[];
-    if (Array.isArray(parsed) && parsed.length > 0 && parsed[0]?.vitals?.heartRate !== undefined) {
+    if (Array.isArray(parsed) && parsed.length > 0 && parsed[0]?.vitals?.systolic !== undefined) {
       return parsed;
     }
     window.localStorage.setItem(HEALTHSYNC_STORAGE_KEY, JSON.stringify(fallback));
+    saveRecordsToIndexedDB(fallback);
     return fallback;
   } catch {
     return fallback;
@@ -49,6 +80,7 @@ export function persistStoredRecords(records: TriageRecord[]) {
   } catch {
     // Ignore quota errors
   }
+  saveRecordsToIndexedDB(records);
 }
 
 /**
@@ -56,7 +88,7 @@ export function persistStoredRecords(records: TriageRecord[]) {
  * Combines:
  * 1. Full-duplex Server WebSocket (/ws/triage) for real cross-device sync
  * 2. Browser BroadcastChannel for instant zero-latency local multi-tab sync
- * 3. window 'storage' event listener on localStorage['healthsync_records']
+ * 3. window 'storage' event listener on localStorage + IndexedDB persistence
  */
 export class HealthSyncRealtimeClient {
   private ws: WebSocket | null = null;
@@ -147,14 +179,12 @@ export class HealthSyncRealtimeClient {
       triggerEmergencySiren,
     };
 
-    // 1. BroadcastChannel for same-browser tabs
     try {
       this.bc?.postMessage(payload);
     } catch {
       // Ignore
     }
 
-    // 2. WebSocket + HTTP fallback for cross-device DMO Command Dashboard
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(payload));
     } else if (typeof fetch === 'function') {

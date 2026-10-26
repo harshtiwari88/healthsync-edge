@@ -1,320 +1,261 @@
 import React, {useState} from 'react';
 import {
-  Fingerprint,
-  Volume2,
+  AlertCircle,
   ArrowRight,
-  Cpu,
-  Radio,
-  Database,
-  Delete,
+  Building2,
+  Eye,
+  EyeOff,
+  Lock,
+  ShieldCheck,
+  Smartphone,
+  Stethoscope,
 } from 'lucide-react';
-import {Language} from '../types/triage';
-import {LANGUAGE_LABELS} from '../data/initialData';
 import {sirenEngine} from '../utils/sirenAudio';
-import {PWAInstallButton} from './PWAInstallButton';
 
 interface LoginPageProps {
-  language: Language;
-  onLanguageChange: (lang: Language) => void;
   onLoginAsha: (ashaId: string) => void;
   onLoginDmo: (dmoEmail: string) => void;
 }
 
-const ASHA_OPERATOR_NODES = [
-  {id: 'ASHA-8842-UP', label: 'Sunita Devi · Sub-Center VIL-204'},
-  {id: 'ASHA-8859-UP', label: 'Geeta Verma · Sub-Center VIL-208'},
-] as const;
-
-const DMO_COMMAND_NODES = [
-  {id: 'dmo.district24@nhm.up.gov.in', label: 'CMO / DMO War-Room · District 24 HQ'},
-  {id: 'als108.dispatch@nhm.up.gov.in', label: 'ALS-108 Emergency Dispatch Desk'},
-] as const;
-
 export const LoginPage: React.FC<LoginPageProps> = ({
-  language,
-  onLanguageChange,
   onLoginAsha,
   onLoginDmo,
 }) => {
-  const [selectedRole, setSelectedRole] = useState<'asha' | 'dmo'>('asha');
-  const [selectedAshaIdx, setSelectedAshaIdx] = useState<number>(0);
-  const [selectedDmoIdx, setSelectedDmoIdx] = useState<number>(0);
-  const [pinDigits, setPinDigits] = useState<string>('2408');
-  const [biometricScanning, setBiometricScanning] = useState<boolean>(false);
-  const [sirenArmed, setSirenArmed] = useState<boolean>(false);
+  const [activeTab, setActiveTab] = useState<'ASHA' | 'DMO'>('ASHA');
+  const [ashaId, setAshaId] = useState<string>('ASHA-8842-UP');
+  const [pin, setPin] = useState<string>('1234');
+  const [showPin, setShowPin] = useState<boolean>(false);
 
-  const handleArmAudio = () => {
-    sirenEngine.unlock();
-    sirenEngine.playTestSirenBurst();
-    setSirenArmed(true);
-  };
+  const [dmoEmail, setDmoEmail] = useState<string>('dmo.varanasi@nhm.gov.in');
+  const [dmoPasscode, setDmoPasscode] = useState<string>('DMO-24');
+  const [authError, setAuthError] = useState<string | null>(null);
 
-  const handleKeypadDigit = (digit: string) => {
-    setPinDigits((prev) => (prev.length >= 4 ? digit : prev + digit));
-  };
+  const handleAshaSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError(null);
 
-  const handleLaunchRole = () => {
-    sirenEngine.unlock();
-    if (selectedRole === 'asha') {
-      onLoginAsha(ASHA_OPERATOR_NODES[selectedAshaIdx].id);
-    } else {
-      onLoginDmo(DMO_COMMAND_NODES[selectedDmoIdx].id);
+    const trimmedId = ashaId.trim();
+    if (!trimmedId) {
+      setAuthError('Please enter a valid ASHA Worker ID.');
+      return;
     }
+    if (pin !== '1234') {
+      setAuthError('Authentication failed: Invalid 4-Digit Security PIN (expected 1234).');
+      return;
+    }
+
+    sirenEngine.unlock();
+    onLoginAsha(trimmedId);
   };
 
-  const handleBiometricVerify = () => {
+  const handleDmoSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError(null);
+
+    const trimmedEmail = dmoEmail.trim();
+    if (!trimmedEmail || !trimmedEmail.includes('@')) {
+      setAuthError('Please enter a valid official District Health Officer email.');
+      return;
+    }
+    if (!dmoPasscode.trim()) {
+      setAuthError('Please enter your District Command authorization code.');
+      return;
+    }
+
     sirenEngine.unlock();
-    setBiometricScanning(true);
-    window.setTimeout(() => {
-      setBiometricScanning(false);
-      handleLaunchRole();
-    }, 360);
+    onLoginDmo(trimmedEmail);
   };
 
   return (
-    <div className="min-h-screen os-grid-surface text-slate-100 flex flex-col justify-between pb-12">
-      {/* Top 3-Zone Header */}
-      <header className="border-b border-slate-800 bg-[#090D16]/95">
-        <div className="max-w-[1440px] mx-auto px-4 sm:px-6 h-14 flex items-center justify-between gap-8">
-          <span className="font-mono text-base font-bold tracking-tight text-white whitespace-nowrap shrink-0">
-            HealthSync OS v3.2
-          </span>
-
-          <div className="hidden md:flex items-center gap-6 font-mono text-xs text-slate-400">
-            <span className="whitespace-nowrap">ONNX-WASM READY</span>
-            <span className="whitespace-nowrap">160B CRC32 CODEC</span>
-            <span className="whitespace-nowrap">CRDT VECTOR SYNC</span>
+    <div className="flex flex-1 items-center justify-center px-4 py-8">
+      {/* Fixed-size rock-solid centered card */}
+      <div className="max-w-md w-full mx-auto my-auto p-6 bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl">
+        {/* Branding Header */}
+        <div className="text-center space-y-2">
+          <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-teal-600 text-white">
+            <Stethoscope className="h-6 w-6" />
           </div>
-
-          <div className="flex items-center gap-2.5 shrink-0">
-            <select
-              aria-label="Interface Language"
-              value={language}
-              onChange={(e) => onLanguageChange(e.target.value as Language)}
-              className="h-9 px-3 rounded-lg bg-[#0D1322] border border-slate-700 font-mono text-xs text-slate-200 cursor-pointer"
-            >
-              {(Object.keys(LANGUAGE_LABELS) as Language[]).map((langKey) => (
-                <option key={langKey} value={langKey}>
-                  {LANGUAGE_LABELS[langKey]}
-                </option>
-              ))}
-            </select>
-            <PWAInstallButton compact />
-          </div>
+          <h1 className="text-2xl font-bold tracking-tight text-slate-100">
+            HealthSync Edge
+          </h1>
+          <p className="text-sm text-slate-400">
+            Voice-First, Offline-First Rural Tele-Triage Platform
+          </p>
+          <p className="pt-0.5 text-xs font-medium text-teal-400">
+            <ShieldCheck className="mr-1 inline h-3.5 w-3.5 align-text-bottom text-emerald-400" />
+            Ayushman Bharat Digital Mission (ABDM) Compliant
+          </p>
         </div>
-      </header>
 
-      {/* Main Tactical Boot & Terminal Authentication Split */}
-      <main className="flex-1 flex items-center justify-center px-4 sm:px-6 py-8">
-        <div className="w-full max-w-5xl grid grid-cols-1 lg:grid-cols-12 gap-8 items-stretch">
-          {/* Left 6 Cols: System Capabilities & Self-Test Telemetry */}
-          <div className="lg:col-span-6 rounded-xl bg-[#0D1322]/90 border border-slate-800 p-6 sm:p-8 flex flex-col justify-between space-y-6">
-            <div className="space-y-4">
-              <div className="font-mono text-xs text-[#06B6D4]">
-                ABDM HIE · TACTICAL MEDICAL FIELD OS
-              </div>
-              <h1 className="text-3xl sm:text-4xl font-bold tracking-tight text-white leading-tight text-balance">
-                High-Density Biometric Telemetry &amp; Zero-Network Triage.
-              </h1>
-              <p className="text-sm text-slate-400 leading-relaxed">
-                Engineered for rural frontline ASHA tablets and District 24 emergency command.
-                Combines 60fps PPG/ECG canvas oscilloscopes, local WASM conjunctiva pallor
-                analysis, 1024-pt Web Audio cough spectrograms, and 160-character CRC32 Base64 SMS
-                packets.
+        {/* Clean Role Tab Switcher */}
+        <div
+          role="tablist"
+          aria-label="Select Role to Authenticate"
+          className="mt-6 grid grid-cols-2 gap-1.5 rounded-xl border border-slate-800 bg-slate-950 p-1"
+        >
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activeTab === 'ASHA'}
+            onClick={() => {
+              setActiveTab('ASHA');
+              setAuthError(null);
+            }}
+            className={`min-h-[44px] rounded-lg px-3 text-xs font-semibold inline-flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+              activeTab === 'ASHA'
+                ? 'bg-teal-600 text-white'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Smartphone className="h-3.5 w-3.5 shrink-0" />
+            <span>ASHA Worker</span>
+          </button>
+
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activeTab === 'DMO'}
+            onClick={() => {
+              setActiveTab('DMO');
+              setAuthError(null);
+            }}
+            className={`min-h-[44px] rounded-lg px-3 text-xs font-semibold inline-flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+              activeTab === 'DMO'
+                ? 'bg-teal-600 text-white'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Building2 className="h-3.5 w-3.5 shrink-0" />
+            <span>District Officer (DMO)</span>
+          </button>
+        </div>
+
+        {authError && (
+          <div
+            role="alert"
+            className="mt-4 flex items-start gap-2 rounded-xl border border-red-500/40 bg-red-950/60 p-3 text-xs font-medium text-red-200"
+          >
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-400" />
+            <span>{authError}</span>
+          </div>
+        )}
+
+        {/* ASHA Worker Login Form */}
+        {activeTab === 'ASHA' ? (
+          <form onSubmit={handleAshaSubmit} className="mt-5 space-y-4">
+            <div>
+              <label
+                htmlFor="asha-id-input"
+                className="mb-1.5 block text-xs font-semibold text-slate-300"
+              >
+                ASHA Worker ID / Mobile
+              </label>
+              <input
+                id="asha-id-input"
+                type="text"
+                value={ashaId}
+                onChange={(e) => setAshaId(e.target.value)}
+                required
+                className="min-h-[46px] w-full rounded-xl border border-slate-700 bg-slate-950 px-3.5 font-mono text-sm font-semibold text-slate-100 focus:border-teal-500 focus:outline-none"
+              />
+              <p className="mt-1 text-xs text-slate-500">
+                Field Unit: Sunita Devi · Rampur Sub-Center (VIL-204)
               </p>
             </div>
 
-            <div className="space-y-3 pt-4 border-t border-slate-800 font-mono text-xs">
-              <div className="flex items-center justify-between text-slate-300">
-                <span className="inline-flex items-center gap-2">
-                  <Cpu className="w-4 h-4 text-[#06B6D4]" />
-                  <span>WASM Optical &amp; FFT DSP</span>
-                </span>
-                <span className="text-[#06B6D4]">● CALIBRATED</span>
+            <div>
+              <div className="mb-1.5 flex items-center justify-between">
+                <label
+                  htmlFor="asha-pin-input"
+                  className="text-xs font-semibold text-slate-300"
+                >
+                  4-Digit Security PIN
+                </label>
+                <span className="font-mono text-[11px] text-slate-400">PIN: 1234</span>
               </div>
-              <div className="flex items-center justify-between text-slate-300">
-                <span className="inline-flex items-center gap-2">
-                  <Radio className="w-4 h-4 text-[#F59E0B]" />
-                  <span>GSM-7 160B Bitstream Codec</span>
-                </span>
-                <span className="text-[#F59E0B]">● CRC32 ARMED</span>
-              </div>
-              <div className="flex items-center justify-between text-slate-300">
-                <span className="inline-flex items-center gap-2">
-                  <Database className="w-4 h-4 text-emerald-400" />
-                  <span>IndexedDB + SQLCipher Vault</span>
-                </span>
-                <span className="text-emerald-400">● MOUNTED</span>
-              </div>
-            </div>
-
-            <button
-              type="button"
-              onClick={handleArmAudio}
-              className={`min-h-[46px] px-4 rounded-lg border font-mono text-xs font-semibold inline-flex items-center justify-center gap-2 cursor-pointer transition-colors ${
-                sirenArmed
-                  ? 'bg-emerald-500/15 border-emerald-500/50 text-emerald-300'
-                  : 'bg-[#090D16] border-slate-700 hover:border-[#F59E0B] text-[#F59E0B]'
-              }`}
-            >
-              <Volume2 className="w-4 h-4 shrink-0" />
-              <span>
-                {sirenArmed
-                  ? 'Web Audio Siren & TTS Synthesizer Verified'
-                  : 'Run Audio Siren Self-Test (Unlock Web Audio)'}
-              </span>
-            </button>
-          </div>
-
-          {/* Right 6 Cols: Tactile Hardware Keypad & Node Selector (Zero Plain Forms) */}
-          <div className="lg:col-span-6 rounded-xl bg-[#0D1322] border border-slate-800 p-6 sm:p-8 flex flex-col justify-between space-y-5">
-            {/* Segmented Mode Selector */}
-            <div
-              role="tablist"
-              aria-label="Select Terminal Mode"
-              className="grid grid-cols-2 gap-1.5 p-1 rounded-lg bg-[#090D16] border border-slate-800"
-            >
-              <button
-                type="button"
-                role="tab"
-                aria-selected={selectedRole === 'asha'}
-                onClick={() => setSelectedRole('asha')}
-                className={`min-h-[46px] px-3 rounded-md font-mono text-xs font-bold transition-colors cursor-pointer whitespace-nowrap ${
-                  selectedRole === 'asha'
-                    ? 'bg-[#06B6D4] text-[#090D16]'
-                    : 'text-slate-400 hover:text-white'
-                }`}
-              >
-                01. ASHA Field OS
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={selectedRole === 'dmo'}
-                onClick={() => setSelectedRole('dmo')}
-                className={`min-h-[46px] px-3 rounded-md font-mono text-xs font-bold transition-colors cursor-pointer whitespace-nowrap ${
-                  selectedRole === 'dmo'
-                    ? 'bg-[#F59E0B] text-[#090D16]'
-                    : 'text-slate-400 hover:text-white'
-                }`}
-              >
-                02. District War-Room
-              </button>
-            </div>
-
-            {/* Hardware Node Selector Buttons */}
-            <div className="space-y-2">
-              <span className="block font-mono text-[11px] text-slate-400">
-                SELECT ASSIGNED HARDWARE TERMINAL NODE
-              </span>
-              {selectedRole === 'asha' ? (
-                <div className="space-y-2">
-                  {ASHA_OPERATOR_NODES.map((node, idx) => (
-                    <button
-                      key={node.id}
-                      type="button"
-                      onClick={() => setSelectedAshaIdx(idx)}
-                      className={`w-full min-h-[50px] px-3.5 py-2 rounded-lg border text-left flex items-center justify-between cursor-pointer transition-colors ${
-                        selectedAshaIdx === idx
-                          ? 'bg-[#06B6D4]/15 border-[#06B6D4] text-white'
-                          : 'bg-[#090D16] border-slate-800 text-slate-400 hover:text-slate-200'
-                      }`}
-                    >
-                      <div>
-                        <div className="text-xs font-semibold">{node.label}</div>
-                        <div className="font-mono text-[11px] text-[#06B6D4]">{node.id}</div>
-                      </div>
-                      <span className="font-mono text-[10px] text-emerald-400">READY</span>
-                    </button>
-                  ))}
-                </div>
-              ) : (
-                <div className="space-y-2">
-                  {DMO_COMMAND_NODES.map((node, idx) => (
-                    <button
-                      key={node.id}
-                      type="button"
-                      onClick={() => setSelectedDmoIdx(idx)}
-                      className={`w-full min-h-[50px] px-3.5 py-2 rounded-lg border text-left flex items-center justify-between cursor-pointer transition-colors ${
-                        selectedDmoIdx === idx
-                          ? 'bg-[#F59E0B]/15 border-[#F59E0B] text-white'
-                          : 'bg-[#090D16] border-slate-800 text-slate-400 hover:text-slate-200'
-                      }`}
-                    >
-                      <div>
-                        <div className="text-xs font-semibold">{node.label}</div>
-                        <div className="font-mono text-[11px] text-[#F59E0B]">{node.id}</div>
-                      </div>
-                      <span className="font-mono text-[10px] text-emerald-400">ONLINE</span>
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            {/* Tactile Cryptographic PIN Pad + Biometric Trigger */}
-            <div className="space-y-2.5">
-              <div className="flex items-center justify-between font-mono text-[11px]">
-                <span className="text-slate-400">OPERATOR CRYPTOGRAPHIC KEYPAD</span>
-                <span className="text-[#06B6D4] tracking-widest tabular-nums">
-                  PIN: {pinDigits.padEnd(4, '·').replace(/./g, (c) => (c === '·' ? '○' : '●'))}
-                </span>
-              </div>
-
-              <div className="grid grid-cols-6 gap-1.5 font-mono">
-                {['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'].map((d) => (
-                  <button
-                    key={d}
-                    type="button"
-                    onClick={() => handleKeypadDigit(d)}
-                    className="min-h-[44px] rounded-lg bg-[#090D16] hover:bg-slate-900 border border-slate-800 text-sm font-bold text-slate-200 cursor-pointer tabular-nums"
-                  >
-                    {d}
-                  </button>
-                ))}
+              <div className="relative">
+                <input
+                  id="asha-pin-input"
+                  type={showPin ? 'text' : 'password'}
+                  inputMode="numeric"
+                  maxLength={4}
+                  value={pin}
+                  onChange={(e) => setPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                  required
+                  placeholder="••••"
+                  className="min-h-[46px] w-full rounded-xl border border-slate-700 bg-slate-950 pl-3.5 pr-12 font-mono text-base font-bold tracking-widest text-slate-100 tabular-nums focus:border-teal-500 focus:outline-none"
+                />
                 <button
                   type="button"
-                  onClick={() => setPinDigits((p) => p.slice(0, -1))}
-                  aria-label="Clear PIN digit"
-                  className="min-h-[44px] rounded-lg bg-[#090D16] hover:bg-slate-900 border border-slate-800 text-slate-400 flex items-center justify-center cursor-pointer"
+                  onClick={() => setShowPin((prev) => !prev)}
+                  aria-label={showPin ? 'Hide PIN' : 'Show PIN'}
+                  className="absolute right-1.5 top-1/2 -translate-y-1/2 flex min-h-[38px] min-w-[38px] items-center justify-center rounded-lg text-slate-400 hover:text-slate-200 cursor-pointer"
                 >
-                  <Delete className="w-4 h-4" />
-                </button>
-                <button
-                  type="button"
-                  onClick={handleBiometricVerify}
-                  title="Biometric Hardware Unlock"
-                  className={`min-h-[44px] rounded-lg border flex items-center justify-center cursor-pointer ${
-                    biometricScanning
-                      ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300'
-                      : 'bg-[#090D16] border-[#06B6D4]/50 text-[#06B6D4]'
-                  }`}
-                >
-                  <Fingerprint className="w-4 h-4" />
+                  {showPin ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                 </button>
               </div>
             </div>
 
-            {/* Primary Boot Execution Button */}
             <button
-              type="button"
-              onClick={handleLaunchRole}
-              className={`w-full min-h-[52px] px-5 rounded-lg font-mono text-xs sm:text-sm font-bold inline-flex items-center justify-center gap-2 cursor-pointer transition-colors ${
-                selectedRole === 'asha'
-                  ? 'bg-[#06B6D4] hover:bg-cyan-400 text-[#090D16]'
-                  : 'bg-[#F59E0B] hover:bg-amber-400 text-[#090D16]'
-              }`}
+              type="submit"
+              className="flex min-h-[48px] w-full items-center justify-center gap-2 rounded-xl bg-teal-600 px-4 py-2.5 text-sm font-bold text-white transition-colors hover:bg-teal-500 whitespace-nowrap cursor-pointer"
             >
-              <span>
-                {selectedRole === 'asha'
-                  ? 'Boot ASHA Field OS v3.2'
-                  : 'Open District 24 War-Room'}
-              </span>
-              <ArrowRight className="w-4 h-4" />
+              <Lock className="h-4 w-4" />
+              <span>Login to ASHA Field App</span>
+              <ArrowRight className="h-4 w-4" />
             </button>
-          </div>
-        </div>
-      </main>
+          </form>
+        ) : (
+          /* District Officer (DMO) Login Form */
+          <form onSubmit={handleDmoSubmit} className="mt-5 space-y-4">
+            <div>
+              <label
+                htmlFor="dmo-email-input"
+                className="mb-1.5 block text-xs font-semibold text-slate-300"
+              >
+                Official Government Email / ID
+              </label>
+              <input
+                id="dmo-email-input"
+                type="email"
+                value={dmoEmail}
+                onChange={(e) => setDmoEmail(e.target.value)}
+                required
+                className="min-h-[46px] w-full rounded-xl border border-slate-700 bg-slate-950 px-3.5 text-sm font-semibold text-slate-100 focus:border-teal-500 focus:outline-none"
+              />
+            </div>
+
+            <div>
+              <div className="mb-1.5 flex items-center justify-between">
+                <label
+                  htmlFor="dmo-code-input"
+                  className="text-xs font-semibold text-slate-300"
+                >
+                  Command Access Code
+                </label>
+                <span className="font-mono text-[11px] text-slate-400">Default: DMO-24</span>
+              </div>
+              <input
+                id="dmo-code-input"
+                type="password"
+                value={dmoPasscode}
+                onChange={(e) => setDmoPasscode(e.target.value)}
+                required
+                className="min-h-[46px] w-full rounded-xl border border-slate-700 bg-slate-950 px-3.5 font-mono text-sm font-semibold text-slate-100 focus:border-teal-500 focus:outline-none"
+              />
+            </div>
+
+            <button
+              type="submit"
+              className="flex min-h-[48px] w-full items-center justify-center gap-2 rounded-xl bg-teal-600 px-4 py-2.5 text-sm font-bold text-white transition-colors hover:bg-teal-500 whitespace-nowrap cursor-pointer"
+            >
+              <Lock className="h-4 w-4" />
+              <span>Access District Command Dashboard</span>
+              <ArrowRight className="h-4 w-4" />
+            </button>
+          </form>
+        )}
+      </div>
     </div>
   );
 };

@@ -1,14 +1,14 @@
 @import "tailwindcss";
 
 @theme {
-  --font-sans: "Plus Jakarta Sans", "Noto Sans Devanagari", "Noto Sans Tamil", system-ui, -apple-system, sans-serif;
+  --font-sans: "Plus Jakarta Sans", "Noto Sans Devanagari", system-ui, -apple-system, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
 }
 
 @layer base {
   html {
     font-family: var(--font-sans);
-    background-color: #090D16;
+    background-color: #020617;
     color: #F1F5F9;
     color-scheme: dark;
     -webkit-tap-highlight-color: transparent;
@@ -17,90 +17,49 @@
   button,
   select,
   input,
+  textarea,
   a {
-    @apply focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#06B6D4];
+    @apply focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500;
   }
 }
 
-/* Tactical Obsidian Coordinate Grid & Subtle OLED Scanlines */
-.os-grid-surface {
-  background-color: #090D16;
-  background-image:
-    linear-gradient(to right, rgba(6, 182, 212, 0.045) 1px, transparent 1px),
-    linear-gradient(to bottom, rgba(6, 182, 212, 0.045) 1px, transparent 1px);
-  background-size: 28px 28px;
-}
-
-.os-scanlines {
-  background-image: repeating-linear-gradient(
-    to bottom,
-    rgba(255, 255, 255, 0.014) 0px,
-    rgba(255, 255, 255, 0.014) 1px,
-    transparent 1px,
-    transparent 3px
-  );
-}
-
-/* Outdoor-Glove Tactile Rotary / Detent Wheel Range Control */
-input[type="range"].tactical-wheel {
-  -webkit-appearance: none;
-  appearance: none;
-  height: 28px;
-  background: repeating-linear-gradient(
-    90deg,
-    rgba(30, 41, 59, 0.95) 0px,
-    rgba(30, 41, 59, 0.95) 4px,
-    rgba(15, 23, 42, 0.95) 4px,
-    rgba(15, 23, 42, 0.95) 8px
-  );
-  border: 1px solid #334155;
-  border-radius: 6px;
-  cursor: ew-resize;
-}
-
-input[type="range"].tactical-wheel::-webkit-slider-thumb {
-  -webkit-appearance: none;
-  appearance: none;
-  width: 22px;
-  height: 32px;
-  border-radius: 4px;
-  background: #06B6D4;
-  border: 2px solid #090D16;
-  box-shadow: 0 0 0 1px #06B6D4;
-  cursor: grab;
-}
-
-input[type="range"].tactical-wheel.amber-wheel::-webkit-slider-thumb {
-  background: #F59E0B;
-  box-shadow: 0 0 0 1px #F59E0B;
-}
-
-input[type="range"].tactical-wheel.red-wheel::-webkit-slider-thumb {
-  background: #EF4444;
-  box-shadow: 0 0 0 1px #EF4444;
-}
-
-@keyframes hazard-pulse {
+@keyframes red-alert-flash {
   0%, 100% {
-    border-color: rgba(239, 68, 68, 0.95);
-    box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.35);
+    border-color: #EF4444;
+    box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.28);
   }
   50% {
-    border-color: rgba(239, 68, 68, 0.35);
-    box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.08);
+    border-color: #7F1D1D;
+    box-shadow: 0 0 0 0px rgba(239, 68, 68, 0);
   }
 }
 
-.hazard-alert-frame {
-  animation: hazard-pulse 1.5s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+.flashing-red-border {
+  animation: red-alert-flash 1.4s ease-in-out infinite;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .hazard-alert-frame {
+  .flashing-red-border {
     animation: none;
   }
 }
 
 .tabular-nums {
   font-variant-numeric: tabular-nums;
+}
+
+/* Subtle dark scrollbars for fixed-height mobile container & dashboard streams */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: rgba(15, 23, 42, 0.6);
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(71, 85, 105, 0.7);
+  border-radius: 9999px;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 116, 139, 0.9);
 }
