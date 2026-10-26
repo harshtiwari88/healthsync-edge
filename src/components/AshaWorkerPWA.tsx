@@ -1,770 +1,734 @@
-import React, {useState, useRef, useEffect} from 'react';
+import React, {useState, useRef} from 'react';
+import {motion, AnimatePresence} from 'motion/react';
 import {
   Mic,
-  MicOff,
   Heart,
   Thermometer,
-  WifiOff,
-  Wifi,
   CheckCircle2,
   AlertTriangle,
   Siren,
-  MessageSquareWarning,
   Save,
+  MessageSquareLock,
+  IndianRupee,
   RefreshCw,
-  Globe,
   Minus,
   Plus,
-  ArrowUpRight,
-  Radio,
+  Camera,
+  Upload,
+  AudioWaveform,
+  Bluetooth,
+  LayoutDashboard,
+  LogOut,
+  Globe,
+  X,
+  Send,
+  ShieldCheck,
+  Eye,
 } from 'lucide-react';
 import {
+  ALL_SYMPTOMS,
+  EdgeAiDiagnostics,
+  IncentiveEntry,
   Language,
+  NetworkState,
+  SymptomKey,
   TriageRecord,
   VitalsSnapshot,
+  buildEncryptedEmergencySms,
   evaluateTriage,
   evaluateVitalStatus,
-  buildCompactSmsPayload,
 } from '../types/triage';
-import {VILLAGE_SUB_CENTERS, TRANSLATIONS} from '../data/initialData';
+import {LANGUAGE_LABELS, UI_COPY} from '../data/initialData';
 import {LungsIcon} from './Icons';
+import {AshaSaheliModal, SaheliFormPatch} from './AshaSaheliModal';
+import {IncentiveLedgerModal} from './IncentiveLedgerModal';
 import {PWAInstallButton} from './PWAInstallButton';
 
 interface AshaWorkerPWAProps {
+  ashaId: string;
   records: TriageRecord[];
+  incentives: IncentiveEntry[];
   language: Language;
   onLanguageChange: (lang: Language) => void;
-  isOfflineMode: boolean;
-  onToggleOfflineMode: () => void;
-  onSaveRecord: (
-    patientName: string,
-    age: number,
-    gender: 'F' | 'M',
-    villageCode: string,
-    vitals: VitalsSnapshot,
-    clinicalNotes: string,
-    channel: 'Data' | 'Emergency SMS'
-  ) => TriageRecord;
+  networkState: NetworkState;
+  onCycleNetworkState: () => void;
+  onSaveRecord: (params: {
+    patientName: string;
+    age: number;
+    gender: 'F' | 'M' | 'O';
+    abhaId: string;
+    villageCode: string;
+    vitals: VitalsSnapshot;
+    symptoms: SymptomKey[];
+    edgeAi: EdgeAiDiagnostics;
+    clinicalNotes: string;
+    channel: 'Data' | 'Emergency SMS';
+  }) => TriageRecord;
   onSyncOfflineQueue: () => number;
-  onOpenCommandPortal: () => void;
-}
-
-interface VoicePreset {
-  id: string;
-  labelEn: string;
-  labelHi: string;
-  transcriptEn: string;
-  transcriptHi: string;
-  patientName: string;
-  age: number;
-  gender: 'F' | 'M';
-  villageCode: string;
-  vitals: VitalsSnapshot;
-  notes: string;
-}
-
-const VOICE_PRESETS: VoicePreset[] = [
-  {
-    id: 'preset-red',
-    labelEn: 'Red Case · Sunita (BP 172/106, SpO₂ 88%)',
-    labelHi: 'गंभीर केस · सुनीता (BP 172/106, SpO₂ 88%)',
-    transcriptEn:
-      'Sunita Devi, age 34 female, Rampur Kalan, BP 172 over 106, oxygen 88 percent, fever 102.4 Fahrenheit, severe breathlessness.',
-    transcriptHi:
-      'सुनीता देवी, उम्र 34 महिला, रामपुर कलां, बीपी 172 बटा 106, ऑक्सीजन 88 प्रतिशत, बुखार 102.4 डिग्री, सांस लेने में तकलीफ।',
-    patientName: 'Sunita Devi',
-    age: 34,
-    gender: 'F',
-    villageCode: 'VLG-2401',
-    vitals: {systolic: 172, diastolic: 106, spo2: 88, temperature: 102.4},
-    notes: 'Voice note: Severe breathlessness and dizziness reported during household visit.',
-  },
-  {
-    id: 'preset-yellow',
-    labelEn: 'Yellow Case · Ramesh (BP 148/94, 100.6°F)',
-    labelHi: 'मध्यम केस · रमेश (BP 148/94, 100.6°F)',
-    transcriptEn:
-      'Ramesh Yadav, age 52 male, Devgarh Gram, systolic 148 diastolic 94, SpO2 93 percent, temperature 100.6 Fahrenheit.',
-    transcriptHi:
-      'रमेश यादव, उम्र 52 पुरुष, देवगढ़ ग्राम, बीपी 148 बटा 94, ऑक्सीजन 93 प्रतिशत, तापमान 100.6 फ़ारेनहाइट।',
-    patientName: 'Ramesh Yadav',
-    age: 52,
-    gender: 'M',
-    villageCode: 'VLG-2402',
-    vitals: {systolic: 148, diastolic: 94, spo2: 93, temperature: 100.6},
-    notes: 'Voice note: Persistent 3-day fever and mild exertional fatigue.',
-  },
-  {
-    id: 'preset-green',
-    labelEn: 'Routine · Kavita (BP 116/76, SpO₂ 99%)',
-    labelHi: 'सामान्य · कविता (BP 116/76, SpO₂ 99%)',
-    transcriptEn:
-      'Kavita Kumari, age 26 female, Khairabad East, blood pressure 116 over 76, oxygen 99 percent, temperature 98.4 Fahrenheit.',
-    transcriptHi:
-      'कविता कुमारी, उम्र 26 महिला, खैराबाद पूर्व, बीपी 116 बटा 76, ऑक्सीजन 99 प्रतिशत, तापमान 98.4 फ़ारेनहाइट।',
-    patientName: 'Kavita Kumari',
-    age: 26,
-    gender: 'F',
-    villageCode: 'VLG-2403',
-    vitals: {systolic: 116, diastolic: 76, spo2: 99, temperature: 98.4},
-    notes: 'Voice note: Routine postnatal wellness check, patient asymptomatic.',
-  },
-];
-
-// Minimal speech recognition interface for browser Web Speech API
-interface SpeechRecognitionInstance {
-  lang: string;
-  interimResults: boolean;
-  continuous: boolean;
-  onresult: ((event: {results: ArrayLike<ArrayLike<{transcript: string}>>}) => void) | null;
-  onerror: (() => void) | null;
-  onend: (() => void) | null;
-  start: () => void;
-  stop: () => void;
+  onSwitchToCommand: () => void;
+  onLogout: () => void;
 }
 
 export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
+  ashaId,
   records,
+  incentives,
   language,
   onLanguageChange,
-  isOfflineMode,
-  onToggleOfflineMode,
+  networkState,
+  onCycleNetworkState,
   onSaveRecord,
   onSyncOfflineQueue,
-  onOpenCommandPortal,
+  onSwitchToCommand,
+  onLogout,
 }) => {
-  const t = TRANSLATIONS[language];
+  const copy = UI_COPY[language];
 
-  const [patientName, setPatientName] = useState<string>('Geeta Devi');
-  const [age, setAge] = useState<number>(38);
-  const [gender, setGender] = useState<'F' | 'M'>('F');
-  const [villageCode, setVillageCode] = useState<string>('VLG-2401');
+  // Form states
+  const [patientName, setPatientName] = useState<string>('Ramesh Kumar');
+  const [age, setAge] = useState<number>(48);
+  const [gender, setGender] = useState<'F' | 'M' | 'O'>('M');
+  const [abhaId, setAbhaId] = useState<string>('91-8834-2201-5590');
   const [vitals, setVitals] = useState<VitalsSnapshot>({
-    systolic: 122,
-    diastolic: 78,
+    systolic: 124,
+    diastolic: 80,
     spo2: 98,
     temperature: 98.6,
   });
+  const [symptoms, setSymptoms] = useState<SymptomKey[]>([]);
   const [clinicalNotes, setClinicalNotes] = useState<string>(
-    'Household maternal & NCD screening visit.'
+    'Door-to-door village wellness & NCD screening.'
   );
-  const [isRecording, setIsRecording] = useState<boolean>(false);
-  const [voiceTranscript, setVoiceTranscript] = useState<string>('');
-  const [feedbackBanner, setFeedbackBanner] = useState<{
-    type: 'teal' | 'red';
-    message: string;
-    smsPayload?: string;
+
+  // Edge-AI Micro-Diagnostics state
+  const [activeDiagTab, setActiveDiagTab] = useState<'anemia' | 'cough'>('anemia');
+  const [anemiaScanning, setAnemiaScanning] = useState<boolean>(false);
+  const [uploadedEyePreview, setUploadedEyePreview] = useState<string | null>(null);
+  const [anemiaFlagged, setAnemiaFlagged] = useState<boolean>(false);
+  const [estimatedHb, setEstimatedHb] = useState<number | undefined>(undefined);
+
+  const [coughRecording, setCoughRecording] = useState<boolean>(false);
+  const [coughSecondsLeft, setCoughSecondsLeft] = useState<number>(5);
+  const [respiratoryFlagged, setRespiratoryFlagged] = useState<boolean>(false);
+  const [coughPeakHz, setCoughPeakHz] = useState<number | undefined>(undefined);
+
+  // Modals & notifications
+  const [saheliOpen, setSaheliOpen] = useState<boolean>(false);
+  const [incentiveOpen, setIncentiveOpen] = useState<boolean>(false);
+  const [smsPreviewOpen, setSmsPreviewOpen] = useState<boolean>(false);
+  const [toastBanner, setToastBanner] = useState<{
+    tone: 'teal' | 'red';
+    text: string;
   } | null>(null);
 
-  const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  const queuedItems = records.filter((r) => r.syncStatus === 'Queued Offline');
-  const queuedCount = queuedItems.length;
+  const pendingSyncCount = records.filter((r) => r.syncStatus === 'Queued Offline').length;
+  const totalIncentiveToday = incentives.reduce((acc, item) => acc + item.amountInr, 0);
 
-  const triage = evaluateTriage(vitals);
-  const previewPatientId = `PT-${2480 + records.length + 1}`;
-  const smsPacketPreview = buildCompactSmsPayload(
-    previewPatientId,
-    villageCode,
+  const edgeAiState: EdgeAiDiagnostics = {
+    anemiaSuspected: anemiaFlagged,
+    estimatedHb,
+    respiratoryRiskHigh: respiratoryFlagged,
+    coughPeakHz,
+  };
+
+  const triage = evaluateTriage(vitals, symptoms, edgeAiState);
+  const nextPatientId = `PT${8924 + records.length + 1}`;
+  const liveSmsPayload = buildEncryptedEmergencySms({
+    patientId: nextPatientId,
+    villageCode: 'VIL-204',
     vitals,
-    triage.severity
-  );
+    symptoms,
+    edgeAi: edgeAiState,
+    severity: triage.severity === 'routine' ? 'emergency' : triage.severity,
+  });
 
-  useEffect(() => {
-    return () => {
-      if (recognitionRef.current) {
-        recognitionRef.current.stop();
-      }
-    };
-  }, []);
-
-  const parseSpokenTranscript = (text: string) => {
-    setVoiceTranscript(text);
-    setClinicalNotes(`Voice note: "${text}"`);
-
-    // Parse BP patterns like "168/104" or "168 over 104" or "168 बटा 104"
-    const bpMatch = text.match(/(\d{2,3})\s*(?:\/|over|by|बटा)\s*(\d{2,3})/i);
-    // Parse SpO2 patterns like "oxygen 89" or "spo2 92"
-    const spo2Match = text.match(/(?:spo2|oxygen|ऑक्सीजन|saturation)\D*(\d{2,3})/i);
-    // Parse temperature patterns like "101.4" or "fever 102"
-    const tempMatch = text.match(/(?:temp|temperature|fever|बुखार|तापमान)\D*(\d{2,3}(?:\.\d)?)/i);
-    // Parse age
-    const ageMatch = text.match(/(?:age|उम्र|आयु)\D*(\d{1,3})/i);
-
-    setVitals((prev) => ({
-      systolic: bpMatch ? Math.min(240, Math.max(60, Number(bpMatch[1]))) : prev.systolic,
-      diastolic: bpMatch ? Math.min(150, Math.max(40, Number(bpMatch[2]))) : prev.diastolic,
-      spo2: spo2Match ? Math.min(100, Math.max(65, Number(spo2Match[1]))) : prev.spo2,
-      temperature: tempMatch
-        ? Math.min(107, Math.max(94, Number(tempMatch[1])))
-        : prev.temperature,
-    }));
-
-    if (ageMatch) {
-      setAge(Math.min(105, Math.max(1, Number(ageMatch[1]))));
+  const handleApplySaheliPatch = (patch: SaheliFormPatch) => {
+    if (patch.vitals) {
+      setVitals((prev) => ({...prev, ...patch.vitals}));
     }
-
-    const firstWords = text.split(/[,.]/)[0]?.trim();
-    if (firstWords && firstWords.length >= 3 && firstWords.length <= 28 && !/\d/.test(firstWords)) {
-      setPatientName(firstWords);
+    if (patch.symptoms) {
+      setSymptoms((prev) => Array.from(new Set([...prev, ...patch.symptoms!])));
+    }
+    if (patch.patientName) {
+      setPatientName(patch.patientName);
+    }
+    if (patch.clinicalNotes) {
+      setClinicalNotes(patch.clinicalNotes);
     }
   };
 
-  const handleToggleVoice = () => {
-    if (isRecording) {
-      recognitionRef.current?.stop();
-      setIsRecording(false);
-      return;
-    }
-
-    const SpeechRecognitionCtor =
-      (window as unknown as {SpeechRecognition?: new () => SpeechRecognitionInstance})
-        .SpeechRecognition ||
-      (window as unknown as {webkitSpeechRecognition?: new () => SpeechRecognitionInstance})
-        .webkitSpeechRecognition;
-
-    if (SpeechRecognitionCtor) {
-      try {
-        const instance = new SpeechRecognitionCtor();
-        instance.lang = language === 'hi' ? 'hi-IN' : 'en-IN';
-        instance.interimResults = true;
-        instance.continuous = false;
-
-        instance.onresult = (event) => {
-          let combined = '';
-          for (let i = 0; i < event.results.length; i++) {
-            combined += event.results[i][0].transcript;
-          }
-          if (combined.trim()) {
-            parseSpokenTranscript(combined.trim());
-          }
-        };
-
-        instance.onerror = () => {
-          setIsRecording(false);
-          // Fallback to first clinical voice dictation preset if microphone is unavailable in sandbox
-          applyPreset(VOICE_PRESETS[0]);
-        };
-
-        instance.onend = () => {
-          setIsRecording(false);
-        };
-
-        recognitionRef.current = instance;
-        setIsRecording(true);
-        instance.start();
-        return;
-      } catch {
-        setIsRecording(false);
-      }
-    }
-
-    // Immediate interactive voice simulation fallback if SpeechRecognition API is unsupported
-    setIsRecording(true);
-    setTimeout(() => {
-      setIsRecording(false);
-      applyPreset(VOICE_PRESETS[0]);
-    }, 900);
-  };
-
-  const applyPreset = (preset: VoicePreset) => {
-    setPatientName(preset.patientName);
-    setAge(preset.age);
-    setGender(preset.gender);
-    setVillageCode(preset.villageCode);
-    setVitals({...preset.vitals});
-    setClinicalNotes(preset.notes);
-    setVoiceTranscript(language === 'hi' ? preset.transcriptHi : preset.transcriptEn);
+  const toggleSymptom = (sym: SymptomKey) => {
+    setSymptoms((prev) =>
+      prev.includes(sym) ? prev.filter((s) => s !== sym) : [...prev, sym]
+    );
   };
 
   const adjustVital = (field: keyof VitalsSnapshot, delta: number) => {
     setVitals((prev) => {
-      const nextVal = Number((prev[field] + delta).toFixed(1));
-      if (field === 'systolic') return {...prev, systolic: Math.min(240, Math.max(60, nextVal))};
-      if (field === 'diastolic') return {...prev, diastolic: Math.min(150, Math.max(40, nextVal))};
-      if (field === 'spo2') return {...prev, spo2: Math.min(100, Math.max(60, nextVal))};
-      return {...prev, temperature: Math.min(107, Math.max(94, nextVal))};
+      const next = Number((prev[field] + delta).toFixed(1));
+      if (field === 'systolic') return {...prev, systolic: Math.min(240, Math.max(60, next))};
+      if (field === 'diastolic') return {...prev, diastolic: Math.min(150, Math.max(40, next))};
+      if (field === 'spo2') return {...prev, spo2: Math.min(100, Math.max(60, next))};
+      return {...prev, temperature: Math.min(107, Math.max(94, next))};
     });
   };
 
-  const handlePrimarySave = () => {
-    const cleanName = patientName.trim() || 'Unnamed Patient';
-    onSaveRecord(cleanName, age, gender, villageCode, vitals, clinicalNotes, 'Data');
-    setFeedbackBanner({
-      type: 'teal',
-      message: isOfflineMode ? t.savedOfflineToast : t.savedOnlineToast,
-    });
+  // Eye Conjunctiva Anemia Scanner Simulator
+  const runConjunctivaAnalysis = (previewUrl?: string) => {
+    if (previewUrl) setUploadedEyePreview(previewUrl);
+    setAnemiaScanning(true);
+    setTimeout(() => {
+      setAnemiaScanning(false);
+      setAnemiaFlagged(true);
+      setEstimatedHb(7.2);
+      setClinicalNotes((prev) =>
+        prev.includes('Conjunctiva')
+          ? prev
+          : `${prev} | Edge-AI Conjunctiva Scan: Suspected Severe Anemia (Hb 7.2 g/dL < 8 g/dL).`
+      );
+    }, 1100);
   };
 
-  const handleEmergencySmsBypass = () => {
-    const cleanName = patientName.trim() || 'Emergency Patient';
-    const created = onSaveRecord(
-      cleanName,
+  const handleEyePhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const objectUrl = URL.createObjectURL(file);
+    runConjunctivaAnalysis(objectUrl);
+  };
+
+  // 5-Second Cough Audio Diagnostic Simulator
+  const startCoughRecorder = () => {
+    if (coughRecording) return;
+    setCoughRecording(true);
+    setCoughSecondsLeft(5);
+
+    let remaining = 5;
+    const interval = setInterval(() => {
+      remaining -= 1;
+      setCoughSecondsLeft(remaining);
+      if (remaining <= 0) {
+        clearInterval(interval);
+        setCoughRecording(false);
+        setRespiratoryFlagged(true);
+        setCoughPeakHz(915);
+        if (!symptoms.includes('Cough')) {
+          setSymptoms((prev) => [...prev, 'Cough']);
+        }
+        setClinicalNotes((prev) =>
+          prev.includes('Acoustic')
+            ? prev
+            : `${prev} | Edge-AI 5s Cough Acoustic Scan: High Respiratory Risk (915 Hz wet crackles).`
+        );
+      }
+    }, 1000);
+  };
+
+  const handleSaveOfflineRecord = () => {
+    const created = onSaveRecord({
+      patientName: patientName.trim() || 'Unnamed Patient',
       age,
       gender,
-      villageCode,
+      abhaId,
+      villageCode: 'VIL-204',
       vitals,
+      symptoms,
+      edgeAi: edgeAiState,
       clinicalNotes,
-      'Emergency SMS'
-    );
-    const smsStr = buildCompactSmsPayload(
-      created.patientId,
-      created.villageCode,
-      created.vitals,
-      created.severity
-    );
-    setFeedbackBanner({
-      type: 'red',
-      message: t.smsDispatchedToast,
-      smsPayload: smsStr,
+      channel: 'Data',
+    });
+
+    setToastBanner({
+      tone: 'teal',
+      text:
+        networkState === 'offline'
+          ? `Saved ${created.patientId} to Offline Encrypted Store (+₹${
+              created.severity === 'routine' ? 20 : 50
+            } Mera Incentive).`
+          : `Synced ${created.patientId} over ${networkState.toUpperCase()} to District 24 HQ (+₹${
+              created.severity === 'routine' ? 20 : 50
+            } Incentive).`,
     });
   };
 
-  const handleManualSync = () => {
-    const count = onSyncOfflineQueue();
-    if (count > 0) {
-      setFeedbackBanner({
-        type: 'teal',
-        message:
-          language === 'hi'
-            ? `${count} ऑफ़लाइन रिकॉर्ड जिला 24 कमांड पोर्टल पर सिंक किए गए।`
-            : `Synced ${count} queued offline ${count === 1 ? 'record' : 'records'} to District 24 Command.`,
-      });
-    }
+  const handleTransmitEmergencySms = () => {
+    const created = onSaveRecord({
+      patientName: patientName.trim() || 'Emergency Patient',
+      age,
+      gender,
+      abhaId,
+      villageCode: 'VIL-204',
+      vitals,
+      symptoms,
+      edgeAi: edgeAiState,
+      clinicalNotes,
+      channel: 'Emergency SMS',
+    });
+    setSmsPreviewOpen(false);
+    setToastBanner({
+      tone: 'red',
+      text: `Encrypted Baseband SMS (${created.patientId}) transmitted to District 24 Command Feed!`,
+    });
   };
 
-  const getVitalCardStyle = (status: 'routine' | 'moderate' | 'emergency') => {
-    if (status === 'emergency') {
-      return {
-        border: 'border-red-300 bg-red-50/50',
-        iconWrap: 'bg-red-100 text-red-700',
-        statusText: t.criticalTag,
-        statusClass: 'text-red-700 font-semibold',
-      };
-    }
-    if (status === 'moderate') {
-      return {
-        border: 'border-amber-300 bg-amber-50/50',
-        iconWrap: 'bg-amber-100 text-amber-800',
-        statusText: t.cautionTag,
-        statusClass: 'text-amber-800 font-semibold',
-      };
-    }
-    return {
-      border: 'border-slate-200 bg-white',
-      iconWrap: 'bg-teal-50 text-[#0F766E]',
-      statusText: t.normalTag,
-      statusClass: 'text-[#0F766E] font-medium',
-    };
-  };
-
-  const sysMeta = getVitalCardStyle(evaluateVitalStatus('systolic', vitals.systolic));
-  const diaMeta = getVitalCardStyle(evaluateVitalStatus('diastolic', vitals.diastolic));
-  const spo2Meta = getVitalCardStyle(evaluateVitalStatus('spo2', vitals.spo2));
-  const tempMeta = getVitalCardStyle(evaluateVitalStatus('temperature', vitals.temperature));
+  const networkButtonConfig =
+    networkState === '4g'
+      ? {
+          label: '🟢 4G Connected',
+          classes: 'bg-emerald-50 border-emerald-300 text-emerald-900',
+        }
+      : networkState === '2g'
+      ? {
+          label: '🟡 Low 2G',
+          classes: 'bg-amber-50 border-amber-300 text-amber-950',
+        }
+      : {
+          label: '🔴 Offline (No Network)',
+          classes: 'bg-red-50 border-red-300 text-red-900',
+        };
 
   return (
-    <div className="min-h-screen bg-slate-50 pb-28 lg:pb-16">
-      {/* ASHA Mobile-First Header */}
-      <header className="bg-white border-b border-slate-200">
-        <div className="max-w-6xl mx-auto px-4 py-3 flex flex-wrap items-center justify-between gap-3">
-          {/* Offline Status Pill Indicator (Interactive connectivity toggle) */}
-          <button
-            type="button"
-            onClick={onToggleOfflineMode}
-            className={`min-h-[48px] px-4 rounded-full border text-xs sm:text-sm font-semibold inline-flex items-center gap-2 transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
-              isOfflineMode
-                ? 'bg-amber-50 border-amber-300 text-amber-900 hover:bg-amber-100'
-                : 'bg-teal-50 border-teal-200 text-[#0F766E] hover:bg-teal-100'
-            }`}
-            title="Tap to toggle simulated village network connectivity"
-          >
-            {isOfflineMode ? (
-              <WifiOff className="w-4 h-4 text-amber-700 shrink-0" />
-            ) : (
-              <Wifi className="w-4 h-4 text-[#0F766E] shrink-0" />
-            )}
-            <span className="tabular-nums">
-              {isOfflineMode ? t.offlineModeQueued(queuedCount) : t.onlineSynced(queuedCount)}
-            </span>
-          </button>
+    <div className="min-h-screen bg-slate-100 flex flex-col">
+      {/* Top Workspace Utility Bar above Mobile Frame */}
+      <div className="bg-slate-900 text-white border-b border-slate-800">
+        <div className="max-w-6xl mx-auto px-4 py-2.5 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5">
+            <span className="text-sm font-bold tracking-tight text-white">HealthSync Edge</span>
+            <span className="text-slate-500">·</span>
+            <span className="font-mono text-xs text-teal-300">{ashaId}</span>
+          </div>
 
-          {/* Language Selector Dropdown (Hindi/English) + Install PWA */}
-          <div className="flex items-center gap-2.5 shrink-0">
+          <div className="flex flex-wrap items-center gap-2">
             <div className="relative flex items-center">
-              <Globe
-                className="w-4 h-4 text-[#0F766E] absolute left-3.5 pointer-events-none"
-                aria-hidden="true"
-              />
+              <Globe className="w-3.5 h-3.5 text-teal-300 absolute left-2.5 pointer-events-none" />
               <select
-                aria-label="Select Language"
+                aria-label="Change Language"
                 value={language}
                 onChange={(e) => onLanguageChange(e.target.value as Language)}
-                className="min-h-[48px] pl-9 pr-8 rounded-xl border border-slate-300 bg-white text-sm font-semibold text-slate-900 hover:border-[#0F766E] transition-colors cursor-pointer"
+                className="min-h-[38px] pl-8 pr-6 rounded-lg bg-slate-800 border border-slate-700 text-xs font-semibold text-white cursor-pointer"
               >
-                <option value="en">English (EN)</option>
-                <option value="hi">हिन्दी (Hindi)</option>
+                {(Object.keys(LANGUAGE_LABELS) as Language[]).map((k) => (
+                  <option key={k} value={k}>
+                    {LANGUAGE_LABELS[k]}
+                  </option>
+                ))}
               </select>
             </div>
+
+            <button
+              type="button"
+              onClick={onSwitchToCommand}
+              className="min-h-[38px] px-3 rounded-lg bg-[#0F766E] hover:bg-teal-700 text-xs font-bold text-white inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+            >
+              <LayoutDashboard className="w-3.5 h-3.5" />
+              <span>District Command</span>
+            </button>
+
             <PWAInstallButton compact />
+
+            <button
+              type="button"
+              onClick={onLogout}
+              title="Back to Role Login"
+              className="min-h-[38px] px-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-300 hover:text-white inline-flex items-center gap-1 cursor-pointer"
+            >
+              <LogOut className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Logout</span>
+            </button>
           </div>
         </div>
-      </header>
+      </div>
 
-      <main className="max-w-6xl mx-auto px-4 pt-5 lg:pt-8">
-        {/* Confirmation Toast / Banner */}
-        {feedbackBanner && (
-          <div
-            role="status"
-            className={`mb-5 rounded-2xl border p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
-              feedbackBanner.type === 'red'
-                ? 'bg-red-50 border-red-300 text-red-950'
-                : 'bg-teal-50 border-teal-300 text-teal-950'
-            }`}
-          >
-            <div className="space-y-1">
-              <p className="text-sm font-semibold">{feedbackBanner.message}</p>
-              {feedbackBanner.smsPayload && (
-                <p className="font-mono text-xs text-red-900 bg-white/80 px-2.5 py-1 rounded-lg border border-red-200 break-all">
-                  SMS: {feedbackBanner.smsPayload}
-                </p>
-              )}
-            </div>
-            <div className="flex items-center gap-2 shrink-0">
-              <button
-                type="button"
-                onClick={onOpenCommandPortal}
-                className="min-h-[44px] px-3.5 rounded-xl bg-slate-900 text-white text-xs font-semibold inline-flex items-center gap-1.5 hover:bg-slate-800 transition-colors cursor-pointer whitespace-nowrap"
-              >
-                <span>View in Command Center</span>
-                <ArrowUpRight className="w-4 h-4" />
-              </button>
-              <button
-                type="button"
-                onClick={() => setFeedbackBanner(null)}
-                className="min-h-[44px] px-3 rounded-xl text-xs font-semibold text-slate-700 hover:bg-black/5 cursor-pointer"
-              >
-                Dismiss
-              </button>
-            </div>
+      {/* Centered Realistic Mobile Device Mockup Frame */}
+      <div className="flex-1 py-5 sm:py-8 px-2 sm:px-4 flex justify-center items-start">
+        <div className="w-full max-w-md rounded-3xl border-4 border-slate-800 bg-white shadow-2xl overflow-hidden flex flex-col">
+          {/* Device Top Speaker Notch Bar */}
+          <div className="bg-slate-900 px-5 py-2 flex items-center justify-between text-[11px] font-mono text-slate-300">
+            <span>HealthSync OS · ABDM</span>
+            <div className="w-16 h-1.5 rounded-full bg-slate-700" />
+            <span className="tabular-nums">VIL-204</span>
           </div>
-        )}
 
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 lg:gap-8 items-start">
-          {/* Primary ASHA Field Column */}
-          <div className="lg:col-span-7 space-y-6">
-            {/* Hero Section: Prominent Voice-to-Form Recording */}
-            <section
-              aria-labelledby="voice-hero-heading"
-              className="rounded-3xl bg-white border border-slate-200 p-6 text-center"
-            >
-              <div className="relative inline-flex items-center justify-center my-2">
+          {/* 1. Header Bar */}
+          <header className="px-4 pt-4 pb-3.5 bg-white border-b border-slate-200 space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              {/* Profile Avatar & Name */}
+              <div className="flex items-center gap-2.5 min-w-0">
+                <div className="w-11 h-11 rounded-2xl bg-[#0F766E] text-white font-bold text-sm flex items-center justify-center shrink-0 shadow-xs">
+                  SD
+                </div>
+                <div className="min-w-0">
+                  <h1 className="text-sm font-bold text-slate-900 truncate">
+                    Sunita Devi (ASHA)
+                  </h1>
+                  <p className="text-xs font-mono text-slate-600">
+                    Village Code: <strong className="text-[#0F766E]">VIL-204</strong>
+                  </p>
+                </div>
+              </div>
+
+              {/* Network Toggle Switch */}
+              <button
+                type="button"
+                onClick={onCycleNetworkState}
+                title="Tap to cycle 4G / Low 2G / Offline"
+                className={`min-h-[48px] px-3 rounded-xl border text-xs font-bold transition-colors cursor-pointer shrink-0 whitespace-nowrap ${networkButtonConfig.classes}`}
+              >
+                {networkButtonConfig.label}
+              </button>
+            </div>
+
+            {/* Interactive Ledger & Pending Offline Sync Triggers */}
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => setIncentiveOpen(true)}
+                className="min-h-[48px] px-3 py-2 rounded-xl bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-left flex items-center gap-2 transition-colors cursor-pointer"
+              >
+                <IndianRupee className="w-4 h-4 text-[#0F766E] shrink-0" />
+                <span className="text-[11px] font-bold text-emerald-950 leading-tight tabular-nums">
+                  Mera Incentive: ₹{totalIncentiveToday} Earned Today
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  if (pendingSyncCount > 0 && networkState !== 'offline') {
+                    const count = onSyncOfflineQueue();
+                    setToastBanner({
+                      tone: 'teal',
+                      text: `Synchronized ${count} pending offline records to District 24 HQ.`,
+                    });
+                  } else if (pendingSyncCount > 0) {
+                    setToastBanner({
+                      tone: 'teal',
+                      text: `${pendingSyncCount} records encrypted locally. Switch network to 4G/2G to upload.`,
+                    });
+                  }
+                }}
+                className="min-h-[48px] px-3 py-2 rounded-xl bg-amber-50 hover:bg-amber-100 border border-amber-200 text-left flex items-center gap-2 transition-colors cursor-pointer"
+              >
+                <RefreshCw className="w-4 h-4 text-[#F59E0B] shrink-0" />
+                <span className="text-[11px] font-bold text-amber-950 leading-tight tabular-nums">
+                  {pendingSyncCount} Pending Offline Syncs
+                </span>
+              </button>
+            </div>
+          </header>
+
+          {/* Main Mobile Body */}
+          <div className="p-4 space-y-5 bg-slate-50">
+            {/* Live Action Toast inside Mobile Viewport */}
+            <AnimatePresence>
+              {toastBanner && (
+                <motion.div
+                  initial={{opacity: 0, y: -6}}
+                  animate={{opacity: 1, y: 0}}
+                  exit={{opacity: 0, y: -6}}
+                  className={`rounded-2xl border p-3.5 flex items-start justify-between gap-2 text-xs font-semibold ${
+                    toastBanner.tone === 'red'
+                      ? 'bg-red-50 border-[#EF4444] text-red-950'
+                      : 'bg-teal-50 border-[#0F766E] text-teal-950'
+                  }`}
+                >
+                  <div className="space-y-1.5">
+                    <p>{toastBanner.text}</p>
+                    <button
+                      type="button"
+                      onClick={onSwitchToCommand}
+                      className="underline font-bold text-[#0F766E] cursor-pointer"
+                    >
+                      Inspect in District 24 Command Center →
+                    </button>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setToastBanner(null)}
+                    aria-label="Dismiss notification"
+                    className="p-1 text-slate-500 hover:text-slate-900 cursor-pointer"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
+            {/* 2. "ASHA Saheli" Interactive Voice Assistant Banner */}
+            <section className="rounded-3xl bg-[#0F766E] text-white p-5 text-center relative overflow-hidden">
+              <div className="relative inline-flex items-center justify-center my-1">
                 <span
                   aria-hidden="true"
-                  className={`absolute inset-0 rounded-full ${
-                    isRecording
-                      ? 'bg-red-500/35 animate-mic-ripple'
-                      : 'bg-[#0F766E]/25 animate-mic-ripple'
-                  }`}
+                  className="absolute inset-0 rounded-full bg-[#10B981]/40 animate-mic-ripple"
                 />
                 <span
                   aria-hidden="true"
-                  className={`absolute inset-0 rounded-full ${
-                    isRecording
-                      ? 'bg-red-500/25 animate-mic-ripple-delayed'
-                      : 'bg-[#0F766E]/15 animate-mic-ripple-delayed'
-                  }`}
+                  className="absolute inset-0 rounded-full bg-white/25 animate-mic-ripple-delayed"
                 />
                 <button
                   type="button"
-                  onClick={handleToggleVoice}
-                  aria-pressed={isRecording}
-                  className={`relative z-10 w-24 h-24 rounded-full flex items-center justify-center text-white shadow-md active:scale-95 transition-transform cursor-pointer ${
-                    isRecording
-                      ? 'bg-red-600 hover:bg-red-700'
-                      : 'bg-[#0F766E] hover:bg-teal-800'
-                  }`}
+                  onClick={() => setSaheliOpen(true)}
+                  aria-label="Open ASHA Saheli Voice Assistant"
+                  className="relative z-10 w-20 h-20 rounded-full bg-white text-[#0F766E] flex items-center justify-center shadow-lg active:scale-95 transition-transform cursor-pointer"
                 >
-                  {isRecording ? (
-                    <MicOff className="w-10 h-10" />
-                  ) : (
-                    <Mic className="w-10 h-10" />
-                  )}
+                  <Mic className="w-9 h-9" />
                 </button>
               </div>
 
-              <h1
-                id="voice-hero-heading"
-                className="mt-4 text-xl sm:text-2xl font-bold text-slate-900 tracking-tight"
+              {/* Animated Acoustic Wave Bars */}
+              <div
+                aria-hidden="true"
+                className="mt-3 flex items-center justify-center gap-1 h-4"
               >
-                {isRecording ? t.voiceListening : t.voiceTitle}
-              </h1>
-              <p className="mt-1 text-sm text-slate-600">{t.voiceHint}</p>
-
-              {voiceTranscript && (
-                <div className="mt-4 rounded-2xl bg-slate-50 border border-slate-200 px-4 py-3 text-left">
-                  <p className="text-xs font-semibold text-[#0F766E]">Captured Voice Input</p>
-                  <p className="mt-0.5 text-sm text-slate-800 leading-snug">“{voiceTranscript}”</p>
-                </div>
-              )}
-
-              {/* One-tap quick voice simulations for rapid field/demo testing */}
-              <div className="mt-5 pt-4 border-t border-slate-100 text-left">
-                <p className="text-xs font-semibold text-slate-500 mb-2.5">{t.voiceSampleLabel}</p>
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-                  {VOICE_PRESETS.map((preset) => (
-                    <button
-                      key={preset.id}
-                      type="button"
-                      onClick={() => applyPreset(preset)}
-                      className="min-h-[48px] px-3 py-2 rounded-xl border border-slate-200 bg-slate-50 hover:bg-teal-50/60 hover:border-[#0F766E]/40 text-left text-xs font-medium text-slate-800 transition-colors cursor-pointer"
-                    >
-                      {language === 'hi' ? preset.labelHi : preset.labelEn}
-                    </button>
-                  ))}
-                </div>
+                {[0.5, 0.9, 0.6, 1, 0.7, 0.95, 0.55].map((scale, idx) => (
+                  <motion.span
+                    key={idx}
+                    animate={{scaleY: [0.4, scale, 0.45]}}
+                    transition={{
+                      duration: 1.1,
+                      repeat: Infinity,
+                      delay: idx * 0.1,
+                      ease: 'easeInOut',
+                    }}
+                    className="w-1 h-4 rounded-full bg-emerald-300 inline-block origin-center"
+                  />
+                ))}
               </div>
+
+              <h2 className="mt-2 text-base font-bold text-white">
+                ASHA Saheli — Bilingual Voice Triage
+              </h2>
+              <p className="text-xs text-teal-100 mt-0.5">
+                “Namaste Didi, patient ke vitals bataiye”
+              </p>
+
+              <button
+                type="button"
+                onClick={() => setSaheliOpen(true)}
+                className="mt-3.5 w-full min-h-[48px] px-4 rounded-xl bg-white hover:bg-teal-50 text-[#0F766E] text-xs sm:text-sm font-bold inline-flex items-center justify-center gap-2 shadow-xs transition-colors cursor-pointer"
+              >
+                <Mic className="w-4 h-4 shrink-0" />
+                <span>{copy.saheliBtn}</span>
+              </button>
             </section>
 
-            {/* Minimal-Typing Patient Context Strip */}
-            <section
-              aria-labelledby="patient-context-heading"
-              className="rounded-3xl bg-white border border-slate-200 p-5"
-            >
-              <div className="flex items-center justify-between gap-2 mb-3.5">
-                <h2
-                  id="patient-context-heading"
-                  className="text-base font-bold text-slate-900"
-                >
-                  {t.patientDetailsHeading}
-                </h2>
-                <span className="font-mono text-xs text-slate-500 tabular-nums">
-                  ID · {previewPatientId}
+            {/* 3. Quick Patient Triage Form */}
+            <section className="rounded-3xl bg-white border border-slate-200 p-4 space-y-4">
+              <div className="flex items-center justify-between">
+                <h2 className="text-sm font-bold text-slate-900">{copy.triageFormTitle}</h2>
+                <span className="font-mono text-[11px] text-slate-500 tabular-nums">
+                  Ref · {nextPatientId}
                 </span>
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-12 gap-3.5">
-                <div className="sm:col-span-5">
+              {/* Demographics + ABHA ID */}
+              <div className="space-y-3">
+                <div>
                   <label
-                    htmlFor="asha-patient-name"
-                    className="block text-xs font-semibold text-slate-700 mb-1.5"
+                    htmlFor="pt-name"
+                    className="block text-xs font-bold text-slate-700 mb-1"
                   >
-                    {t.patientNameLabel}
+                    Patient Name
                   </label>
                   <input
-                    id="asha-patient-name"
+                    id="pt-name"
                     type="text"
                     value={patientName}
                     onChange={(e) => setPatientName(e.target.value)}
-                    className="w-full min-h-[48px] px-3.5 rounded-xl border border-slate-300 bg-white text-base font-semibold text-slate-900"
+                    className="w-full min-h-[48px] px-3.5 rounded-xl border border-slate-300 text-sm font-semibold text-slate-900"
                   />
                 </div>
 
-                <div className="sm:col-span-3">
-                  <label
-                    htmlFor="asha-patient-age"
-                    className="block text-xs font-semibold text-slate-700 mb-1.5"
-                  >
-                    {t.patientAgeLabel}
-                  </label>
-                  <div className="flex items-center gap-1.5">
+                <div className="grid grid-cols-12 gap-2.5">
+                  <div className="col-span-4">
+                    <label
+                      htmlFor="pt-age"
+                      className="block text-xs font-bold text-slate-700 mb-1"
+                    >
+                      Age
+                    </label>
                     <input
-                      id="asha-patient-age"
+                      id="pt-age"
                       type="number"
                       min={1}
                       max={110}
                       value={age}
                       onChange={(e) => setAge(Math.max(1, Number(e.target.value) || 1))}
-                      className="w-full min-h-[48px] px-3 rounded-xl border border-slate-300 bg-white text-base font-mono font-semibold text-slate-900 tabular-nums text-center"
+                      className="w-full min-h-[48px] px-3 rounded-xl border border-slate-300 font-mono text-sm font-bold text-slate-900 tabular-nums text-center"
                     />
-                    <button
-                      type="button"
-                      onClick={() => setGender((g) => (g === 'F' ? 'M' : 'F'))}
-                      className="min-h-[48px] min-w-[48px] px-3 rounded-xl border border-slate-300 bg-slate-50 text-sm font-bold text-slate-800 hover:bg-slate-100 cursor-pointer shrink-0"
-                      title="Toggle Sex (Female / Male)"
-                    >
-                      {gender}
-                    </button>
                   </div>
-                </div>
 
-                <div className="sm:col-span-4">
-                  <label
-                    htmlFor="asha-village-select"
-                    className="block text-xs font-semibold text-slate-700 mb-1.5"
-                  >
-                    {t.villageLabel}
-                  </label>
-                  <select
-                    id="asha-village-select"
-                    value={villageCode}
-                    onChange={(e) => setVillageCode(e.target.value)}
-                    className="w-full min-h-[48px] px-3 rounded-xl border border-slate-300 bg-white text-sm font-semibold text-slate-900 cursor-pointer"
-                  >
-                    {VILLAGE_SUB_CENTERS.map((v) => (
-                      <option key={v.code} value={v.code}>
-                        {v.code} · {language === 'hi' ? v.nameHi : v.name}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              </div>
-            </section>
-
-            {/* Quick Vitals Form: Clean 2-Column Grid */}
-            <section aria-labelledby="quick-vitals-heading" className="space-y-3.5">
-              <div className="flex items-baseline justify-between gap-2 px-1">
-                <h2 id="quick-vitals-heading" className="text-lg font-bold text-slate-900">
-                  {t.quickVitalsHeading}
-                </h2>
-                <span className="text-xs text-slate-500">{t.quickVitalsSub}</span>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3.5 sm:gap-4">
-                {/* Card 1: Systolic BP */}
-                <div
-                  className={`rounded-3xl border p-4 sm:p-5 transition-colors ${sysMeta.border}`}
-                >
-                  <div className="flex items-start justify-between gap-2">
-                    <div
-                      className={`w-11 h-11 rounded-2xl flex items-center justify-center shrink-0 ${sysMeta.iconWrap}`}
-                    >
-                      <Heart className="w-5 h-5" />
+                  <div className="col-span-8">
+                    <span className="block text-xs font-bold text-slate-700 mb-1">Gender</span>
+                    <div className="grid grid-cols-3 gap-1.5">
+                      {(
+                        [
+                          {val: 'F', label: 'Female'},
+                          {val: 'M', label: 'Male'},
+                          {val: 'O', label: 'Other'},
+                        ] as const
+                      ).map((g) => (
+                        <button
+                          key={g.val}
+                          type="button"
+                          onClick={() => setGender(g.val)}
+                          className={`min-h-[48px] rounded-xl border text-xs font-bold transition-colors cursor-pointer ${
+                            gender === g.val
+                              ? 'bg-[#0F766E] border-[#0F766E] text-white'
+                              : 'bg-slate-50 border-slate-300 text-slate-700 hover:bg-slate-100'
+                          }`}
+                        >
+                          {g.label}
+                        </button>
+                      ))}
                     </div>
-                    <span className={`text-xs ${sysMeta.statusClass}`}>{sysMeta.statusText}</span>
                   </div>
+                </div>
 
-                  <label
-                    htmlFor="vital-systolic"
-                    className="mt-3 block text-sm font-bold text-slate-900"
-                  >
-                    {t.systolicLabel}
-                  </label>
-                  <p className="text-xs text-slate-500">mmHg · 90–139</p>
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <label htmlFor="pt-abha" className="text-xs font-bold text-slate-700">
+                      ABHA ID (Ayushman Bharat Health Account)
+                    </label>
+                    <span className="inline-flex items-center gap-1 text-[10px] font-bold text-[#0F766E]">
+                      <ShieldCheck className="w-3 h-3 text-[#10B981]" />
+                      14-Digit
+                    </span>
+                  </div>
+                  <input
+                    id="pt-abha"
+                    type="text"
+                    value={abhaId}
+                    onChange={(e) => setAbhaId(e.target.value)}
+                    className="w-full min-h-[48px] px-3.5 rounded-xl border border-slate-300 font-mono text-xs font-semibold text-slate-900 tabular-nums"
+                  />
+                </div>
+              </div>
 
-                  <div className="mt-3 flex items-center justify-between gap-1.5">
+              {/* Vitals Input 2x2 Grid */}
+              <div className="grid grid-cols-2 gap-2.5 pt-2 border-t border-slate-100">
+                {/* Systolic BP */}
+                <div
+                  className={`rounded-2xl border p-3 ${
+                    evaluateVitalStatus('systolic', vitals.systolic) === 'emergency'
+                      ? 'border-[#EF4444] bg-red-50/50'
+                      : evaluateVitalStatus('systolic', vitals.systolic) === 'moderate'
+                      ? 'border-[#F59E0B] bg-amber-50/50'
+                      : 'border-slate-200 bg-slate-50/60'
+                  }`}
+                >
+                  <div className="flex items-center justify-between text-xs font-bold text-slate-800">
+                    <span className="inline-flex items-center gap-1.5">
+                      <Heart className="w-4 h-4 text-[#0F766E]" />
+                      Systolic BP
+                    </span>
+                    <span className="text-[10px] text-slate-500">mmHg</span>
+                  </div>
+                  <div className="mt-2 flex items-center justify-between gap-1">
                     <button
                       type="button"
-                      onClick={() => adjustVital('systolic', -4)}
+                      onClick={() => adjustVital('systolic', -5)}
                       aria-label="Decrease Systolic BP"
-                      className="min-h-[48px] min-w-[48px] rounded-xl border border-slate-300 bg-white flex items-center justify-center text-slate-800 hover:bg-slate-100 active:scale-95 transition-transform cursor-pointer shrink-0"
+                      className="min-h-[48px] min-w-[44px] rounded-xl bg-white border border-slate-300 flex items-center justify-center text-slate-800 cursor-pointer"
                     >
-                      <Minus className="w-5 h-5" />
+                      <Minus className="w-4 h-4" />
                     </button>
                     <input
-                      id="vital-systolic"
                       type="number"
-                      inputMode="numeric"
+                      aria-label="Systolic BP"
                       value={vitals.systolic}
                       onChange={(e) =>
-                        setVitals((v) => ({
-                          ...v,
-                          systolic: Math.max(0, Number(e.target.value) || 0),
-                        }))
+                        setVitals((v) => ({...v, systolic: Number(e.target.value) || 0}))
                       }
-                      className="w-full min-w-0 min-h-[48px] text-center font-mono text-2xl sm:text-3xl font-bold text-slate-900 bg-transparent tabular-nums"
+                      className="w-full min-w-0 text-center font-mono text-xl font-bold text-slate-900 bg-transparent tabular-nums"
                     />
                     <button
                       type="button"
-                      onClick={() => adjustVital('systolic', 4)}
+                      onClick={() => adjustVital('systolic', 5)}
                       aria-label="Increase Systolic BP"
-                      className="min-h-[48px] min-w-[48px] rounded-xl border border-slate-300 bg-white flex items-center justify-center text-slate-800 hover:bg-slate-100 active:scale-95 transition-transform cursor-pointer shrink-0"
+                      className="min-h-[48px] min-w-[44px] rounded-xl bg-white border border-slate-300 flex items-center justify-center text-slate-800 cursor-pointer"
                     >
-                      <Plus className="w-5 h-5" />
+                      <Plus className="w-4 h-4" />
                     </button>
                   </div>
                 </div>
 
-                {/* Card 2: Diastolic BP */}
+                {/* Diastolic BP */}
                 <div
-                  className={`rounded-3xl border p-4 sm:p-5 transition-colors ${diaMeta.border}`}
+                  className={`rounded-2xl border p-3 ${
+                    evaluateVitalStatus('diastolic', vitals.diastolic) === 'emergency'
+                      ? 'border-[#EF4444] bg-red-50/50'
+                      : evaluateVitalStatus('diastolic', vitals.diastolic) === 'moderate'
+                      ? 'border-[#F59E0B] bg-amber-50/50'
+                      : 'border-slate-200 bg-slate-50/60'
+                  }`}
                 >
-                  <div className="flex items-start justify-between gap-2">
-                    <div
-                      className={`w-11 h-11 rounded-2xl flex items-center justify-center shrink-0 ${diaMeta.iconWrap}`}
-                    >
-                      <Heart className="w-5 h-5" />
-                    </div>
-                    <span className={`text-xs ${diaMeta.statusClass}`}>{diaMeta.statusText}</span>
+                  <div className="flex items-center justify-between text-xs font-bold text-slate-800">
+                    <span className="inline-flex items-center gap-1.5">
+                      <Heart className="w-4 h-4 text-[#0F766E]" />
+                      Diastolic BP
+                    </span>
+                    <span className="text-[10px] text-slate-500">mmHg</span>
                   </div>
-
-                  <label
-                    htmlFor="vital-diastolic"
-                    className="mt-3 block text-sm font-bold text-slate-900"
-                  >
-                    {t.diastolicLabel}
-                  </label>
-                  <p className="text-xs text-slate-500">mmHg · 60–89</p>
-
-                  <div className="mt-3 flex items-center justify-between gap-1.5">
+                  <div className="mt-2 flex items-center justify-between gap-1">
                     <button
                       type="button"
                       onClick={() => adjustVital('diastolic', -2)}
                       aria-label="Decrease Diastolic BP"
-                      className="min-h-[48px] min-w-[48px] rounded-xl border border-slate-300 bg-white flex items-center justify-center text-slate-800 hover:bg-slate-100 active:scale-95 transition-transform cursor-pointer shrink-0"
+                      className="min-h-[48px] min-w-[44px] rounded-xl bg-white border border-slate-300 flex items-center justify-center text-slate-800 cursor-pointer"
                     >
-                      <Minus className="w-5 h-5" />
+                      <Minus className="w-4 h-4" />
                     </button>
                     <input
-                      id="vital-diastolic"
                       type="number"
-                      inputMode="numeric"
+                      aria-label="Diastolic BP"
                       value={vitals.diastolic}
                       onChange={(e) =>
-                        setVitals((v) => ({
-                          ...v,
-                          diastolic: Math.max(0, Number(e.target.value) || 0),
-                        }))
+                        setVitals((v) => ({...v, diastolic: Number(e.target.value) || 0}))
                       }
-                      className="w-full min-w-0 min-h-[48px] text-center font-mono text-2xl sm:text-3xl font-bold text-slate-900 bg-transparent tabular-nums"
+                      className="w-full min-w-0 text-center font-mono text-xl font-bold text-slate-900 bg-transparent tabular-nums"
                     />
                     <button
                       type="button"
                       onClick={() => adjustVital('diastolic', 2)}
                       aria-label="Increase Diastolic BP"
-                      className="min-h-[48px] min-w-[48px] rounded-xl border border-slate-300 bg-white flex items-center justify-center text-slate-800 hover:bg-slate-100 active:scale-95 transition-transform cursor-pointer shrink-0"
+                      className="min-h-[48px] min-w-[44px] rounded-xl bg-white border border-slate-300 flex items-center justify-center text-slate-800 cursor-pointer"
                     >
-                      <Plus className="w-5 h-5" />
+                      <Plus className="w-4 h-4" />
                     </button>
                   </div>
                 </div>
 
-                {/* Card 3: SpO2 (%) with Lungs Icon */}
+                {/* SpO2 % */}
                 <div
-                  className={`rounded-3xl border p-4 sm:p-5 transition-colors ${spo2Meta.border}`}
+                  className={`rounded-2xl border p-3 ${
+                    evaluateVitalStatus('spo2', vitals.spo2) === 'emergency'
+                      ? 'border-[#EF4444] bg-red-50/50'
+                      : evaluateVitalStatus('spo2', vitals.spo2) === 'moderate'
+                      ? 'border-[#F59E0B] bg-amber-50/50'
+                      : 'border-slate-200 bg-slate-50/60'
+                  }`}
                 >
-                  <div className="flex items-start justify-between gap-2">
-                    <div
-                      className={`w-11 h-11 rounded-2xl flex items-center justify-center shrink-0 ${spo2Meta.iconWrap}`}
-                    >
-                      <LungsIcon className="w-5 h-5" />
-                    </div>
-                    <span className={`text-xs ${spo2Meta.statusClass}`}>
-                      {spo2Meta.statusText}
+                  <div className="flex items-center justify-between text-xs font-bold text-slate-800">
+                    <span className="inline-flex items-center gap-1.5">
+                      <LungsIcon className="w-4 h-4 text-[#0F766E]" />
+                      SpO₂ %
                     </span>
+                    <span className="text-[10px] text-slate-500">%</span>
                   </div>
-
-                  <label
-                    htmlFor="vital-spo2"
-                    className="mt-3 block text-sm font-bold text-slate-900"
-                  >
-                    {t.spo2Label}
-                  </label>
-                  <p className="text-xs text-slate-500">% · 95–100%</p>
-
-                  <div className="mt-3 flex items-center justify-between gap-1.5">
+                  <div className="mt-2 flex items-center justify-between gap-1">
                     <button
                       type="button"
                       onClick={() => adjustVital('spo2', -1)}
                       aria-label="Decrease SpO2"
-                      className="min-h-[48px] min-w-[48px] rounded-xl border border-slate-300 bg-white flex items-center justify-center text-slate-800 hover:bg-slate-100 active:scale-95 transition-transform cursor-pointer shrink-0"
+                      className="min-h-[48px] min-w-[44px] rounded-xl bg-white border border-slate-300 flex items-center justify-center text-slate-800 cursor-pointer"
                     >
-                      <Minus className="w-5 h-5" />
+                      <Minus className="w-4 h-4" />
                     </button>
                     <input
-                      id="vital-spo2"
                       type="number"
-                      inputMode="numeric"
+                      aria-label="SpO2 Percentage"
                       value={vitals.spo2}
                       onChange={(e) =>
                         setVitals((v) => ({
@@ -772,249 +736,496 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
                           spo2: Math.min(100, Math.max(0, Number(e.target.value) || 0)),
                         }))
                       }
-                      className="w-full min-w-0 min-h-[48px] text-center font-mono text-2xl sm:text-3xl font-bold text-slate-900 bg-transparent tabular-nums"
+                      className="w-full min-w-0 text-center font-mono text-xl font-bold text-slate-900 bg-transparent tabular-nums"
                     />
                     <button
                       type="button"
                       onClick={() => adjustVital('spo2', 1)}
                       aria-label="Increase SpO2"
-                      className="min-h-[48px] min-w-[48px] rounded-xl border border-slate-300 bg-white flex items-center justify-center text-slate-800 hover:bg-slate-100 active:scale-95 transition-transform cursor-pointer shrink-0"
+                      className="min-h-[48px] min-w-[44px] rounded-xl bg-white border border-slate-300 flex items-center justify-center text-slate-800 cursor-pointer"
                     >
-                      <Plus className="w-5 h-5" />
+                      <Plus className="w-4 h-4" />
                     </button>
                   </div>
                 </div>
 
-                {/* Card 4: Temperature (°F) with Thermometer Icon */}
+                {/* Temperature °F */}
                 <div
-                  className={`rounded-3xl border p-4 sm:p-5 transition-colors ${tempMeta.border}`}
+                  className={`rounded-2xl border p-3 ${
+                    evaluateVitalStatus('temperature', vitals.temperature) === 'emergency'
+                      ? 'border-[#EF4444] bg-red-50/50'
+                      : evaluateVitalStatus('temperature', vitals.temperature) === 'moderate'
+                      ? 'border-[#F59E0B] bg-amber-50/50'
+                      : 'border-slate-200 bg-slate-50/60'
+                  }`}
                 >
-                  <div className="flex items-start justify-between gap-2">
-                    <div
-                      className={`w-11 h-11 rounded-2xl flex items-center justify-center shrink-0 ${tempMeta.iconWrap}`}
-                    >
-                      <Thermometer className="w-5 h-5" />
-                    </div>
-                    <span className={`text-xs ${tempMeta.statusClass}`}>
-                      {tempMeta.statusText}
+                  <div className="flex items-center justify-between text-xs font-bold text-slate-800">
+                    <span className="inline-flex items-center gap-1.5">
+                      <Thermometer className="w-4 h-4 text-[#0F766E]" />
+                      Temp °F
                     </span>
+                    <span className="text-[10px] text-slate-500">°F</span>
                   </div>
-
-                  <label
-                    htmlFor="vital-temp"
-                    className="mt-3 block text-sm font-bold text-slate-900"
-                  >
-                    {t.tempLabel}
-                  </label>
-                  <p className="text-xs text-slate-500">°F · 97.0–99.4°F</p>
-
-                  <div className="mt-3 flex items-center justify-between gap-1.5">
+                  <div className="mt-2 flex items-center justify-between gap-1">
                     <button
                       type="button"
-                      onClick={() => adjustVital('temperature', -0.4)}
+                      onClick={() => adjustVital('temperature', -0.5)}
                       aria-label="Decrease Temperature"
-                      className="min-h-[48px] min-w-[48px] rounded-xl border border-slate-300 bg-white flex items-center justify-center text-slate-800 hover:bg-slate-100 active:scale-95 transition-transform cursor-pointer shrink-0"
+                      className="min-h-[48px] min-w-[44px] rounded-xl bg-white border border-slate-300 flex items-center justify-center text-slate-800 cursor-pointer"
                     >
-                      <Minus className="w-5 h-5" />
+                      <Minus className="w-4 h-4" />
                     </button>
                     <input
-                      id="vital-temp"
                       type="number"
                       step="0.1"
-                      inputMode="decimal"
+                      aria-label="Temperature Fahrenheit"
                       value={vitals.temperature}
                       onChange={(e) =>
-                        setVitals((v) => ({
-                          ...v,
-                          temperature: Math.max(0, Number(e.target.value) || 0),
-                        }))
+                        setVitals((v) => ({...v, temperature: Number(e.target.value) || 0}))
                       }
-                      className="w-full min-w-0 min-h-[48px] text-center font-mono text-2xl sm:text-3xl font-bold text-slate-900 bg-transparent tabular-nums"
+                      className="w-full min-w-0 text-center font-mono text-xl font-bold text-slate-900 bg-transparent tabular-nums"
                     />
                     <button
                       type="button"
-                      onClick={() => adjustVital('temperature', 0.4)}
+                      onClick={() => adjustVital('temperature', 0.5)}
                       aria-label="Increase Temperature"
-                      className="min-h-[48px] min-w-[48px] rounded-xl border border-slate-300 bg-white flex items-center justify-center text-slate-800 hover:bg-slate-100 active:scale-95 transition-transform cursor-pointer shrink-0"
+                      className="min-h-[48px] min-w-[44px] rounded-xl bg-white border border-slate-300 flex items-center justify-center text-slate-800 cursor-pointer"
                     >
-                      <Plus className="w-5 h-5" />
+                      <Plus className="w-4 h-4" />
                     </button>
                   </div>
                 </div>
               </div>
+
+              {/* Symptom Chips */}
+              <div className="pt-2 border-t border-slate-100">
+                <p className="text-xs font-bold text-slate-700 mb-2">
+                  Presenting Symptoms (Tap to toggle):
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  {ALL_SYMPTOMS.map((sym) => {
+                    const active = symptoms.includes(sym);
+                    const isCriticalSym = sym === 'Chest Pain';
+                    return (
+                      <button
+                        key={sym}
+                        type="button"
+                        onClick={() => toggleSymptom(sym)}
+                        className={`min-h-[48px] px-3.5 rounded-xl border text-xs font-bold transition-colors cursor-pointer ${
+                          active
+                            ? isCriticalSym
+                              ? 'bg-[#EF4444] border-[#EF4444] text-white'
+                              : 'bg-[#0F766E] border-[#0F766E] text-white'
+                            : 'bg-slate-50 border-slate-300 text-slate-800 hover:bg-slate-100'
+                        }`}
+                      >
+                        {sym}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
             </section>
 
-            {/* Live Triage Preview */}
+            {/* 4. Edge-AI Micro-Diagnostics Tab */}
+            <section className="rounded-3xl bg-white border border-slate-200 p-4 space-y-3.5">
+              <div className="flex items-center justify-between">
+                <h2 className="text-sm font-bold text-slate-900">{copy.edgeAiTitle}</h2>
+                <span className="text-[11px] font-mono text-[#0F766E] font-semibold">
+                  On-Device TFLite
+                </span>
+              </div>
+
+              {/* Sub-tabs */}
+              <div className="grid grid-cols-2 gap-1.5 p-1 bg-slate-100 rounded-2xl">
+                <button
+                  type="button"
+                  onClick={() => setActiveDiagTab('anemia')}
+                  className={`min-h-[44px] px-3 rounded-xl text-xs font-bold inline-flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
+                    activeDiagTab === 'anemia'
+                      ? 'bg-white text-slate-900 shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <Eye className="w-3.5 h-3.5 text-[#0F766E]" />
+                  <span>Conjunctiva Anemia</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setActiveDiagTab('cough')}
+                  className={`min-h-[44px] px-3 rounded-xl text-xs font-bold inline-flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
+                    activeDiagTab === 'cough'
+                      ? 'bg-white text-slate-900 shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <AudioWaveform className="w-3.5 h-3.5 text-[#0F766E]" />
+                  <span>Cough Audio (5s)</span>
+                </button>
+              </div>
+
+              {activeDiagTab === 'anemia' ? (
+                <div className="space-y-3">
+                  {/* Simulated Camera / Uploaded Eyelid Viewfinder */}
+                  <div className="relative h-36 rounded-2xl bg-slate-900 overflow-hidden border border-slate-800 flex items-center justify-center">
+                    {uploadedEyePreview ? (
+                      <img
+                        src={uploadedEyePreview}
+                        alt="Uploaded lower eyelid conjunctiva preview"
+                        referrerPolicy="no-referrer"
+                        className="w-full h-full object-cover opacity-85"
+                      />
+                    ) : (
+                      <svg
+                        viewBox="0 0 320 140"
+                        className="w-full h-full"
+                        aria-label="Simulated Palpebral Conjunctiva Viewfinder"
+                      >
+                        <rect width="320" height="140" fill="#1E293B" />
+                        <path
+                          d="M 45 70 Q 160 15 275 70 Q 160 120 45 70 Z"
+                          fill="#F8FAFC"
+                          opacity="0.92"
+                        />
+                        <circle cx="160" cy="66" r="24" fill="#334155" />
+                        <circle cx="160" cy="66" r="10" fill="#0F172A" />
+                        {/* Pale lower palpebral conjunctiva band */}
+                        <path
+                          d="M 70 82 Q 160 116 250 82 Q 160 102 70 82 Z"
+                          fill={anemiaFlagged ? '#FCA5A5' : '#F87171'}
+                        />
+                        <rect
+                          x="65"
+                          y="72"
+                          width="190"
+                          height="34"
+                          rx="8"
+                          fill="none"
+                          stroke="#10B981"
+                          strokeWidth="1.5"
+                          strokeDasharray="4 3"
+                        />
+                      </svg>
+                    )}
+
+                    {anemiaScanning && (
+                      <motion.div
+                        initial={{y: -60}}
+                        animate={{y: 60}}
+                        transition={{duration: 0.9, repeat: Infinity, repeatType: 'reverse'}}
+                        className="absolute inset-x-4 h-0.5 bg-[#10B981] shadow-md"
+                      />
+                    )}
+                  </div>
+
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="image/*"
+                    onChange={handleEyePhotoUpload}
+                    className="hidden"
+                  />
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => runConjunctivaAnalysis()}
+                      disabled={anemiaScanning}
+                      className="min-h-[48px] px-3 rounded-xl bg-[#0F766E] hover:bg-teal-800 text-white text-xs font-bold inline-flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      <Camera className="w-4 h-4 shrink-0" />
+                      <span>{anemiaScanning ? 'Analyzing Pallor...' : 'Simulate Eyelid Scan'}</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                      className="min-h-[48px] px-3 rounded-xl border border-slate-300 bg-slate-50 hover:bg-slate-100 text-xs font-bold text-slate-800 inline-flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      <Upload className="w-4 h-4 shrink-0" />
+                      <span>Upload Photo</span>
+                    </button>
+                  </div>
+
+                  {anemiaFlagged && (
+                    <div className="rounded-2xl bg-red-50 border border-[#EF4444] p-3 flex items-center justify-between gap-2">
+                      <div>
+                        <p className="text-xs font-bold text-red-900">
+                          Suspected Severe Anemia (Hb &lt; 8 g/dL)
+                        </p>
+                        <p className="text-[11px] text-red-800 font-mono tabular-nums mt-0.5">
+                          Est. Hemoglobin: {estimatedHb} g/dL · Erythema Index Low (94% conf.)
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAnemiaFlagged(false);
+                          setEstimatedHb(undefined);
+                        }}
+                        className="text-[11px] font-bold text-slate-600 underline cursor-pointer shrink-0"
+                      >
+                        Clear
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <div className="rounded-2xl bg-slate-900 p-4 text-white space-y-3">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="text-slate-300 font-medium">
+                        5-Second Acoustic Cough Spectrogram
+                      </span>
+                      <span className="font-mono font-bold text-emerald-300 tabular-nums">
+                        {coughRecording ? `00:0${coughSecondsLeft}s` : '5.0s Window'}
+                      </span>
+                    </div>
+
+                    <div className="h-14 flex items-center justify-center gap-1.5">
+                      {[0.35, 0.7, 0.95, 0.5, 1, 0.8, 0.45, 0.9, 0.6, 0.85, 0.4, 0.75].map(
+                        (amp, i) => (
+                          <motion.span
+                            key={i}
+                            animate={
+                              coughRecording
+                                ? {scaleY: [0.25, amp, 0.3]}
+                                : {scaleY: respiratoryFlagged ? amp * 0.85 : 0.25}
+                            }
+                            transition={{
+                              duration: 0.45,
+                              repeat: coughRecording ? Infinity : 0,
+                              delay: i * 0.04,
+                            }}
+                            className={`w-2 h-12 rounded-full inline-block origin-center ${
+                              respiratoryFlagged ? 'bg-[#EF4444]' : 'bg-[#10B981]'
+                            }`}
+                          />
+                        )
+                      )}
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={startCoughRecorder}
+                    disabled={coughRecording}
+                    className="w-full min-h-[48px] px-4 rounded-xl bg-[#0F766E] hover:bg-teal-800 disabled:opacity-60 text-white text-xs font-bold inline-flex items-center justify-center gap-2 cursor-pointer"
+                  >
+                    <Mic className="w-4 h-4" />
+                    <span>
+                      {coughRecording
+                        ? `Recording Patient Cough (${coughSecondsLeft}s)...`
+                        : 'Record 5-Second Cough Sample'}
+                    </span>
+                  </button>
+
+                  {respiratoryFlagged && (
+                    <div className="rounded-2xl bg-red-50 border border-[#EF4444] p-3 flex items-center justify-between gap-2">
+                      <div>
+                        <p className="text-xs font-bold text-red-900">High Respiratory Risk</p>
+                        <p className="text-[11px] text-red-800 font-mono tabular-nums mt-0.5">
+                          Spectral Peak: {coughPeakHz} Hz · Wet Bronchial Crackle Detected
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setRespiratoryFlagged(false);
+                          setCoughPeakHz(undefined);
+                        }}
+                        className="text-[11px] font-bold text-slate-600 underline cursor-pointer shrink-0"
+                      >
+                        Clear
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+            </section>
+
+            {/* 5. Dynamic Triage Scorecard */}
             <section
               aria-live="polite"
-              className={`rounded-3xl border p-5 sm:p-6 transition-colors ${
+              className={`rounded-3xl border-2 p-4 space-y-2.5 transition-colors ${
                 triage.severity === 'emergency'
-                  ? 'bg-red-50 border-red-300 text-red-950'
+                  ? 'bg-red-50 border-[#EF4444] text-red-950'
                   : triage.severity === 'moderate'
-                  ? 'bg-amber-50 border-amber-300 text-amber-950'
-                  : 'bg-emerald-50 border-emerald-300 text-emerald-950'
+                  ? 'bg-amber-50 border-[#F59E0B] text-amber-950'
+                  : 'bg-emerald-50 border-[#10B981] text-emerald-950'
               }`}
             >
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <span className="text-xs font-bold tracking-wide text-slate-700">
-                  {t.liveTriageHeading}
-                </span>
-
-                {/* Real-time dynamic severity badge */}
-                <div
-                  className={`min-h-[40px] px-4 py-1.5 rounded-full inline-flex items-center gap-2 text-sm font-bold shadow-xs ${
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-bold">Dynamic Triage Scorecard</span>
+                <span
+                  className={`px-3 py-1 rounded-full text-xs font-bold inline-flex items-center gap-1.5 ${
                     triage.severity === 'emergency'
-                      ? 'bg-red-600 text-white'
+                      ? 'bg-[#EF4444] text-white'
                       : triage.severity === 'moderate'
-                      ? 'bg-amber-500 text-slate-950'
-                      : 'bg-emerald-700 text-white'
+                      ? 'bg-[#F59E0B] text-slate-950'
+                      : 'bg-[#10B981] text-white'
                   }`}
                 >
                   {triage.severity === 'emergency' ? (
-                    <Siren className="w-4 h-4 shrink-0" />
+                    <Siren className="w-3.5 h-3.5" />
                   ) : triage.severity === 'moderate' ? (
-                    <AlertTriangle className="w-4 h-4 shrink-0" />
+                    <AlertTriangle className="w-3.5 h-3.5" />
                   ) : (
-                    <CheckCircle2 className="w-4 h-4 shrink-0" />
+                    <CheckCircle2 className="w-3.5 h-3.5" />
                   )}
                   <span>
                     {triage.severity === 'emergency'
-                      ? t.severityEmergency
+                      ? 'RED · CRITICAL EMERGENCY'
                       : triage.severity === 'moderate'
-                      ? t.severityModerate
-                      : t.severityRoutine}
+                      ? 'YELLOW · Moderate Risk'
+                      : 'GREEN · Routine'}
                   </span>
-                </div>
-              </div>
-
-              <div className="mt-3.5 space-y-2">
-                <p className="text-sm font-semibold">
-                  {(language === 'hi' ? triage.triggersHi : triage.triggersEn).join(' · ')}
-                </p>
-                <p className="text-sm opacity-90 leading-relaxed">
-                  {language === 'hi' ? triage.protocolHi : triage.protocolEn}
-                </p>
-              </div>
-            </section>
-          </div>
-
-          {/* Right Companion Column on Desktop: Local Offline Sync Queue & 2G SMS Fallback */}
-          <aside className="lg:col-span-5 space-y-6">
-            <div className="rounded-3xl bg-white border border-slate-200 p-5 sm:p-6">
-              <div className="flex items-center justify-between gap-3">
-                <h2 className="text-base font-bold text-slate-900">{t.offlineQueueTitle}</h2>
-                <span className="font-mono text-xs font-semibold text-slate-600 tabular-nums">
-                  {queuedCount} queued
                 </span>
               </div>
 
-              <p className="mt-1.5 text-xs text-slate-600 leading-relaxed">
-                Records saved while offline are encrypted locally on this device and synced when
-                sub-center connectivity resumes. Critical emergencies bypass data queues over 2G
-                GSM SMS.
-              </p>
+              <p className="text-xs font-bold leading-snug">{triage.triggers.join(' · ')}</p>
+              <p className="text-xs opacity-90 leading-relaxed">{triage.protocol}</p>
+            </section>
 
-              {/* Queued items list */}
-              <div className="mt-4 divide-y divide-slate-100 border-t border-b border-slate-100">
-                {queuedItems.length === 0 ? (
-                  <div className="py-6 text-center text-sm text-slate-500">
-                    All local patient screenings are synced with District 24 Command.
-                  </div>
+            {/* 6. Emergency Action Bar */}
+            <section className="rounded-3xl bg-white border border-slate-200 p-4 space-y-3">
+              {/* BLE Mesh Relay Status */}
+              <div className="flex items-center justify-between text-xs px-1">
+                {networkState === 'offline' ? (
+                  <span className="inline-flex items-center gap-1.5 font-bold text-[#0F766E]">
+                    <Bluetooth className="w-4 h-4 text-[#10B981]" />
+                    <span>BLE Peer Relay Ready (ANM Sub-Center Hop Active)</span>
+                  </span>
                 ) : (
-                  queuedItems.map((item) => (
-                    <div key={item.id} className="py-3.5 flex items-center justify-between gap-3">
-                      <div className="min-w-0">
-                        <p className="text-sm font-bold text-slate-900 truncate">
-                          {item.patientName}{' '}
-                          <span className="font-normal text-slate-500">
-                            · {item.age}
-                            {item.gender}
-                          </span>
-                        </p>
-                        <p className="text-xs text-slate-500 font-mono tabular-nums mt-0.5">
-                          {item.patientId} · {item.villageCode} · BP {item.vitals.systolic}/
-                          {item.vitals.diastolic} · SpO₂ {item.vitals.spo2}%
-                        </p>
-                      </div>
-                      <span
-                        className={`text-xs font-semibold shrink-0 ${
-                          item.severity === 'emergency'
-                            ? 'text-red-700'
-                            : item.severity === 'moderate'
-                            ? 'text-amber-700'
-                            : 'text-[#0F766E]'
-                        }`}
-                      >
-                        {item.severity === 'emergency'
-                          ? 'EMERGENCY'
-                          : item.severity === 'moderate'
-                          ? 'Moderate'
-                          : 'Routine'}
-                      </span>
-                    </div>
-                  ))
+                  <span className="text-slate-600 font-medium">
+                    Direct {networkState.toUpperCase()} Packet &amp; Baseband SMS Ready
+                  </span>
                 )}
+                <span className="font-mono text-[11px] text-slate-400">AES-128</span>
               </div>
 
               <button
                 type="button"
-                disabled={queuedCount === 0}
-                onClick={handleManualSync}
-                className="mt-4 w-full min-h-[48px] px-4 rounded-xl border border-slate-300 bg-slate-50 text-sm font-semibold text-slate-800 hover:bg-slate-100 disabled:opacity-45 disabled:cursor-not-allowed inline-flex items-center justify-center gap-2 transition-colors cursor-pointer"
+                onClick={handleSaveOfflineRecord}
+                className="w-full min-h-[50px] px-4 rounded-xl bg-[#0F766E] hover:bg-teal-800 active:scale-[0.99] text-white text-sm font-bold inline-flex items-center justify-center gap-2 transition-all cursor-pointer"
               >
-                <RefreshCw className="w-4 h-4 text-[#0F766E]" />
-                <span>
-                  {t.syncNowBtn} ({queuedCount})
-                </span>
+                <Save className="w-4 h-4 shrink-0" />
+                <span>{copy.saveOfflineBtn}</span>
               </button>
-            </div>
 
-            {/* Live GSM 7-bit Emergency SMS Packet Inspector */}
-            <div className="rounded-3xl bg-slate-900 text-slate-100 p-5 sm:p-6">
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-2 text-xs font-semibold text-teal-300">
-                  <Radio className="w-4 h-4" />
-                  <span>{t.smsPreviewTitle}</span>
-                </div>
-                <span className="font-mono text-xs text-slate-400 tabular-nums">
-                  {smsPacketPreview.length}/160 chars
-                </span>
-              </div>
-              <p className="mt-3 font-mono text-xs sm:text-sm text-white bg-slate-800/90 border border-slate-700 rounded-xl p-3.5 break-all tabular-nums">
-                {smsPacketPreview}
-              </p>
-              <p className="mt-2.5 text-xs text-slate-400 leading-relaxed">
-                Transmits directly to District 24 Hospital gateway shortcode{' '}
-                <span className="font-mono text-slate-200">108-2400</span> when mobile data is
-                unavailable.
-              </p>
-            </div>
-          </aside>
-        </div>
-      </main>
-
-      {/* Fixed Bottom Action Bar (Meets >= 48px high touch target & <= 15% mobile sticky cap) */}
-      <div className="fixed bottom-0 left-0 right-0 z-30 bg-white/95 backdrop-blur-md border-t border-slate-200 px-4 py-2.5">
-        <div className="max-w-6xl mx-auto grid grid-cols-1 sm:grid-cols-2 gap-2.5 sm:gap-4">
-          <button
-            type="button"
-            onClick={handlePrimarySave}
-            className="min-h-[48px] px-5 rounded-xl bg-[#0F766E] hover:bg-teal-800 active:scale-[0.99] text-white text-sm sm:text-base font-bold inline-flex items-center justify-center gap-2 shadow-xs transition-all cursor-pointer whitespace-nowrap"
-          >
-            <Save className="w-5 h-5 shrink-0" />
-            <span>{t.saveRecordBtn}</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={handleEmergencySmsBypass}
-            className="min-h-[48px] px-5 rounded-xl bg-white hover:bg-red-50 active:scale-[0.99] border-2 border-red-600 text-red-700 text-sm sm:text-base font-bold inline-flex items-center justify-center gap-2 transition-all cursor-pointer whitespace-nowrap"
-          >
-            <MessageSquareWarning className="w-5 h-5 text-red-600 shrink-0" />
-            <span>{t.sendSmsBtn}</span>
-          </button>
+              <button
+                type="button"
+                onClick={() => setSmsPreviewOpen(true)}
+                className="w-full min-h-[50px] px-4 rounded-xl bg-[#EF4444] hover:bg-red-600 active:scale-[0.99] text-white text-sm font-bold inline-flex items-center justify-center gap-2 shadow-sm transition-all cursor-pointer"
+              >
+                <MessageSquareLock className="w-4 h-4 shrink-0" />
+                <span>{copy.sendEncryptedSmsBtn}</span>
+              </button>
+            </section>
+          </div>
         </div>
       </div>
+
+      {/* Encrypted Emergency SMS Preview Modal */}
+      <AnimatePresence>
+        {smsPreviewOpen && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/65 backdrop-blur-xs p-4"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="sms-preview-modal-title"
+          >
+            <motion.div
+              initial={{opacity: 0, scale: 0.96, y: 10}}
+              animate={{opacity: 1, scale: 1, y: 0}}
+              exit={{opacity: 0, scale: 0.96, y: 10}}
+              transition={{duration: 0.18}}
+              className="w-full max-w-md rounded-3xl bg-white border border-slate-200 shadow-2xl overflow-hidden"
+            >
+              <div className="bg-[#EF4444] text-white px-5 py-4 flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2.5">
+                  <MessageSquareLock className="w-5 h-5 shrink-0" />
+                  <div>
+                    <h3 id="sms-preview-modal-title" className="text-base font-bold">
+                      Encrypted Baseband Emergency SMS
+                    </h3>
+                    <p className="text-xs text-red-100">
+                      Zero-Internet GSM 7-Bit Bit-Packed Transmission
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSmsPreviewOpen(false)}
+                  aria-label="Close SMS Preview"
+                  className="min-h-[40px] min-w-[40px] rounded-xl bg-white/15 hover:bg-white/25 flex items-center justify-center cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="p-5 space-y-4">
+                <div className="flex items-center justify-between text-xs text-slate-600">
+                  <span>Gateway Shortcode: <strong>108-2400 (District 24 HQ)</strong></span>
+                  <span className="font-mono font-bold text-[#0F766E] tabular-nums">
+                    {liveSmsPayload.length}/160 chars
+                  </span>
+                </div>
+
+                <div className="rounded-2xl bg-slate-950 text-emerald-300 font-mono text-xs p-4 break-all leading-relaxed border border-slate-800">
+                  {liveSmsPayload}
+                </div>
+
+                <div className="rounded-2xl bg-slate-50 border border-slate-200 p-3.5 text-xs text-slate-700 space-y-1">
+                  <p className="font-bold text-slate-900">Packed Clinical Fields:</p>
+                  <p>
+                    Patient: <strong>{patientName}</strong> ({nextPatientId}) · Village{' '}
+                    <strong>VIL-204</strong>
+                  </p>
+                  <p className="font-mono tabular-nums">
+                    BP {vitals.systolic}/{vitals.diastolic} mmHg · SpO₂ {vitals.spo2}% · Temp{' '}
+                    {vitals.temperature.toFixed(1)}°F
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2.5">
+                  <button
+                    type="button"
+                    onClick={() => setSmsPreviewOpen(false)}
+                    className="min-h-[48px] px-4 rounded-xl border border-slate-300 bg-white text-xs font-bold text-slate-700 hover:bg-slate-50 cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleTransmitEmergencySms}
+                    className="min-h-[48px] px-4 rounded-xl bg-[#EF4444] hover:bg-red-600 text-white text-xs font-bold inline-flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    <Send className="w-4 h-4" />
+                    <span>Transmit SMS Now</span>
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Two-Way ASHA Saheli Voice Chatbot Modal */}
+      <AshaSaheliModal
+        isOpen={saheliOpen}
+        onClose={() => setSaheliOpen(false)}
+        onApplyFormPatch={handleApplySaheliPatch}
+      />
+
+      {/* Mera Incentive Ledger Modal */}
+      <IncentiveLedgerModal
+        isOpen={incentiveOpen}
+        onClose={() => setIncentiveOpen(false)}
+        entries={incentives}
+        ashaName="Sunita Devi"
+        ashaId={ashaId}
+      />
     </div>
   );
 };

@@ -4,32 +4,44 @@
  */
 
 import {useState, useEffect} from 'react';
-import {Smartphone, LayoutDashboard} from 'lucide-react';
 import {
+  EdgeAiDiagnostics,
+  IncentiveEntry,
   Language,
+  NetworkState,
+  SymptomKey,
   TriageRecord,
   VitalsSnapshot,
+  buildEncryptedEmergencySms,
   evaluateTriage,
 } from './types/triage';
-import {INITIAL_TRIAGE_RECORDS, VILLAGE_SUB_CENTERS, TRANSLATIONS} from './data/initialData';
+import {
+  INITIAL_INCENTIVE_LEDGER,
+  INITIAL_TRIAGE_RECORDS,
+  VILLAGE_SUB_CENTERS,
+} from './data/initialData';
+import {LoginPage} from './components/LoginPage';
 import {AshaWorkerPWA} from './components/AshaWorkerPWA';
 import {DistrictCommandDashboard} from './components/DistrictCommandDashboard';
 
-type ActivePortal = 'asha' | 'command';
+type AppRoute = 'login' | 'asha' | 'command';
 
-const STORAGE_KEY = 'swasthyasetu_district24_records_v1';
+const RECORDS_STORAGE_KEY = 'healthsync_edge_records_v2';
+const INCENTIVES_STORAGE_KEY = 'healthsync_edge_incentives_v2';
 
 export default function App() {
-  const [activePortal, setActivePortal] = useState<ActivePortal>('asha');
+  // Default Initial Screen: Login & Onboarding Page
+  const [route, setRoute] = useState<AppRoute>('login');
   const [language, setLanguage] = useState<Language>('en');
-  // Starts in simulated rural offline mode with 2 queued records to showcase the offline field workflow immediately
-  const [isOfflineMode, setIsOfflineMode] = useState<boolean>(true);
+  const [ashaId, setAshaId] = useState<string>('ASHA-8842-UP');
+  const [dmoEmail, setDmoEmail] = useState<string>('dmo.district24@nhm.up.gov.in');
+  const [networkState, setNetworkState] = useState<NetworkState>('offline');
 
   const [records, setRecords] = useState<TriageRecord[]>(() => {
     try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) {
-        const parsed = JSON.parse(saved) as TriageRecord[];
+      const raw = localStorage.getItem(RECORDS_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as TriageRecord[];
         if (Array.isArray(parsed) && parsed.length > 0) {
           return parsed;
         }
@@ -40,37 +52,71 @@ export default function App() {
     return INITIAL_TRIAGE_RECORDS;
   });
 
+  const [incentives, setIncentives] = useState<IncentiveEntry[]>(() => {
+    try {
+      const raw = localStorage.getItem(INCENTIVES_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as IncentiveEntry[];
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          return parsed;
+        }
+      }
+    } catch {
+      // Fallback to initial ₹240 ledger
+    }
+    return INITIAL_INCENTIVE_LEDGER;
+  });
+
   useEffect(() => {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(records));
+      localStorage.setItem(RECORDS_STORAGE_KEY, JSON.stringify(records));
     } catch {
-      // Ignore storage quota errors in restricted frames
+      // Ignore storage quota errors
     }
   }, [records]);
 
-  const handleSaveRecord = (
-    patientName: string,
-    age: number,
-    gender: 'F' | 'M',
-    villageCode: string,
-    vitals: VitalsSnapshot,
-    clinicalNotes: string,
-    channel: 'Data' | 'Emergency SMS'
-  ): TriageRecord => {
+  useEffect(() => {
+    try {
+      localStorage.setItem(INCENTIVES_STORAGE_KEY, JSON.stringify(incentives));
+    } catch {
+      // Ignore storage quota errors
+    }
+  }, [incentives]);
+
+  const handleCycleNetworkState = () => {
+    setNetworkState((prev) => (prev === '4g' ? '2g' : prev === '2g' ? 'offline' : '4g'));
+  };
+
+  const handleSaveRecord = (params: {
+    patientName: string;
+    age: number;
+    gender: 'F' | 'M' | 'O';
+    abhaId: string;
+    villageCode: string;
+    vitals: VitalsSnapshot;
+    symptoms: SymptomKey[];
+    edgeAi: EdgeAiDiagnostics;
+    clinicalNotes: string;
+    channel: 'Data' | 'Emergency SMS';
+  }): TriageRecord => {
     const village =
-      VILLAGE_SUB_CENTERS.find((v) => v.code === villageCode) || VILLAGE_SUB_CENTERS[0];
-    const evaluation = evaluateTriage(vitals);
+      VILLAGE_SUB_CENTERS.find((v) => v.code === params.villageCode) || VILLAGE_SUB_CENTERS[0];
+    const evaluation = evaluateTriage(params.vitals, params.symptoms, params.edgeAi);
 
-    // Emergency SMS bypasses data outage and always delivers as RED high-priority alert if triggered via emergency SMS button
     const effectiveSeverity =
-      channel === 'Emergency SMS' && evaluation.severity === 'routine'
-        ? 'emergency'
-        : channel === 'Emergency SMS'
-        ? 'emergency'
-        : evaluation.severity;
+      params.channel === 'Emergency SMS' ? 'emergency' : evaluation.severity;
 
-    const now = new Date();
-    const formattedTime = now.toLocaleTimeString('en-IN', {
+    const patientId = `PT${8924 + records.length + 1}`;
+    const binarySmsPayload = buildEncryptedEmergencySms({
+      patientId,
+      villageCode: village.code,
+      vitals: params.vitals,
+      symptoms: params.symptoms,
+      edgeAi: params.edgeAi,
+      severity: effectiveSeverity,
+    });
+
+    const formattedTime = new Date().toLocaleTimeString('en-IN', {
       hour: '2-digit',
       minute: '2-digit',
       hour12: true,
@@ -78,47 +124,67 @@ export default function App() {
 
     const newRecord: TriageRecord = {
       id: `rec-${Date.now()}`,
-      patientId: `PT-${2480 + records.length + 1}`,
-      patientName,
-      age,
-      gender,
+      patientId,
+      abhaId: params.abhaId,
+      patientName: params.patientName,
+      age: params.age,
+      gender: params.gender,
       villageCode: village.code,
       villageName: village.name,
       ashaWorker: village.ashaName,
-      vitals: {...vitals},
+      vitals: {...params.vitals},
+      symptoms: [...params.symptoms],
+      edgeAi: {...params.edgeAi},
       severity: effectiveSeverity,
-      clinicalNotes,
-      channel,
+      clinicalNotes: params.clinicalNotes,
+      channel: params.channel,
       syncStatus:
-        channel === 'Emergency SMS'
+        params.channel === 'Emergency SMS'
           ? 'SMS Delivered'
-          : isOfflineMode
+          : networkState === 'offline'
           ? 'Queued Offline'
           : 'Synced',
+      binarySmsPayload,
       timestamp: formattedTime,
       createdAtMs: Date.now(),
       dispatchStatus: 'Unassigned',
     };
 
     setRecords((prev) => [newRecord, ...prev]);
+
+    // Credit NHM Mera Incentive Ledger automatically
+    const rewardAmount = effectiveSeverity === 'routine' ? 20 : 50;
+    const newIncentive: IncentiveEntry = {
+      id: `inc-${Date.now()}`,
+      taskTitle:
+        effectiveSeverity === 'emergency'
+          ? 'Critical Emergency Triage & Referral'
+          : effectiveSeverity === 'moderate'
+          ? 'High-Risk / Edge-AI Diagnostic Screening'
+          : 'Routine NCD Community Check',
+      programCode: effectiveSeverity === 'routine' ? 'NPCDCS-02' : 'NHM-EMG-08',
+      patientRef: `${patientId} · ${params.patientName}`,
+      amountInr: rewardAmount,
+      timestamp: formattedTime,
+      abdmVerified: true,
+    };
+    setIncentives((prev) => [newIncentive, ...prev]);
+
     return newRecord;
   };
 
   const handleSyncOfflineQueue = (): number => {
-    let syncedCount = 0;
+    let synced = 0;
     setRecords((prev) =>
-      prev.map((rec) => {
-        if (rec.syncStatus === 'Queued Offline') {
-          syncedCount += 1;
-          return {...rec, syncStatus: 'Synced'};
+      prev.map((r) => {
+        if (r.syncStatus === 'Queued Offline') {
+          synced += 1;
+          return {...r, syncStatus: 'Synced'};
         }
-        return rec;
+        return r;
       })
     );
-    if (syncedCount > 0) {
-      setIsOfflineMode(false);
-    }
-    return syncedCount;
+    return synced;
   };
 
   const handleDispatchAmbulance = (recordId: string) => {
@@ -127,7 +193,7 @@ export default function App() {
         if (rec.id !== recordId) return rec;
         const village = VILLAGE_SUB_CENTERS.find((v) => v.code === rec.villageCode);
         const eta = village ? Math.max(8, Math.round(village.phcDistanceKm * 1.15)) : 14;
-        const unitNum = String(((idx + 3) % 9) + 1).padStart(2, '0');
+        const unitNum = String(((idx + 2) % 9) + 1).padStart(2, '0');
         return {
           ...rec,
           dispatchStatus: 'Dispatched',
@@ -138,88 +204,49 @@ export default function App() {
     );
   };
 
-  const unassignedEmergencies = records.filter(
-    (r) => r.severity === 'emergency' && r.dispatchStatus === 'Unassigned'
-  ).length;
-  const queuedOfflineCount = records.filter((r) => r.syncStatus === 'Queued Offline').length;
-  const t = TRANSLATIONS[language];
+  if (route === 'login') {
+    return (
+      <LoginPage
+        language={language}
+        onLanguageChange={setLanguage}
+        onLoginAsha={(id) => {
+          setAshaId(id);
+          setRoute('asha');
+        }}
+        onLoginDmo={(email) => {
+          setDmoEmail(email);
+          setRoute('command');
+        }}
+      />
+    );
+  }
+
+  if (route === 'asha') {
+    return (
+      <AshaWorkerPWA
+        ashaId={ashaId}
+        records={records}
+        incentives={incentives}
+        language={language}
+        onLanguageChange={setLanguage}
+        networkState={networkState}
+        onCycleNetworkState={handleCycleNetworkState}
+        onSaveRecord={handleSaveRecord}
+        onSyncOfflineQueue={handleSyncOfflineQueue}
+        onSwitchToCommand={() => setRoute('command')}
+        onLogout={() => setRoute('login')}
+      />
+    );
+  }
 
   return (
-    <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900">
-      {/* Unified Role Switcher Bar */}
-      <div className="bg-slate-900 text-white border-b border-slate-800">
-        <div className="max-w-[1440px] mx-auto px-4 sm:px-6 py-2 flex items-center justify-between gap-4">
-          <span className="text-sm font-bold tracking-tight text-white whitespace-nowrap shrink-0">
-            SwasthyaSetu
-          </span>
-
-          <div
-            role="tablist"
-            aria-label="Application View Switcher"
-            className="flex items-center gap-1 p-1 rounded-xl bg-slate-800"
-          >
-            <button
-              type="button"
-              role="tab"
-              aria-selected={activePortal === 'asha'}
-              onClick={() => setActivePortal('asha')}
-              className={`min-h-[38px] px-3.5 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-2 transition-colors cursor-pointer whitespace-nowrap ${
-                activePortal === 'asha'
-                  ? 'bg-[#0F766E] text-white shadow-xs'
-                  : 'text-slate-300 hover:text-white'
-              }`}
-            >
-              <Smartphone className="w-3.5 h-3.5 shrink-0" />
-              <span>{t.ashaPortalLabel}</span>
-              {queuedOfflineCount > 0 && (
-                <span className="font-mono tabular-nums opacity-90">({queuedOfflineCount})</span>
-              )}
-            </button>
-
-            <button
-              type="button"
-              role="tab"
-              aria-selected={activePortal === 'command'}
-              onClick={() => setActivePortal('command')}
-              className={`min-h-[38px] px-3.5 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-2 transition-colors cursor-pointer whitespace-nowrap ${
-                activePortal === 'command'
-                  ? 'bg-[#0F766E] text-white shadow-xs'
-                  : 'text-slate-300 hover:text-white'
-              }`}
-            >
-              <LayoutDashboard className="w-3.5 h-3.5 shrink-0" />
-              <span>{t.commandPortalLabel}</span>
-              {unassignedEmergencies > 0 && (
-                <span className="px-1.5 py-0.2 rounded-full bg-red-600 text-white font-mono text-[11px] font-bold tabular-nums">
-                  {unassignedEmergencies}
-                </span>
-              )}
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* Active Workspace */}
-      <div className="flex-1">
-        {activePortal === 'asha' ? (
-          <AshaWorkerPWA
-            records={records}
-            language={language}
-            onLanguageChange={setLanguage}
-            isOfflineMode={isOfflineMode}
-            onToggleOfflineMode={() => setIsOfflineMode((prev) => !prev)}
-            onSaveRecord={handleSaveRecord}
-            onSyncOfflineQueue={handleSyncOfflineQueue}
-            onOpenCommandPortal={() => setActivePortal('command')}
-          />
-        ) : (
-          <DistrictCommandDashboard
-            records={records}
-            onDispatchAmbulance={handleDispatchAmbulance}
-            onSyncOfflineQueue={handleSyncOfflineQueue}
-          />
-        )}
-      </div>
-    </div>
+    <DistrictCommandDashboard
+      dmoEmail={dmoEmail}
+      records={records}
+      onDispatchAmbulance={handleDispatchAmbulance}
+      onSyncOfflineQueue={handleSyncOfflineQueue}
+      onSwitchToAsha={() => setRoute('asha')}
+      onLogout={() => setRoute('login')}
+    />
   );
 }
