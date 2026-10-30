@@ -1,7 +1,12 @@
 node_modules/
 build/
 dist/
+dev-dist/
 coverage/
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
 .DS_Store
 *.log
 .env*

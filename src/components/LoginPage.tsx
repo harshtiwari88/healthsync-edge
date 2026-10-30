@@ -1,260 +1,524 @@
-import React, {useState} from 'react';
+import React, {useEffect, useState} from 'react';
 import {
   AlertCircle,
   ArrowRight,
   Building2,
+  CheckCircle2,
   Eye,
   EyeOff,
+  HeartHandshake,
   Lock,
   ShieldCheck,
   Smartphone,
-  Stethoscope,
+  UserPlus,
 } from 'lucide-react';
+import {NetworkState, SUB_CENTER_DIRECTORY} from '../types/triage';
+import {saveOfflineLoginVerifier, verifyOfflineLogin} from '../utils/cryptoVault';
 import {sirenEngine} from '../utils/sirenAudio';
 
-interface LoginPageProps {
-  onLoginAsha: (ashaId: string) => void;
-  onLoginDmo: (dmoEmail: string) => void;
+export interface AuthenticatedSessionPayload {
+  token: string;
+  user: {
+    identifier: string;
+    role: 'ASHA' | 'DMO';
+    displayName: string;
+    villageCode: string;
+  };
+  vaultKey: CryptoKey;
+  salt: Uint8Array;
 }
 
-export const LoginPage: React.FC<LoginPageProps> = ({
-  onLoginAsha,
-  onLoginDmo,
-}) => {
-  const [activeTab, setActiveTab] = useState<'ASHA' | 'DMO'>('ASHA');
-  const [ashaId, setAshaId] = useState<string>('ASHA-8842-UP');
-  const [pin, setPin] = useState<string>('1234');
-  const [showPin, setShowPin] = useState<boolean>(false);
+interface LoginPageProps {
+  networkState: NetworkState;
+  onAuthenticated: (session: AuthenticatedSessionPayload) => void;
+}
 
-  const [dmoEmail, setDmoEmail] = useState<string>('dmo.varanasi@nhm.gov.in');
-  const [dmoPasscode, setDmoPasscode] = useState<string>('DMO-24');
+export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticated}) => {
+  const [authMode, setAuthMode] = useState<'LOGIN' | 'REGISTER'>('LOGIN');
+  const [activeRole, setActiveRole] = useState<'ASHA' | 'DMO'>('ASHA');
+
+  const [identifier, setIdentifier] = useState<string>('');
+  const [secret, setSecret] = useState<string>('');
+  const [displayName, setDisplayName] = useState<string>('');
+  const [villageCode, setVillageCode] = useState<string>('VIL-204');
+  const [dmoProvisioningCode, setDmoProvisioningCode] = useState<string>('');
+  const [showSecret, setShowSecret] = useState<boolean>(false);
+
+  const [submitting, setSubmitting] = useState<boolean>(false);
+  const [firstRunNotice, setFirstRunNotice] = useState<boolean>(false);
   const [authError, setAuthError] = useState<string | null>(null);
 
-  const handleAshaSubmit = (e: React.FormEvent) => {
+  useEffect(() => {
+    if (networkState === 'offline') return;
+    let cancelled = false;
+    fetch('/api/auth/status')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: {hasRegisteredUsers?: boolean} | null) => {
+        if (!cancelled && data && data.hasRegisteredUsers === false) {
+          setFirstRunNotice(true);
+          setAuthMode('REGISTER');
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [networkState]);
+
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError(null);
 
-    const trimmedId = ashaId.trim();
-    if (!trimmedId) {
-      setAuthError('Please enter a valid ASHA Worker ID.');
-      return;
-    }
-    if (pin !== '1234') {
-      setAuthError('Authentication failed: Invalid 4-Digit Security PIN (expected 1234).');
+    const cleanId = identifier.trim();
+    if (!cleanId) {
+      setAuthError(
+        activeRole === 'ASHA'
+          ? 'Please enter your Health Worker ID.'
+          : 'Please enter your official hospital email address.'
+      );
       return;
     }
 
+    const minSecretLen = activeRole === 'ASHA' ? 4 : 6;
+    if (secret.length < minSecretLen) {
+      setAuthError(
+        activeRole === 'ASHA'
+          ? 'Your PIN must be at least 4 characters long.'
+          : 'Your password must be at least 6 characters long.'
+      );
+      return;
+    }
+
+    if (authMode === 'REGISTER' && activeRole === 'DMO' && !dmoProvisioningCode.trim()) {
+      setAuthError(
+        'Medical Officer registration requires an official Hospital Authorization Code from District Health Administration.'
+      );
+      return;
+    }
+
+    setSubmitting(true);
     sirenEngine.unlock();
-    onLoginAsha(trimmedId);
-  };
 
-  const handleDmoSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    setAuthError(null);
+    try {
+      if (networkState === 'offline') {
+        if (authMode === 'REGISTER') {
+          throw new Error(
+            'Creating a new account requires an internet connection. Switch to Online above to register first.'
+          );
+        }
+        const offlineSession = await verifyOfflineLogin({
+          identifier: cleanId,
+          role: activeRole,
+          secret,
+        });
+        onAuthenticated({
+          token: 'OFFLINE_LOCAL_SESSION',
+          user: offlineSession.user,
+          vaultKey: offlineSession.vaultKey,
+          salt: offlineSession.salt,
+        });
+        return;
+      }
 
-    const trimmedEmail = dmoEmail.trim();
-    if (!trimmedEmail || !trimmedEmail.includes('@')) {
-      setAuthError('Please enter a valid official District Health Officer email.');
-      return;
+      const endpoint = authMode === 'REGISTER' ? '/api/auth/register' : '/api/auth/login';
+      const resp = await fetch(endpoint, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          identifier: cleanId,
+          secret,
+          role: activeRole,
+          displayName: displayName.trim(),
+          villageCode: villageCode.trim() || 'VIL-204',
+          ...(authMode === 'REGISTER' && activeRole === 'DMO'
+            ? {dmoProvisioningCode: dmoProvisioningCode.trim()}
+            : {}),
+        }),
+      });
+
+      const data = (await resp.json()) as {
+        error?: string;
+        token?: string;
+        user?: {
+          identifier: string;
+          role: 'ASHA' | 'DMO';
+          displayName: string;
+          villageCode: string;
+        };
+      };
+
+      if (!resp.ok || !data.token || !data.user) {
+        throw new Error(data.error || 'Could not sign in. Please check your ID and password.');
+      }
+
+      const {vaultKey, salt} = await saveOfflineLoginVerifier({
+        identifier: data.user.identifier,
+        role: data.user.role,
+        displayName: data.user.displayName,
+        villageCode: data.user.villageCode,
+        secret,
+      });
+
+      onAuthenticated({
+        token: data.token,
+        user: data.user,
+        vaultKey,
+        salt,
+      });
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : 'Unable to sign in right now.');
+    } finally {
+      setSubmitting(false);
     }
-    if (!dmoPasscode.trim()) {
-      setAuthError('Please enter your District Command authorization code.');
-      return;
-    }
-
-    sirenEngine.unlock();
-    onLoginDmo(trimmedEmail);
   };
 
   return (
-    <div className="flex flex-1 items-center justify-center px-4 py-8">
-      {/* Fixed-size rock-solid centered card */}
-      <div className="max-w-md w-full mx-auto my-auto p-6 bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl">
-        {/* Branding Header */}
-        <div className="text-center space-y-2">
-          <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-teal-600 text-white">
-            <Stethoscope className="h-6 w-6" />
+    <div className="mx-auto flex w-full max-w-6xl flex-1 items-center px-4 py-8 sm:px-6 lg:py-12">
+      <div className="grid w-full grid-cols-1 gap-8 lg:grid-cols-12 lg:gap-12 items-start">
+        {/* Left Column: Calm, Welcoming Overview */}
+        <div id="care-features" className="lg:col-span-6 lg:pt-4 space-y-6">
+          <div className="space-y-3">
+            <p className="text-sm font-semibold text-teal-700">
+              Community &amp; Hospital Care Coordination
+            </p>
+            <h1
+              className="text-2xl font-bold tracking-tight text-slate-900 sm:text-4xl leading-tight"
+              style={{textWrap: 'balance'}}
+            >
+              Simple, reliable health checkups for rural communities and district hospitals.
+            </h1>
+            <p className="text-base leading-relaxed text-slate-600 max-w-xl">
+              Record vital signs in plain language, get clear guidance on when a patient needs a
+              doctor, and keep records safe even when mobile internet is unavailable.
+            </p>
           </div>
-          <h1 className="text-2xl font-bold tracking-tight text-slate-100">
-            HealthSync Edge
-          </h1>
-          <p className="text-sm text-slate-400">
-            Voice-First, Offline-First Rural Tele-Triage Platform
-          </p>
-          <p className="pt-0.5 text-xs font-medium text-teal-400">
-            <ShieldCheck className="mr-1 inline h-3.5 w-3.5 align-text-bottom text-emerald-400" />
-            Ayushman Bharat Digital Mission (ABDM) Compliant
-          </p>
+
+          <div className="space-y-4 border-t border-slate-200 pt-6">
+            <div className="flex items-start gap-3">
+              <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-teal-50 text-teal-700">
+                <HeartHandshake className="h-5 w-5" />
+              </div>
+              <div>
+                <h2 className="text-sm font-semibold text-slate-900">
+                  Clear Health Guidance in Everyday Language
+                </h2>
+                <p className="mt-0.5 text-sm text-slate-600">
+                  Blood pressure, oxygen, and temperature readings are explained simply so workers
+                  and families know what steps to take next.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-start gap-3">
+              <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-teal-50 text-teal-700">
+                <CheckCircle2 className="h-5 w-5" />
+              </div>
+              <div>
+                <h2 className="text-sm font-semibold text-slate-900">
+                  Works Smoothly Without Internet
+                </h2>
+                <p className="mt-0.5 text-sm text-slate-600">
+                  Save patient visits during village rounds offline, sync automatically later, or
+                  send a compact urgent text message (SMS) over basic mobile signal.
+                </p>
+              </div>
+            </div>
+
+            <div id="privacy-notice" className="flex items-start gap-3">
+              <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-teal-50 text-teal-700">
+                <ShieldCheck className="h-5 w-5" />
+              </div>
+              <div>
+                <h2 className="text-sm font-semibold text-slate-900">
+                  Private &amp; Encrypted Patient Information
+                </h2>
+                <p className="mt-0.5 text-sm text-slate-600">
+                  Patient records are encrypted per worker on shared devices and in the hospital
+                  database, and health IDs remain masked on screen until needed.
+                </p>
+              </div>
+            </div>
+          </div>
         </div>
 
-        {/* Clean Role Tab Switcher */}
-        <div
-          role="tablist"
-          aria-label="Select Role to Authenticate"
-          className="mt-6 grid grid-cols-2 gap-1.5 rounded-xl border border-slate-800 bg-slate-950 p-1"
-        >
-          <button
-            type="button"
-            role="tab"
-            aria-selected={activeTab === 'ASHA'}
-            onClick={() => {
-              setActiveTab('ASHA');
-              setAuthError(null);
-            }}
-            className={`min-h-[44px] rounded-lg px-3 text-xs font-semibold inline-flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-              activeTab === 'ASHA'
-                ? 'bg-teal-600 text-white'
-                : 'text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <Smartphone className="h-3.5 w-3.5 shrink-0" />
-            <span>ASHA Worker</span>
-          </button>
-
-          <button
-            type="button"
-            role="tab"
-            aria-selected={activeTab === 'DMO'}
-            onClick={() => {
-              setActiveTab('DMO');
-              setAuthError(null);
-            }}
-            className={`min-h-[44px] rounded-lg px-3 text-xs font-semibold inline-flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-              activeTab === 'DMO'
-                ? 'bg-teal-600 text-white'
-                : 'text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <Building2 className="h-3.5 w-3.5 shrink-0" />
-            <span>District Officer (DMO)</span>
-          </button>
-        </div>
-
-        {authError && (
-          <div
-            role="alert"
-            className="mt-4 flex items-start gap-2 rounded-xl border border-red-500/40 bg-red-950/60 p-3 text-xs font-medium text-red-200"
-          >
-            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-400" />
-            <span>{authError}</span>
-          </div>
-        )}
-
-        {/* ASHA Worker Login Form */}
-        {activeTab === 'ASHA' ? (
-          <form onSubmit={handleAshaSubmit} className="mt-5 space-y-4">
-            <div>
-              <label
-                htmlFor="asha-id-input"
-                className="mb-1.5 block text-xs font-semibold text-slate-300"
-              >
-                ASHA Worker ID / Mobile
-              </label>
-              <input
-                id="asha-id-input"
-                type="text"
-                value={ashaId}
-                onChange={(e) => setAshaId(e.target.value)}
-                required
-                className="min-h-[46px] w-full rounded-xl border border-slate-700 bg-slate-950 px-3.5 font-mono text-sm font-semibold text-slate-100 focus:border-teal-500 focus:outline-none"
-              />
-              <p className="mt-1 text-xs text-slate-500">
-                Field Unit: Sunita Devi · Rampur Sub-Center (VIL-204)
+        {/* Right Column: Clean, Accessible Sign In / Create Account Card */}
+        <div id="sign-in-card" className="lg:col-span-6 w-full max-w-md mx-auto lg:max-w-none">
+          <div className="rounded-2xl border border-slate-200 bg-white p-6 sm:p-8 shadow-xs">
+            <div className="space-y-1">
+              <h2 className="text-xl font-bold text-slate-900">
+                {authMode === 'REGISTER' ? 'Create Your Account' : 'Sign In to SwasthyaSetu'}
+              </h2>
+              <p className="text-sm text-slate-600">
+                Choose your role below to open your care workspace.
               </p>
             </div>
 
-            <div>
-              <div className="mb-1.5 flex items-center justify-between">
-                <label
-                  htmlFor="asha-pin-input"
-                  className="text-xs font-semibold text-slate-300"
-                >
-                  4-Digit Security PIN
-                </label>
-                <span className="font-mono text-[11px] text-slate-400">PIN: 1234</span>
+            {/* Sign In vs Create Account Tabs */}
+            <div className="mt-5 grid grid-cols-2 gap-1 rounded-xl bg-slate-100 p-1">
+              <button
+                type="button"
+                onClick={() => {
+                  setAuthMode('LOGIN');
+                  setAuthError(null);
+                }}
+                className={`min-h-[42px] rounded-lg px-3 text-sm font-medium transition-colors whitespace-nowrap cursor-pointer ${
+                  authMode === 'LOGIN'
+                    ? 'bg-white text-slate-900 font-semibold shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                Sign In
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setAuthMode('REGISTER');
+                  setAuthError(null);
+                }}
+                className={`min-h-[42px] rounded-lg px-3 text-sm font-medium transition-colors whitespace-nowrap cursor-pointer ${
+                  authMode === 'REGISTER'
+                    ? 'bg-white text-slate-900 font-semibold shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                Create Account
+              </button>
+            </div>
+
+            {firstRunNotice && authMode === 'REGISTER' && (
+              <div
+                role="status"
+                className="mt-4 flex items-start gap-2.5 rounded-xl border border-teal-200 bg-teal-50/70 p-3.5 text-xs leading-relaxed text-teal-900"
+              >
+                <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-teal-700" />
+                <span>
+                  Welcome! Health Workers can create their account directly below. Medical Officer
+                  accounts require District Hospital Admin authorization.
+                </span>
               </div>
-              <div className="relative">
-                <input
-                  id="asha-pin-input"
-                  type={showPin ? 'text' : 'password'}
-                  inputMode="numeric"
-                  maxLength={4}
-                  value={pin}
-                  onChange={(e) => setPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
-                  required
-                  placeholder="••••"
-                  className="min-h-[46px] w-full rounded-xl border border-slate-700 bg-slate-950 pl-3.5 pr-12 font-mono text-base font-bold tracking-widest text-slate-100 tabular-nums focus:border-teal-500 focus:outline-none"
-                />
+            )}
+
+            {/* Role Selection */}
+            <div className="mt-5">
+              <span className="mb-2 block text-xs font-semibold text-slate-700">Your Role</span>
+              <div
+                role="tablist"
+                aria-label="Select Role"
+                className="grid grid-cols-1 gap-2 sm:grid-cols-2"
+              >
                 <button
                   type="button"
-                  onClick={() => setShowPin((prev) => !prev)}
-                  aria-label={showPin ? 'Hide PIN' : 'Show PIN'}
-                  className="absolute right-1.5 top-1/2 -translate-y-1/2 flex min-h-[38px] min-w-[38px] items-center justify-center rounded-lg text-slate-400 hover:text-slate-200 cursor-pointer"
+                  role="tab"
+                  aria-selected={activeRole === 'ASHA'}
+                  onClick={() => {
+                    setActiveRole('ASHA');
+                    setIdentifier('');
+                    setSecret('');
+                    setDmoProvisioningCode('');
+                    setAuthError(null);
+                  }}
+                  className={`flex min-h-[48px] items-center gap-2.5 rounded-xl border px-3.5 py-2.5 text-left text-sm transition-colors cursor-pointer ${
+                    activeRole === 'ASHA'
+                      ? 'border-teal-700 bg-teal-50/70 font-semibold text-teal-950'
+                      : 'border-slate-200 bg-white font-medium text-slate-700 hover:bg-slate-50'
+                  }`}
                 >
-                  {showPin ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                  <Smartphone
+                    className={`h-4 w-4 shrink-0 ${
+                      activeRole === 'ASHA' ? 'text-teal-700' : 'text-slate-500'
+                    }`}
+                  />
+                  <span className="truncate">Health Worker (ASHA)</span>
+                </button>
+
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={activeRole === 'DMO'}
+                  onClick={() => {
+                    setActiveRole('DMO');
+                    setIdentifier('');
+                    setSecret('');
+                    setDmoProvisioningCode('');
+                    setAuthError(null);
+                  }}
+                  className={`flex min-h-[48px] items-center gap-2.5 rounded-xl border px-3.5 py-2.5 text-left text-sm transition-colors cursor-pointer ${
+                    activeRole === 'DMO'
+                      ? 'border-teal-700 bg-teal-50/70 font-semibold text-teal-950'
+                      : 'border-slate-200 bg-white font-medium text-slate-700 hover:bg-slate-50'
+                  }`}
+                >
+                  <Building2
+                    className={`h-4 w-4 shrink-0 ${
+                      activeRole === 'DMO' ? 'text-teal-700' : 'text-slate-500'
+                    }`}
+                  />
+                  <span className="truncate">Medical Officer (DMO)</span>
                 </button>
               </div>
             </div>
 
-            <button
-              type="submit"
-              className="flex min-h-[48px] w-full items-center justify-center gap-2 rounded-xl bg-teal-600 px-4 py-2.5 text-sm font-bold text-white transition-colors hover:bg-teal-500 whitespace-nowrap cursor-pointer"
-            >
-              <Lock className="h-4 w-4" />
-              <span>Login to ASHA Field App</span>
-              <ArrowRight className="h-4 w-4" />
-            </button>
-          </form>
-        ) : (
-          /* District Officer (DMO) Login Form */
-          <form onSubmit={handleDmoSubmit} className="mt-5 space-y-4">
-            <div>
-              <label
-                htmlFor="dmo-email-input"
-                className="mb-1.5 block text-xs font-semibold text-slate-300"
+            {authError && (
+              <div
+                role="alert"
+                className="mt-4 flex items-start gap-2.5 rounded-xl border border-red-200 bg-red-50 p-3.5 text-sm text-red-800"
               >
-                Official Government Email / ID
-              </label>
-              <input
-                id="dmo-email-input"
-                type="email"
-                value={dmoEmail}
-                onChange={(e) => setDmoEmail(e.target.value)}
-                required
-                className="min-h-[46px] w-full rounded-xl border border-slate-700 bg-slate-950 px-3.5 text-sm font-semibold text-slate-100 focus:border-teal-500 focus:outline-none"
-              />
-            </div>
-
-            <div>
-              <div className="mb-1.5 flex items-center justify-between">
-                <label
-                  htmlFor="dmo-code-input"
-                  className="text-xs font-semibold text-slate-300"
-                >
-                  Command Access Code
-                </label>
-                <span className="font-mono text-[11px] text-slate-400">Default: DMO-24</span>
+                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-600" />
+                <span>{authError}</span>
               </div>
-              <input
-                id="dmo-code-input"
-                type="password"
-                value={dmoPasscode}
-                onChange={(e) => setDmoPasscode(e.target.value)}
-                required
-                className="min-h-[46px] w-full rounded-xl border border-slate-700 bg-slate-950 px-3.5 font-mono text-sm font-semibold text-slate-100 focus:border-teal-500 focus:outline-none"
-              />
-            </div>
+            )}
 
-            <button
-              type="submit"
-              className="flex min-h-[48px] w-full items-center justify-center gap-2 rounded-xl bg-teal-600 px-4 py-2.5 text-sm font-bold text-white transition-colors hover:bg-teal-500 whitespace-nowrap cursor-pointer"
-            >
-              <Lock className="h-4 w-4" />
-              <span>Access District Command Dashboard</span>
-              <ArrowRight className="h-4 w-4" />
-            </button>
-          </form>
-        )}
+            <form onSubmit={handleSubmit} className="mt-5 space-y-4" autoComplete="off">
+              <div>
+                <label
+                  htmlFor="auth-identifier-input"
+                  className="mb-1.5 block text-sm font-medium text-slate-800"
+                >
+                  {activeRole === 'ASHA' ? 'Health Worker ID' : 'Official Hospital Email'}
+                </label>
+                <input
+                  id="auth-identifier-input"
+                  type={activeRole === 'DMO' ? 'email' : 'text'}
+                  value={identifier}
+                  onChange={(e) => setIdentifier(e.target.value)}
+                  placeholder={
+                    activeRole === 'ASHA' ? 'e.g. ASHA-8842-UP' : 'e.g. doctor@district24.gov.in'
+                  }
+                  required
+                  className="min-h-[48px] w-full rounded-xl border border-slate-300 bg-white px-3.5 text-base text-slate-900 placeholder:text-slate-400 focus:border-teal-700 focus:outline-none"
+                />
+              </div>
+
+              {authMode === 'REGISTER' && (
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                  <div>
+                    <label
+                      htmlFor="auth-name-input"
+                      className="mb-1.5 block text-sm font-medium text-slate-800"
+                    >
+                      Your Full Name
+                    </label>
+                    <input
+                      id="auth-name-input"
+                      type="text"
+                      value={displayName}
+                      onChange={(e) => setDisplayName(e.target.value)}
+                      placeholder={activeRole === 'ASHA' ? 'e.g. Sunita Devi' : 'e.g. Dr. R. Verma'}
+                      required
+                      className="min-h-[48px] w-full rounded-xl border border-slate-300 bg-white px-3.5 text-base text-slate-900 placeholder:text-slate-400 focus:border-teal-700 focus:outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label
+                      htmlFor="auth-village-input"
+                      className="mb-1.5 block text-sm font-medium text-slate-800"
+                    >
+                      Assigned Clinic
+                    </label>
+                    <select
+                      id="auth-village-input"
+                      value={villageCode}
+                      onChange={(e) => setVillageCode(e.target.value)}
+                      className="min-h-[48px] w-full rounded-xl border border-slate-300 bg-white px-3 text-base text-slate-900 focus:border-teal-700 focus:outline-none"
+                    >
+                      {SUB_CENTER_DIRECTORY.map((center) => (
+                        <option key={center.code} value={center.code}>
+                          {center.name.replace(' Health Sub-Center', '')} ({center.code})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              )}
+
+              {authMode === 'REGISTER' && activeRole === 'DMO' && (
+                <div>
+                  <label
+                    htmlFor="auth-dmo-code-input"
+                    className="mb-1.5 block text-sm font-medium text-slate-800"
+                  >
+                    Hospital Authorization Code
+                  </label>
+                  <input
+                    id="auth-dmo-code-input"
+                    type="password"
+                    value={dmoProvisioningCode}
+                    onChange={(e) => setDmoProvisioningCode(e.target.value)}
+                    placeholder="Issued by District Health Administration"
+                    required
+                    className="min-h-[48px] w-full rounded-xl border border-slate-300 bg-white px-3.5 text-base text-slate-900 placeholder:text-slate-400 focus:border-teal-700 focus:outline-none"
+                  />
+                  <p className="mt-1 text-xs text-slate-500">
+                    Required to verify official Medical Officer privileges before account creation.
+                  </p>
+                </div>
+              )}
+
+              <div>
+                <label
+                  htmlFor="auth-secret-input"
+                  className="mb-1.5 block text-sm font-medium text-slate-800"
+                >
+                  {activeRole === 'ASHA' ? '4-Digit Security PIN' : 'Account Password'}
+                </label>
+                <div className="relative">
+                  <input
+                    id="auth-secret-input"
+                    type={showSecret ? 'text' : 'password'}
+                    value={secret}
+                    onChange={(e) => setSecret(e.target.value)}
+                    placeholder={
+                      activeRole === 'ASHA'
+                        ? 'At least 4 digits or characters'
+                        : 'At least 6 characters'
+                    }
+                    required
+                    className="min-h-[48px] w-full rounded-xl border border-slate-300 bg-white pl-3.5 pr-12 text-base text-slate-900 placeholder:text-slate-400 focus:border-teal-700 focus:outline-none"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowSecret((prev) => !prev)}
+                    aria-label={showSecret ? 'Hide password' : 'Show password'}
+                    className="absolute right-1.5 top-1/2 -translate-y-1/2 flex min-h-[40px] min-w-[40px] items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 hover:text-slate-800 cursor-pointer"
+                  >
+                    {showSecret ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                  </button>
+                </div>
+              </div>
+
+              <button
+                type="submit"
+                disabled={submitting}
+                className="flex min-h-[48px] w-full items-center justify-center gap-2 rounded-xl bg-teal-700 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-teal-800 disabled:opacity-60 whitespace-nowrap cursor-pointer"
+              >
+                {authMode === 'REGISTER' ? (
+                  <>
+                    <UserPlus className="h-4 w-4 shrink-0" />
+                    <span>
+                      {submitting
+                        ? 'Creating Account...'
+                        : activeRole === 'ASHA'
+                        ? 'Create Health Worker Account'
+                        : 'Authorize & Create Officer Account'}
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <Lock className="h-4 w-4 shrink-0" />
+                    <span>
+                      {submitting
+                        ? 'Signing In...'
+                        : activeRole === 'ASHA'
+                        ? 'Sign In as Health Worker'
+                        : 'Sign In as Medical Officer'}
+                    </span>
+                    <ArrowRight className="h-4 w-4 shrink-0" />
+                  </>
+                )}
+              </button>
+            </form>
+          </div>
+        </div>
       </div>
     </div>
   );

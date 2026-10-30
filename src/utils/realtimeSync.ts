@@ -1,9 +1,60 @@
-import {TriageRecord} from '../types/triage';
+import {IncentiveEntry, TriageRecord} from '../types/triage';
+import {
+  decryptVaultData,
+  EncryptedVaultEnvelope,
+  encryptVaultData,
+  isEncryptedVaultEnvelope,
+} from './cryptoVault';
 
-export const HEALTHSYNC_STORAGE_KEY = 'healthsync_edge_v5_records';
+export const LEGACY_SINGLETON_VAULT_KEY = 'healthsync_aes_gcm_vault_v1';
+export const SCOPED_VAULT_KEY_PREFIX = 'healthsync_aes_gcm_vault_v2_';
+const LEGACY_PLAINTEXT_KEYS = [
+  'healthsync_records',
+  'healthsync_edge_v4_records',
+  'healthsync_edge_v5_records',
+];
 const BROADCAST_CHANNEL_NAME = 'healthsync_edge_realtime_bus';
-const IDB_NAME = 'healthsync_edge_idb';
-const IDB_STORE = 'triage_records';
+const IDB_NAME = 'healthsync_encrypted_idb_v1';
+const IDB_STORE = 'encrypted_vault_envelopes';
+
+/**
+ * Produces an injective, collision-free per-account vault scope identifier from (role, identifier).
+ * Prevents shared-device data destruction when multiple ASHA workers or DMOs share a tablet/phone.
+ */
+export function buildUserVaultScope(role: 'ASHA' | 'DMO', identifier: string): string {
+  const normalized = `${role}:${identifier.trim().toUpperCase()}`;
+  const bytes = new TextEncoder().encode(normalized);
+  let hex = '';
+  for (let i = 0; i < bytes.length; i++) {
+    hex += bytes[i].toString(16).padStart(2, '0');
+  }
+  return `${role}_${hex}`;
+}
+
+export function getScopedVaultStorageKey(userScope: string): string {
+  if (!userScope || !userScope.trim()) {
+    throw new Error('User vault scope is required to access encrypted local storage.');
+  }
+  return `${SCOPED_VAULT_KEY_PREFIX}${userScope.trim()}`;
+}
+
+export function getScopedVaultIdbSlot(userScope: string): string {
+  if (!userScope || !userScope.trim()) {
+    throw new Error('User vault scope is required to access encrypted IndexedDB slot.');
+  }
+  return `vault_v2_${userScope.trim()}`;
+}
+
+function getLocalStorage(): Storage | null {
+  try {
+    if (typeof globalThis !== 'undefined' && 'localStorage' in globalThis && globalThis.localStorage) {
+      return globalThis.localStorage;
+    }
+  } catch {
+    // Ignore storage access errors
+  }
+  return null;
+}
 
 export type RealtimeEventMessage =
   | {
@@ -21,90 +72,245 @@ export type RealtimeEventMessage =
       connectedPeers: number;
     }
   | {
+      type: 'sync:ack';
+      recordId: string;
+      record: TriageRecord;
+    }
+  | {
+      type: 'sync:error';
+      recordId: string | null;
+      error: string;
+      retryable: boolean;
+    }
+  | {
+      type: 'auth:error';
+      error: string;
+    }
+  | {
       type: 'presence:count';
       connectedPeers: number;
     };
 
 /**
- * Real Browser IndexedDB Mirror for Offline Persistence alongside LocalStorage
+ * Purges any legacy unencrypted localStorage keys & legacy IndexedDB databases
+ * so zero plaintext PHI ever lingers in browser storage.
  */
-function saveRecordsToIndexedDB(records: TriageRecord[]): void {
-  if (typeof window === 'undefined' || !('indexedDB' in window)) return;
-  try {
-    const request = window.indexedDB.open(IDB_NAME, 1);
-    request.onupgradeneeded = () => {
-      const db = request.result;
-      if (!db.objectStoreNames.contains(IDB_STORE)) {
-        db.createObjectStore(IDB_STORE, {keyPath: 'id'});
+export function purgeLegacyPlaintextStorage(): void {
+  const storage = getLocalStorage();
+  if (storage) {
+    try {
+      for (const key of LEGACY_PLAINTEXT_KEYS) {
+        storage.removeItem(key);
       }
-    };
-    request.onsuccess = () => {
-      const db = request.result;
-      const tx = db.transaction(IDB_STORE, 'readwrite');
-      const store = tx.objectStore(IDB_STORE);
-      records.forEach((rec) => {
-        store.put(rec);
-      });
-      tx.oncomplete = () => db.close();
-    };
+    } catch {
+      // Ignore storage errors
+    }
+  }
+  try {
+    if (typeof window !== 'undefined' && 'indexedDB' in window) {
+      window.indexedDB.deleteDatabase('healthsync_edge_idb');
+      window.indexedDB.deleteDatabase('healthsync_os_v32');
+    }
   } catch {
-    // Ignore IndexedDB sandbox restrictions if any
+    // Ignore IndexedDB errors
   }
 }
 
-export function loadStoredRecords(fallback: TriageRecord[]): TriageRecord[] {
-  if (typeof window === 'undefined') return fallback;
-  try {
-    const raw = window.localStorage.getItem(HEALTHSYNC_STORAGE_KEY);
-    if (!raw) {
-      window.localStorage.setItem(HEALTHSYNC_STORAGE_KEY, JSON.stringify(fallback));
-      saveRecordsToIndexedDB(fallback);
-      return fallback;
-    }
-    const parsed = JSON.parse(raw) as TriageRecord[];
-    if (Array.isArray(parsed) && parsed.length > 0 && parsed[0]?.vitals?.systolic !== undefined) {
-      return parsed;
-    }
-    window.localStorage.setItem(HEALTHSYNC_STORAGE_KEY, JSON.stringify(fallback));
-    saveRecordsToIndexedDB(fallback);
-    return fallback;
-  } catch {
-    return fallback;
-  }
+// REQUIRED FIX: Global queue to prevent IDB transaction race conditions
+let idbWriteQueue: Promise<void> = Promise.resolve();
+
+function saveEncryptedEnvelopeToIndexedDB(userScope: string, envelope: EncryptedVaultEnvelope): void {
+  if (typeof window === 'undefined' || !('indexedDB' in window) || !userScope) return;
+
+  idbWriteQueue = idbWriteQueue.then(
+    () =>
+      new Promise<void>((resolve) => {
+        try {
+          const slotKey = getScopedVaultIdbSlot(userScope);
+          const request = window.indexedDB.open(IDB_NAME, 1);
+          request.onupgradeneeded = () => {
+            const db = request.result;
+            if (!db.objectStoreNames.contains(IDB_STORE)) {
+              db.createObjectStore(IDB_STORE, {keyPath: 'slot'});
+            }
+          };
+          request.onsuccess = () => {
+            try {
+              const db = request.result;
+              const tx = db.transaction(IDB_STORE, 'readwrite');
+              tx.objectStore(IDB_STORE).put({slot: slotKey, ...envelope});
+              tx.oncomplete = () => {
+                db.close();
+                resolve();
+              };
+              tx.onerror = () => {
+                db.close();
+                resolve();
+              };
+            } catch {
+              resolve();
+            }
+          };
+          request.onerror = () => resolve();
+        } catch {
+          resolve(); // Do not block queue on sandbox restriction
+        }
+      })
+  );
 }
 
-export function persistStoredRecords(records: TriageRecord[]) {
-  if (typeof window === 'undefined') return;
-  try {
-    window.localStorage.setItem(HEALTHSYNC_STORAGE_KEY, JSON.stringify(records));
-  } catch {
-    // Ignore quota errors
+function loadEncryptedEnvelopeFromIndexedDB(userScope: string): Promise<EncryptedVaultEnvelope | null> {
+  if (typeof window === 'undefined' || !('indexedDB' in window) || !userScope) {
+    return Promise.resolve(null);
   }
-  saveRecordsToIndexedDB(records);
+  return new Promise((resolve) => {
+    try {
+      const slotKey = getScopedVaultIdbSlot(userScope);
+      const request = window.indexedDB.open(IDB_NAME, 1);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(IDB_STORE)) {
+          db.createObjectStore(IDB_STORE, {keyPath: 'slot'});
+        }
+      };
+      request.onsuccess = () => {
+        try {
+          const db = request.result;
+          const tx = db.transaction(IDB_STORE, 'readonly');
+          const getReq = tx.objectStore(IDB_STORE).get(slotKey);
+          getReq.onsuccess = () => {
+            const val = getReq.result;
+            db.close();
+            resolve(isEncryptedVaultEnvelope(val) ? val : null);
+          };
+          getReq.onerror = () => {
+            db.close();
+            resolve(null);
+          };
+        } catch {
+          resolve(null);
+        }
+      };
+      request.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
 }
 
 /**
- * Multi-Device & Multi-Tab Real-Time Transport
- * Combines:
- * 1. Full-duplex Server WebSocket (/ws/triage) for real cross-device sync
- * 2. Browser BroadcastChannel for instant zero-latency local multi-tab sync
- * 3. window 'storage' event listener on localStorage + IndexedDB persistence
+ * Encrypts records with Web Crypto AES-256-GCM BEFORE writing to the user's isolated
+ * localStorage key and IndexedDB slot. Never touches any other user's vault on a shared device.
+ */
+export async function persistEncryptedRecords(
+  vaultKey: CryptoKey | null,
+  salt: Uint8Array | null,
+  records: TriageRecord[],
+  userScope: string
+): Promise<void> {
+  const storage = getLocalStorage();
+  if (!vaultKey || !salt || !userScope || !userScope.trim()) return;
+  try {
+    const scopedKey = getScopedVaultStorageKey(userScope);
+    const envelope = await encryptVaultData(vaultKey, salt, records);
+    if (storage) {
+      storage.setItem(scopedKey, JSON.stringify(envelope));
+    }
+    saveEncryptedEnvelopeToIndexedDB(userScope, envelope);
+  } catch {
+    // Ignore quota or encryption errors
+  }
+}
+
+/**
+ * Reads and verifies the AES-256-GCM encrypted vault for a specific `userScope`.
+ * - Isolated per user so Worker B logging in on a shared tablet never reads or overwrites Worker A's vault.
+ * - Safely migrates a legacy v1 vault ONLY if `vaultKey` cryptographically authenticates it;
+ *   if decryption fails (belonging to a different user), legacy v1 is left untouched for its owner.
+ */
+export async function loadEncryptedRecords(
+  vaultKey: CryptoKey,
+  fallback: TriageRecord[],
+  userScope: string
+): Promise<TriageRecord[]> {
+  if (!userScope || !userScope.trim()) return fallback;
+  const storage = getLocalStorage();
+  const scopedKey = getScopedVaultStorageKey(userScope);
+
+  // 1. Check the user's isolated v2 localStorage vault
+  if (storage) {
+    try {
+      const raw = storage.getItem(scopedKey);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (isEncryptedVaultEnvelope(parsed)) {
+          const decrypted = await decryptVaultData<TriageRecord[]>(vaultKey, parsed);
+          return Array.isArray(decrypted) ? decrypted : fallback;
+        }
+      }
+    } catch {
+      return fallback;
+    }
+  }
+
+  // 2. Fallback to the user's isolated v2 IndexedDB vault slot
+  const idbEnvelope = await loadEncryptedEnvelopeFromIndexedDB(userScope);
+  if (idbEnvelope) {
+    try {
+      const decrypted = await decryptVaultData<TriageRecord[]>(vaultKey, idbEnvelope);
+      if (Array.isArray(decrypted)) {
+        if (storage) {
+          try {
+            storage.setItem(scopedKey, JSON.stringify(idbEnvelope));
+          } catch {
+            // Ignore quota errors
+          }
+        }
+        return decrypted;
+      }
+    } catch {
+      return fallback;
+    }
+  }
+
+  // 3. Non-destructive legacy singleton migration: ONLY migrate if THIS user's key decrypts it!
+  if (storage) {
+    try {
+      const legacyRaw = storage.getItem(LEGACY_SINGLETON_VAULT_KEY);
+      if (legacyRaw) {
+        const legacyParsed = JSON.parse(legacyRaw);
+        if (isEncryptedVaultEnvelope(legacyParsed)) {
+          const migrated = await decryptVaultData<TriageRecord[]>(vaultKey, legacyParsed);
+          if (Array.isArray(migrated)) {
+            storage.setItem(scopedKey, legacyRaw);
+            saveEncryptedEnvelopeToIndexedDB(userScope, legacyParsed);
+            storage.removeItem(LEGACY_SINGLETON_VAULT_KEY);
+            return migrated;
+          }
+        }
+      }
+    } catch {
+      // Legacy vault belongs to a different user on this shared device — leave it completely intact!
+    }
+  }
+
+  return fallback;
+}
+
+/**
+ * Authenticated Multi-Device & Multi-Tab Real-Time Transport
  */
 export class HealthSyncRealtimeClient {
   private ws: WebSocket | null = null;
   private bc: BroadcastChannel | null = null;
   private reconnectTimer: number | null = null;
   private destroyed = false;
+  private sessionToken: string;
   private onMessageCallback: (msg: RealtimeEventMessage) => void;
-  private onStorageSyncCallback: (records: TriageRecord[]) => void;
 
-  constructor(
-    onMessage: (msg: RealtimeEventMessage) => void,
-    onStorageSync: (records: TriageRecord[]) => void,
-    initialSeedRecords: TriageRecord[]
-  ) {
+  constructor(sessionToken: string, onMessage: (msg: RealtimeEventMessage) => void) {
+    this.sessionToken = sessionToken;
     this.onMessageCallback = onMessage;
-    this.onStorageSyncCallback = onStorageSync;
 
     if (typeof window !== 'undefined') {
       if ('BroadcastChannel' in window) {
@@ -116,37 +322,36 @@ export class HealthSyncRealtimeClient {
         };
       }
 
-      window.addEventListener('storage', this.handleStorageEvent);
-      this.connectWebSocket(initialSeedRecords);
+      if (this.sessionToken && this.sessionToken !== 'OFFLINE_LOCAL_SESSION') {
+        this.connectWebSocket();
+      }
     }
   }
 
-  private handleStorageEvent = (e: StorageEvent) => {
-    if (e.key === HEALTHSYNC_STORAGE_KEY && e.newValue) {
-      try {
-        const updated = JSON.parse(e.newValue) as TriageRecord[];
-        if (Array.isArray(updated)) {
-          this.onStorageSyncCallback(updated);
-        }
-      } catch {
-        // Ignore parse errors
-      }
+  private connectWebSocket() {
+    if (
+      this.destroyed ||
+      typeof window === 'undefined' ||
+      !this.sessionToken ||
+      this.sessionToken === 'OFFLINE_LOCAL_SESSION'
+    ) {
+      return;
     }
-  };
 
-  private connectWebSocket(seedRecords: TriageRecord[]) {
-    if (this.destroyed || typeof window === 'undefined') return;
     try {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      // SECURITY FIX: Never place session tokens in the WebSocket URL query string.
+      // Authenticate post-upgrade over an in-band WebSocket frame.
       const wsUrl = `${protocol}//${window.location.host}/ws/triage`;
       const socket = new WebSocket(wsUrl);
       this.ws = socket;
 
       socket.onopen = () => {
+        if (this.destroyed || socket.readyState !== WebSocket.OPEN) return;
         socket.send(
           JSON.stringify({
-            type: 'records:seed',
-            records: seedRecords,
+            type: 'auth',
+            token: this.sessionToken,
           })
         );
       };
@@ -155,24 +360,28 @@ export class HealthSyncRealtimeClient {
         try {
           const parsed = JSON.parse(String(event.data)) as RealtimeEventMessage;
           this.onMessageCallback(parsed);
-        } catch {
-          // Ignore invalid JSON
+        } catch (err) {
+          console.error('[HealthSync WS] Invalid JSON frame from server:', err);
         }
       };
 
-      socket.onclose = () => {
-        if (!this.destroyed) {
+      socket.onclose = (event) => {
+        if (!this.destroyed && event.code !== 4001) {
           this.reconnectTimer = window.setTimeout(() => {
-            this.connectWebSocket(seedRecords);
-          }, 2500);
+            this.connectWebSocket();
+          }, 3000);
         }
       };
-    } catch {
-      // Fallback gracefully to BroadcastChannel + storage events
+    } catch (err) {
+      console.error('[HealthSync WS] Failed to initialize WebSocket transport:', err);
     }
   }
 
-  public publishRecordCreated(record: TriageRecord, triggerEmergencySiren: boolean) {
+  public async publishRecordCreated(
+    record: TriageRecord,
+    triggerEmergencySiren: boolean,
+    incentive?: IncentiveEntry
+  ): Promise<{ok: boolean; record?: TriageRecord; error?: string; retryable?: boolean}> {
     const payload: RealtimeEventMessage = {
       type: 'record:created',
       record,
@@ -182,32 +391,99 @@ export class HealthSyncRealtimeClient {
     try {
       this.bc?.postMessage(payload);
     } catch {
-      // Ignore
+      // Ignore BroadcastChannel cloning issues
     }
 
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(payload));
-    } else if (typeof fetch === 'function') {
-      fetch('/api/records', {
+    if (!this.sessionToken || this.sessionToken === 'OFFLINE_LOCAL_SESSION') {
+      const offlineMsg = 'Offline local session: record queued locally until server sign-in.';
+      this.onMessageCallback({
+        type: 'sync:error',
+        recordId: record.id,
+        error: offlineMsg,
+        retryable: true,
+      });
+      return {ok: false, error: offlineMsg, retryable: true};
+    }
+
+    try {
+      const resp = await fetch('/api/records', {
         method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({record, triggerEmergencySiren}),
-      }).catch(() => {});
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${this.sessionToken}`,
+        },
+        body: JSON.stringify({record, triggerEmergencySiren, incentive}),
+      });
+
+      const body = (await resp.json().catch(() => ({}))) as {
+        ok?: boolean;
+        record?: TriageRecord;
+        error?: string;
+      };
+
+      if (!resp.ok) {
+        const errMsg = body.error || `Server rejected triage sync (HTTP ${resp.status}).`;
+        const retryable = resp.status >= 500 || resp.status === 429;
+        console.error('[HealthSync Sync Error] Failed to persist record:', errMsg);
+        this.onMessageCallback({
+          type: 'sync:error',
+          recordId: record.id,
+          error: errMsg,
+          retryable,
+        });
+        return {ok: false, error: errMsg, retryable};
+      }
+
+      const savedRecord: TriageRecord = body.record ?? {
+        ...record,
+        syncStatus: record.channel === 'Emergency SMS' ? 'SMS Delivered' : 'Synced',
+      };
+      this.onMessageCallback({
+        type: 'sync:ack',
+        recordId: savedRecord.id,
+        record: savedRecord,
+      });
+      return {ok: true, record: savedRecord};
+    } catch (err) {
+      const errMsg =
+        err instanceof Error ? err.message : 'Network error while syncing triage record.';
+      console.error('[HealthSync Sync Error] Network/transport failure:', err);
+      this.onMessageCallback({
+        type: 'sync:error',
+        recordId: record.id,
+        error: errMsg,
+        retryable: true,
+      });
+      return {ok: false, error: errMsg, retryable: true};
     }
   }
 
-  public publishRecordUpdated(record: TriageRecord) {
-    const payload: RealtimeEventMessage = {
-      type: 'record:updated',
-      record,
-    };
-    try {
-      this.bc?.postMessage(payload);
-    } catch {
-      // Ignore
+  public async publishRecordDispatched(
+    recordId: string,
+    ambulanceUnit = '108-AMB-UP65',
+    etaMinutes = 11
+  ): Promise<TriageRecord | null> {
+    if (!this.sessionToken || this.sessionToken === 'OFFLINE_LOCAL_SESSION') {
+      return null;
     }
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(payload));
+    try {
+      const resp = await fetch(`/api/records/${encodeURIComponent(recordId)}/dispatch`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${this.sessionToken}`,
+        },
+        body: JSON.stringify({ambulanceUnit, etaMinutes}),
+      });
+      if (!resp.ok) return null;
+      const data = (await resp.json()) as {record?: TriageRecord};
+      if (data.record) {
+        this.bc?.postMessage({type: 'record:updated', record: data.record});
+        return data.record;
+      }
+      return null;
+    } catch {
+      return null;
     }
   }
 
@@ -215,9 +491,6 @@ export class HealthSyncRealtimeClient {
     this.destroyed = true;
     if (this.reconnectTimer !== null) {
       window.clearTimeout(this.reconnectTimer);
-    }
-    if (typeof window !== 'undefined') {
-      window.removeEventListener('storage', this.handleStorageEvent);
     }
     try {
       this.bc?.close();

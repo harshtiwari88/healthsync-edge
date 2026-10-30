@@ -21,15 +21,21 @@ export default defineConfig(() => {
         manifest: {
           id: '/',
           name: 'SwasthyaSetu — ASHA Field Triage & District 24 Command',
-          short_name: 'ASHA Triage',
+          short_name: 'SwasthyaSetu',
           description:
             'Offline-first rural tele-triage PWA for ASHA frontline health workers and District 24 Hospital Command Center.',
-          theme_color: '#0F766E',
+          theme_color: '#F8FAFC',
           background_color: '#F8FAFC',
           display: 'standalone',
           start_url: '/',
           scope: '/',
           icons: [
+            {
+              src: '/icon.svg',
+              sizes: 'any',
+              type: 'image/svg+xml',
+              purpose: 'any',
+            },
             {
               src: '/pwa-192x192.png',
               sizes: '192x192',
@@ -91,14 +97,11 @@ export default defineConfig(() => {
     ],
     resolve: {
       alias: {
-        '@': path.resolve(__dirname, '.'),
+        '@': path.resolve(import.meta.dirname, '.'),
       },
     },
     server: {
-      // HMR is disabled in AI Studio via DISABLE_HMR env var.
-      // Do not modify—file watching is disabled to prevent flickering during agent edits.
       hmr: process.env.DISABLE_HMR !== 'true',
-      // Disable file watching when DISABLE_HMR is true to save CPU during agent edits.
       watch: process.env.DISABLE_HMR === 'true' ? null : {},
     },
   };

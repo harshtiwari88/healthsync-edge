@@ -1,5 +1,5 @@
 import React, {useState} from 'react';
-import {Download, X, Smartphone} from 'lucide-react';
+import {Download, Smartphone, X} from 'lucide-react';
 import {usePWAInstall} from '../hooks/usePWAInstall';
 
 interface PWAInstallButtonProps {
@@ -27,60 +27,61 @@ export const PWAInstallButton: React.FC<PWAInstallButtonProps> = ({compact = fal
       <button
         type="button"
         onClick={handleClick}
-        className={`inline-flex items-center justify-center gap-1.5 rounded-lg border border-slate-700 bg-[#0D1322] font-mono font-semibold text-slate-200 hover:bg-slate-800 hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-          compact ? 'h-9 px-3 text-xs' : 'h-9 px-3.5 text-xs'
+        className={`inline-flex items-center justify-center gap-1.5 rounded-lg border border-slate-200 bg-white font-semibold text-slate-700 transition-colors hover:border-teal-600/40 hover:bg-slate-50 hover:text-slate-900 whitespace-nowrap shrink-0 cursor-pointer ${
+          compact ? 'min-h-[40px] px-3.5 text-xs' : 'min-h-[44px] px-4 text-sm'
         }`}
-        title="Install Offline Field OS PWA"
       >
-        <Download className="w-3.5 h-3.5 text-[#06B6D4] shrink-0" />
-        <span>{isIOS ? 'Install iOS' : compact ? 'Install OS' : 'Install Field OS'}</span>
+        <Download className="h-4 w-4 text-teal-700 shrink-0" />
+        <span>{isIOS ? 'Install on iPhone' : 'Install App'}</span>
       </button>
 
       {showGuide && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-xs p-4"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-xs"
           role="dialog"
           aria-modal="true"
           aria-labelledby="pwa-install-title"
         >
-          <div className="w-full max-w-sm rounded-xl bg-[#090D16] p-6 shadow-2xl border border-slate-800 text-slate-100">
+          <div className="w-full max-w-sm rounded-2xl border border-slate-200 bg-white p-6 text-slate-900 shadow-lg">
             <div className="flex items-start justify-between gap-3">
               <div className="flex items-center gap-2.5">
-                <div className="w-9 h-9 rounded-lg bg-[#06B6D4]/15 border border-[#06B6D4]/50 text-[#06B6D4] flex items-center justify-center shrink-0">
-                  <Smartphone className="w-4 h-4" />
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-teal-50 text-teal-700">
+                  <Smartphone className="h-5 w-5" />
                 </div>
-                <h3 id="pwa-install-title" className="text-sm font-semibold text-white">
-                  Install HealthSync OS Offline
+                <h3 id="pwa-install-title" className="text-base font-semibold text-slate-900">
+                  Use SwasthyaSetu Offline
                 </h3>
               </div>
               <button
                 type="button"
                 onClick={() => setShowGuide(false)}
-                className="min-h-[38px] min-w-[38px] flex items-center justify-center text-slate-400 hover:text-white rounded-lg cursor-pointer"
+                className="flex min-h-[40px] min-w-[40px] items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 hover:text-slate-900 cursor-pointer"
                 aria-label="Close install instructions"
               >
-                <X className="w-4 h-4" />
+                <X className="h-4 w-4" />
               </button>
             </div>
 
-            <div className="mt-4 space-y-2.5 text-xs text-slate-300 leading-relaxed">
+            <div className="mt-4 space-y-2.5 text-sm leading-relaxed text-slate-600">
               {isIOS ? (
                 <>
-                  <p>1. Tap the <strong>Share</strong> icon in Safari.</p>
                   <p>
-                    2. Select <strong>Add to Home Screen</strong> to cache HealthSync OS v3.2 for
-                    zero-network field deployments.
+                    1. Tap the <strong>Share</strong> icon in Safari.
+                  </p>
+                  <p>
+                    2. Choose <strong>Add to Home Screen</strong> so you can open SwasthyaSetu even
+                    without mobile internet.
                   </p>
                 </>
               ) : (
                 <>
                   <p>
-                    Service Worker precaching &amp; IndexedDB vaults are active for zero-network
-                    rural operations.
+                    SwasthyaSetu saves patient checkups privately on your phone or tablet when
+                    internet service is unavailable.
                   </p>
                   <p>
-                    Open in a standalone browser tab and click the address-bar{' '}
-                    <strong>Install App</strong> icon to mount locally.
+                    Open this page in a browser tab and select the <strong>Install</strong> icon in
+                    your address bar to add it to your home screen.
                   </p>
                 </>
               )}
@@ -89,9 +90,9 @@ export const PWAInstallButton: React.FC<PWAInstallButtonProps> = ({compact = fal
             <button
               type="button"
               onClick={() => setShowGuide(false)}
-              className="mt-5 w-full min-h-[44px] rounded-lg bg-[#06B6D4] hover:bg-cyan-400 text-[#090D16] font-mono text-xs font-bold transition-colors cursor-pointer"
+              className="mt-5 w-full min-h-[44px] rounded-xl bg-teal-700 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-teal-800 cursor-pointer"
             >
-              Acknowledge
+              Close
             </button>
           </div>
         </div>

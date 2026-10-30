@@ -210,9 +210,9 @@ export function evaluateTriage(
       scoreCode: 'TR3',
       triggers: [...redReasons, ...yellowReasons],
       protocolEn:
-        'CRITICAL RED ALERT: Position patient semi-upright, keep airway clear, transmit Encrypted Baseband SMS immediately, and prepare for 108 Ambulance.',
+        'Urgent care needed: Help the patient sit upright comfortably, keep their airway clear, alert the hospital doctor immediately, and arrange ambulance transport.',
       protocolHi:
-        'सावधान दीदी! यह गंभीर रेड इमरजेंसी है। मरीज़ को सहारा देकर बिठाएं, तुरंत एन्क्रिप्टेड इमरजेंसी एसएमएस भेजें और 108 एम्बुलेंस बुलाएं।',
+        'तुरंत डॉक्टर की सहायता आवश्यक है: मरीज़ को आराम से सहारा देकर बिठाएं, अस्पताल को तुरंत सूचना भेजें और 108 एम्बुलेंस की व्यवस्था करें।',
     };
   }
 
@@ -222,19 +222,64 @@ export function evaluateTriage(
       scoreCode: 'TR2',
       triggers: yellowReasons,
       protocolEn:
-        'MODERATE RISK: Schedule same-day PHC Medical Officer tele-consultation and re-verify vitals within 2 hours.',
+        'Doctor review recommended: Arrange a same-day consultation with the clinic doctor and recheck vital signs within 2 hours.',
       protocolHi:
-        'मध्यम जोखिम: आज ही पीएचसी डॉक्टर से टेली-परामर्श कराएं और दो घंटे में दोबारा जांच करें।',
+        'डॉक्टर की सलाह आवश्यक: आज ही प्राथमिक स्वास्थ्य केंद्र के डॉक्टर से परामर्श कराएं और 2 घंटे में दोबारा जांच करें।',
     };
   }
 
   return {
     severity: 'routine',
     scoreCode: 'TR1',
-    triggers: ['All physiological vitals & camera/audio checks nominal'],
+    triggers: ['All recorded vital signs are within the expected everyday range'],
     protocolEn:
-      'ROUTINE GREEN: Vitals within normal physiological baseline. Save to ABDM offline health record.',
+      'Vital signs are within normal range: Save this checkup record and continue routine wellness follow-up.',
     protocolHi:
-      'सामान्य स्थिति: मरीज़ के सभी जीवन संकेत सामान्य हैं। रिकॉर्ड सुरक्षित करें।',
+      'सभी जीवन संकेत सामान्य सीमा में हैं: यह स्वास्थ्य जांच रिकॉर्ड सुरक्षित करें।',
   };
 }
+
+export const SUB_CENTER_DIRECTORY: VillageSubCenter[] = [
+  {
+    code: 'VIL-204',
+    name: 'Rampur Health Sub-Center',
+    nameHi: 'रामपुर उप-केंद्र',
+    block: 'Varanasi Rural Block',
+    ashaName: 'Rampur Care Team',
+    x: 26,
+    y: 32,
+    population: 4820,
+    phcDistanceKm: 11.4,
+  },
+  {
+    code: 'VIL-208',
+    name: 'Devgarh Health Sub-Center',
+    nameHi: 'देवगढ़ उप-केंद्र',
+    block: 'Cholapur Block',
+    ashaName: 'Devgarh Care Team',
+    x: 68,
+    y: 24,
+    population: 3910,
+    phcDistanceKm: 14.8,
+  },
+  {
+    code: 'VIL-215',
+    name: 'Shivpur North Sub-Center',
+    nameHi: 'शिवपुर उत्तर उप-केंद्र',
+    block: 'Pindra Block',
+    ashaName: 'Shivpur Care Team',
+    x: 80,
+    y: 58,
+    population: 5290,
+    phcDistanceKm: 16.5,
+  },
+];
+
+export function maskHealthId(abhaId: string): string {
+  const clean = (abhaId || '').trim();
+  if (clean.length < 6) return 'Protected ID';
+  const prefix = clean.slice(0, 2);
+  const suffix = clean.slice(-4);
+  return `${prefix}-••••-••••-${suffix}`;
+}
+

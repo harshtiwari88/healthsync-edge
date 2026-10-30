@@ -1,30 +1,53 @@
-import React, {useEffect, useRef, useState} from 'react';
-import {
-  INITIAL_INCENTIVE_LEDGER,
-  INITIAL_TRIAGE_RECORDS,
-} from './data/initialData';
+import React, {useCallback, useEffect, useRef, useState} from 'react';
 import {IncentiveEntry, NetworkState, TriageRecord} from './types/triage';
 import {
+  buildUserVaultScope,
   HealthSyncRealtimeClient,
-  loadStoredRecords,
-  persistStoredRecords,
+  loadEncryptedRecords,
+  persistEncryptedRecords,
+  purgeLegacyPlaintextStorage,
   RealtimeEventMessage,
 } from './utils/realtimeSync';
 import {sirenEngine} from './utils/sirenAudio';
-import {CurrentView, TopRoleToolbar, UserRole} from './components/TopRoleToolbar';
-import {LoginPage} from './components/LoginPage';
+import {
+  AshaNavTab,
+  CurrentView,
+  DmoNavTab,
+  TopRoleToolbar,
+  UserRole,
+} from './components/TopRoleToolbar';
+import {AuthenticatedSessionPayload, LoginPage} from './components/LoginPage';
 import {AshaWorkerPWA} from './components/AshaWorkerPWA';
 import {DistrictCommandDashboard} from './components/DistrictCommandDashboard';
 
+function mergeRecordsById(primary: TriageRecord[], secondary: TriageRecord[]): TriageRecord[] {
+  const byId = new Map<string, TriageRecord>();
+  for (const rec of secondary) {
+    byId.set(rec.id, rec);
+  }
+  for (const rec of primary) {
+    byId.set(rec.id, rec);
+  }
+  return Array.from(byId.values()).sort((a, b) => b.createdAtMs - a.createdAtMs);
+}
+
 export function App() {
-  // 1. STRICT AUTHENTICATION & ROUTING GUARD STATE
+  // 1. STRICT AUTHENTICATION & SERVER SESSION STATE
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
   const [userRole, setUserRole] = useState<UserRole>(null);
   const [currentView, setCurrentView] = useState<CurrentView>('LOGIN');
+  const [sessionToken, setSessionToken] = useState<string>('');
+  const [authUser, setAuthUser] = useState<AuthenticatedSessionPayload['user'] | null>(null);
 
-  // Authenticated user metadata
-  const [ashaId, setAshaId] = useState<string>('ASHA-8842-UP');
-  const [dmoEmail, setDmoEmail] = useState<string>('dmo.varanasi@nhm.gov.in');
+  // Navigation Tabs for Field Worker & Hospital Dashboard
+  const [ashaTab, setAshaTab] = useState<AshaNavTab>('checkup');
+  const [dmoTab, setDmoTab] = useState<DmoNavTab>('overview');
+
+  // Derived Web Crypto AES-256-GCM key + PBKDF2 salt + per-user vault scope held only in memory while authenticated
+  const vaultKeyRef = useRef<CryptoKey | null>(null);
+  const vaultSaltRef = useRef<Uint8Array | null>(null);
+  const vaultScopeRef = useRef<string>('');
+  const authIdentifierRef = useRef<string>('');
 
   // 2. REAL-TIME REACTIVE NETWORK ENGINE
   const [browserOnline, setBrowserOnline] = useState<boolean>(() =>
@@ -34,44 +57,61 @@ export function App() {
     typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : '4g'
   );
 
-  // Shared Triage Records & ASHA Daily Incentive Ledger
-  const [records, setRecords] = useState<TriageRecord[]>(() =>
-    loadStoredRecords(INITIAL_TRIAGE_RECORDS)
-  );
-  const [incentives, setIncentives] = useState<IncentiveEntry[]>(INITIAL_INCENTIVE_LEDGER);
+  // Real Triage Records & Visit Stipend Log (zero fabricated mock records)
+  const [records, setRecords] = useState<TriageRecord[]>([]);
+  const [incentives, setIncentives] = useState<IncentiveEntry[]>([]);
+  const [isLoadingRecords, setIsLoadingRecords] = useState<boolean>(false);
 
-  // Web Audio Emergency Siren State
+  // Web Audio Alert Chime State
   const [sirenActive, setSirenActive] = useState<boolean>(false);
   const [sirenMuted, setSirenMuted] = useState<boolean>(false);
 
   const realtimeRef = useRef<HealthSyncRealtimeClient | null>(null);
   const userRoleRef = useRef<UserRole>(userRole);
   const isAuthRef = useRef<boolean>(isAuthenticated);
+  const recordsRef = useRef<TriageRecord[]>(records);
+  const isVaultHydratedRef = useRef<boolean>(false);
+
+  // Keep recordsRef synchronized and persist committed records outside pure state updaters
+  recordsRef.current = records;
+
+  useEffect(() => {
+    purgeLegacyPlaintextStorage();
+  }, []);
 
   useEffect(() => {
     userRoleRef.current = userRole;
     isAuthRef.current = isAuthenticated;
   }, [userRole, isAuthenticated]);
 
-  const flushOfflineQueue = () => {
-    setRecords((curr) => {
-      let hasChanges = false;
-      const updated = curr.map((rec) => {
-        if (rec.syncStatus === 'Queued Offline') {
-          hasChanges = true;
-          return {...rec, syncStatus: 'Synced' as const};
-        }
-        return rec;
-      });
-      if (hasChanges) {
-        persistStoredRecords(updated);
-        updated.forEach((rec) => realtimeRef.current?.publishRecordUpdated(rec));
-      }
-      return hasChanges ? updated : curr;
-    });
-  };
+  useEffect(() => {
+    recordsRef.current = records;
+    if (!isVaultHydratedRef.current || !isAuthRef.current) return;
+    if (!vaultKeyRef.current || !vaultSaltRef.current || !vaultScopeRef.current) return;
+    void persistEncryptedRecords(
+      vaultKeyRef.current,
+      vaultSaltRef.current,
+      records,
+      vaultScopeRef.current
+    );
+  }, [records]);
 
-  // Real browser navigator.onLine + window 'online'/'offline' event listeners
+  const flushOfflineQueue = useCallback(() => {
+    // Defer network side-effects outside React state updaters so StrictMode/concurrent renders never double-fire
+    window.setTimeout(() => {
+      const queued = recordsRef.current.filter((rec) => rec.syncStatus === 'Queued Offline');
+      if (queued.length === 0) return;
+
+      for (const rec of queued) {
+        const candidateSynced: TriageRecord = {...rec, syncStatus: 'Synced'};
+        void realtimeRef.current?.publishRecordCreated(
+          candidateSynced,
+          candidateSynced.severity === 'emergency'
+        );
+      }
+    }, 0);
+  }, []);
+
   useEffect(() => {
     const handleBrowserOnline = () => {
       setBrowserOnline(true);
@@ -90,26 +130,34 @@ export function App() {
       window.removeEventListener('online', handleBrowserOnline);
       window.removeEventListener('offline', handleBrowserOffline);
     };
-  }, []);
+  }, [flushOfflineQueue]);
 
-  // Multi-tab BroadcastChannel + WebSocket Real-Time Transport
+  // Authenticated WebSocket + BroadcastChannel Real-Time Transport
   useEffect(() => {
+    if (!isAuthenticated || !sessionToken) {
+      realtimeRef.current?.destroy();
+      realtimeRef.current = null;
+      return;
+    }
+
+    const canCurrentUserAccessRecord = (rec: TriageRecord): boolean => {
+      if (userRoleRef.current === 'DMO') return true;
+      const currentId = authIdentifierRef.current.trim().toUpperCase();
+      if (!currentId) return false;
+      return rec.ashaWorker.toUpperCase().includes(`(${currentId})`);
+    };
+
     const handleRealtimeMessage = (msg: RealtimeEventMessage) => {
-      if (msg.type === 'sync:init' && Array.isArray(msg.records) && msg.records.length > 0) {
-        const looksValid = msg.records.some((r) => r.binarySmsPayload?.startsWith('HS#'));
-        if (looksValid) {
-          setRecords(msg.records);
-          persistStoredRecords(msg.records);
-        }
+      if (msg.type === 'sync:init' && Array.isArray(msg.records)) {
+        const allowedRecords = msg.records.filter(canCurrentUserAccessRecord);
+        setRecords((prev) => mergeRecordsById(allowedRecords, prev));
       } else if (msg.type === 'record:created') {
+        if (!canCurrentUserAccessRecord(msg.record)) return;
         setRecords((prev) => {
           if (prev.some((r) => r.id === msg.record.id)) return prev;
-          const next = [msg.record, ...prev];
-          persistStoredRecords(next);
-          return next;
+          return [msg.record, ...prev];
         });
 
-        // Trigger emergency siren immediately on DMO Dashboard when RED Critical Alert arrives
         if (msg.triggerEmergencySiren || msg.record.severity === 'emergency') {
           setSirenActive(true);
           if (isAuthRef.current && userRoleRef.current === 'DMO') {
@@ -120,57 +168,182 @@ export function App() {
         }
       } else if (msg.type === 'record:updated') {
         setRecords((prev) => {
-          const next = prev.map((r) => (r.id === msg.record.id ? msg.record : r));
-          persistStoredRecords(next);
-          return next;
+          if (!prev.some((r) => r.id === msg.record.id) && userRoleRef.current !== 'DMO') {
+            return prev;
+          }
+          return prev.map((r) => (r.id === msg.record.id ? msg.record : r));
+        });
+      } else if (msg.type === 'sync:ack') {
+        setRecords((prev) => {
+          if (!prev.some((r) => r.id === msg.recordId)) return prev;
+          return prev.map((r) =>
+            r.id === msg.recordId
+              ? {
+                  ...msg.record,
+                  syncStatus:
+                    msg.record.channel === 'Emergency SMS'
+                      ? ('SMS Delivered' as const)
+                      : ('Synced' as const),
+                }
+              : r
+          );
+        });
+      } else if (msg.type === 'sync:error') {
+        if (!msg.recordId) return;
+        setRecords((prev) => {
+          if (!prev.some((r) => r.id === msg.recordId)) return prev;
+          return prev.map((r) => {
+            if (r.id === msg.recordId && r.syncStatus !== 'SMS Delivered') {
+              // Only leave in offline retry queue if the server marked the error as transient/retryable
+              return {
+                ...r,
+                syncStatus: msg.retryable ? ('Queued Offline' as const) : ('Synced' as const),
+              };
+            }
+            return r;
+          });
         });
       }
     };
 
-    const client = new HealthSyncRealtimeClient(
-      handleRealtimeMessage,
-      (syncedRecords) => setRecords(syncedRecords),
-      records
-    );
+    const client = new HealthSyncRealtimeClient(sessionToken, handleRealtimeMessage);
     realtimeRef.current = client;
 
     return () => {
       client.destroy();
-      sirenEngine.stopSiren();
+      realtimeRef.current = null;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [isAuthenticated, sessionToken]);
 
-  // Interactive Network Mode Override Switch
   const handleSelectNetwork = (nextMode: NetworkState) => {
-    setNetworkState((prev) => {
-      if (prev === 'offline' && nextMode !== 'offline') {
-        flushOfflineQueue();
+    const wasOffline = networkState === 'offline';
+    setNetworkState(nextMode);
+    if (wasOffline && nextMode !== 'offline') {
+      flushOfflineQueue();
+    }
+  };
+
+  // STRICT AUTHENTICATION HANDLER (Server SQLite Session + Per-User Web Crypto AES-256-GCM Vault)
+  const handleAuthenticated = async (session: AuthenticatedSessionPayload) => {
+    sirenEngine.unlock();
+    const userScope = buildUserVaultScope(session.user.role, session.user.identifier);
+    isVaultHydratedRef.current = false;
+    vaultKeyRef.current = session.vaultKey;
+    vaultSaltRef.current = session.salt;
+    vaultScopeRef.current = userScope;
+    authIdentifierRef.current = session.user.identifier;
+    isAuthRef.current = true;
+    userRoleRef.current = session.user.role;
+    setSessionToken(session.token);
+    setAuthUser(session.user);
+    setIsAuthenticated(true);
+    setUserRole(session.user.role);
+    setAshaTab('checkup');
+    setDmoTab('overview');
+    setCurrentView(session.user.role === 'ASHA' ? 'ASHA_MOBILE' : 'DMO_DASHBOARD');
+    setIsLoadingRecords(true);
+
+    try {
+      // 1. Decrypt THIS user's isolated local AES-256-GCM offline vault
+      const localDecrypted = await loadEncryptedRecords(session.vaultKey, [], userScope);
+      isVaultHydratedRef.current = true;
+      setRecords([...localDecrypted]);
+
+      // 2. Sync authoritative records & incentives from SQLite server when online
+      if (networkState !== 'offline' && session.token !== 'OFFLINE_LOCAL_SESSION') {
+        const [recordsRes, incentivesRes] = await Promise.all([
+          fetch('/api/records', {
+            headers: {Authorization: `Bearer ${session.token}`},
+          }),
+          fetch('/api/incentives', {
+            headers: {Authorization: `Bearer ${session.token}`},
+          }),
+        ]);
+
+        if (recordsRes.ok) {
+          const data = (await recordsRes.json()) as {records?: TriageRecord[]};
+          if (Array.isArray(data.records)) {
+            const unsynced = localDecrypted.filter((r) => r.syncStatus === 'Queued Offline');
+            const confirmedSyncedById = new Map<string, TriageRecord>();
+
+            for (const q of unsynced) {
+              const syncedCopy: TriageRecord = {...q, syncStatus: 'Synced'};
+              try {
+                const postRes = await fetch('/api/records', {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${session.token}`,
+                  },
+                  body: JSON.stringify({
+                    record: syncedCopy,
+                    triggerEmergencySiren: syncedCopy.severity === 'emergency',
+                  }),
+                });
+                if (postRes.ok) {
+                  const postJson = (await postRes.json().catch(() => ({}))) as {
+                    record?: TriageRecord;
+                  };
+                  confirmedSyncedById.set(q.id, postJson.record ?? syncedCopy);
+                } else {
+                  console.error(
+                    `[HealthSync Offline Sync] Server rejected queued record ${q.id} (HTTP ${postRes.status}). Keeping in offline queue.`
+                  );
+                }
+              } catch (syncErr) {
+                console.error(
+                  `[HealthSync Offline Sync] Network error syncing record ${q.id}. Keeping in offline queue:`,
+                  syncErr
+                );
+              }
+            }
+
+            // Pure functional state update merging against LIVE state (vault persistence runs via useEffect)
+            setRecords((currentRecords) => {
+              const normalizedCurrent = currentRecords.map((r) =>
+                confirmedSyncedById.has(r.id) ? confirmedSyncedById.get(r.id)! : r
+              );
+              return mergeRecordsById(data.records || [], normalizedCurrent);
+            });
+          }
+        }
+
+        if (incentivesRes.ok) {
+          const incData = (await incentivesRes.json()) as {incentives?: IncentiveEntry[]};
+          if (Array.isArray(incData.incentives)) {
+            setIncentives(incData.incentives);
+          }
+        }
       }
-      return nextMode;
-    });
-  };
-
-  // STRICT AUTHENTICATION HANDLERS
-  const handleLoginAsha = (validAshaId: string) => {
-    sirenEngine.unlock();
-    setAshaId(validAshaId);
-    setIsAuthenticated(true);
-    setUserRole('ASHA');
-    setCurrentView('ASHA_MOBILE');
-  };
-
-  const handleLoginDmo = (validEmail: string) => {
-    sirenEngine.unlock();
-    setDmoEmail(validEmail);
-    setIsAuthenticated(true);
-    setUserRole('DMO');
-    setCurrentView('DMO_DASHBOARD');
+    } catch (err) {
+      console.error('[HealthSync Auth Sync] Offline or transient sync error:', err);
+    } finally {
+      setIsLoadingRecords(false);
+    }
   };
 
   const handleLogout = () => {
+    if (sessionToken && sessionToken !== 'OFFLINE_LOCAL_SESSION') {
+      void fetch('/api/auth/logout', {
+        method: 'POST',
+        headers: {Authorization: `Bearer ${sessionToken}`},
+      }).catch(() => {});
+    }
+    isVaultHydratedRef.current = false;
+    isAuthRef.current = false;
+    userRoleRef.current = null;
+    realtimeRef.current?.destroy();
+    realtimeRef.current = null;
+    vaultKeyRef.current = null;
+    vaultSaltRef.current = null;
+    vaultScopeRef.current = '';
+    authIdentifierRef.current = '';
     sirenEngine.stopSiren();
     setSirenActive(false);
+    setSessionToken('');
+    setAuthUser(null);
+    setRecords([]);
+    setIncentives([]);
     setIsAuthenticated(false);
     setUserRole(null);
     setCurrentView('LOGIN');
@@ -179,20 +352,20 @@ export function App() {
   const handleSaveRecord = (newRecord: TriageRecord, isEmergencySms: boolean) => {
     sirenEngine.unlock();
 
-    setRecords((prev) => {
-      const next = [newRecord, ...prev];
-      persistStoredRecords(next);
-      return next;
-    });
+    // Until the server confirms SQLite persistence via sync:ack, store non-SMS records safely as 'Queued Offline'
+    const safeLocalRecord: TriageRecord = isEmergencySms
+      ? newRecord
+      : {...newRecord, syncStatus: 'Queued Offline'};
 
-    // ASHA Incentive Ledger: +₹50 for High Risk (Emergency / Moderate), +₹20 for NCD Routine
+    setRecords((prev) => [safeLocalRecord, ...prev]);
+
     const isHighRisk = newRecord.severity === 'emergency' || newRecord.severity === 'moderate';
     const rewardAmount = isHighRisk ? 50 : 20;
     const newIncentive: IncentiveEntry = {
-      id: `inc-${Date.now()}`,
+      id: `inc-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
       taskTitle: isHighRisk
-        ? 'High-Risk Triage & Referral Stabilization'
-        : 'NCD Community Vitals Screening',
+        ? 'Priority Referral & Health Stabilization'
+        : 'Community Vital Signs Checkup',
       programCode: isHighRisk ? 'NHM-HRP-50' : 'NPCDCS-20',
       patientRef: `${newRecord.patientId} · ${newRecord.patientName}`,
       amountInr: rewardAmount,
@@ -201,10 +374,12 @@ export function App() {
     };
     setIncentives((prev) => [newIncentive, ...prev]);
 
-    // Real-time Cloud Sync when 4G / 2G OR Emergency Binary SMS bypass
     if (networkState !== 'offline' || isEmergencySms) {
       const triggerSiren = isEmergencySms || newRecord.severity === 'emergency';
-      realtimeRef.current?.publishRecordCreated(newRecord, triggerSiren);
+      const serverPayload: TriageRecord = isEmergencySms
+        ? newRecord
+        : {...newRecord, syncStatus: 'Synced'};
+      void realtimeRef.current?.publishRecordCreated(serverPayload, triggerSiren, newIncentive);
       if (triggerSiren) {
         setSirenActive(true);
         if (!sirenMuted) {
@@ -218,21 +393,19 @@ export function App() {
     sirenEngine.stopSiren();
     setSirenActive(false);
 
-    setRecords((prev) => {
-      const next = prev.map((rec) => {
+    setRecords((prev) =>
+      prev.map((rec) => {
         if (rec.id !== recordId) return rec;
-        const updated: TriageRecord = {
+        return {
           ...rec,
-          dispatchStatus: 'Dispatched',
+          dispatchStatus: 'Dispatched' as const,
           ambulanceUnit: '108-AMB-UP65',
           etaMinutes: 11,
         };
-        realtimeRef.current?.publishRecordUpdated(updated);
-        return updated;
-      });
-      persistStoredRecords(next);
-      return next;
-    });
+      })
+    );
+
+    void realtimeRef.current?.publishRecordDispatched(recordId, '108-AMB-UP65', 11);
   };
 
   const handleTriggerTestSiren = () => {
@@ -260,37 +433,54 @@ export function App() {
   };
 
   const pendingOfflineCount = records.filter((r) => r.syncStatus === 'Queued Offline').length;
-  const userIdentifier = userRole === 'ASHA' ? ashaId : userRole === 'DMO' ? dmoEmail : '';
+  const userIdentifier = authUser?.identifier ?? '';
 
   return (
-    <div className="min-h-screen w-full bg-slate-950 text-slate-100 overflow-x-hidden flex flex-col">
-      {/* Top Bar with Reactive Network Switch & Strict Authenticated Logout */}
+    <div className="min-h-screen w-full bg-slate-50 text-slate-900 overflow-x-hidden flex flex-col">
       <TopRoleToolbar
         isAuthenticated={isAuthenticated}
         userRole={userRole}
         userIdentifier={userIdentifier}
+        userDisplayName={authUser?.displayName}
         networkState={networkState}
         browserOnline={browserOnline}
+        pendingOfflineCount={pendingOfflineCount}
+        ashaTab={ashaTab}
+        onSelectAshaTab={setAshaTab}
+        dmoTab={dmoTab}
+        onSelectDmoTab={setDmoTab}
         onSelectNetwork={handleSelectNetwork}
         onLogout={handleLogout}
       />
 
       {/* STRICT ROUTING GUARD: Unauthenticated users ONLY ever see LOGIN */}
       <main className="flex-1 flex flex-col w-full">
-        {!isAuthenticated || userRole === null || currentView === 'LOGIN' ? (
-          <LoginPage onLoginAsha={handleLoginAsha} onLoginDmo={handleLoginDmo} />
+        {!isAuthenticated || userRole === null || currentView === 'LOGIN' || !authUser ? (
+          <LoginPage networkState={networkState} onAuthenticated={handleAuthenticated} />
         ) : userRole === 'ASHA' && currentView === 'ASHA_MOBILE' ? (
           <AshaWorkerPWA
-            ashaId={ashaId}
+            ashaId={authUser.identifier}
+            ashaDisplayName={authUser.displayName}
+            villageCode={authUser.villageCode}
+            sessionToken={sessionToken}
             networkState={networkState}
+            records={records}
             incentives={incentives}
             pendingOfflineCount={pendingOfflineCount}
+            isLoadingRecords={isLoadingRecords}
+            activeTab={ashaTab}
+            onSelectTab={setAshaTab}
             onSaveRecord={handleSaveRecord}
           />
         ) : userRole === 'DMO' && currentView === 'DMO_DASHBOARD' ? (
           <DistrictCommandDashboard
-            dmoEmail={dmoEmail}
+            dmoEmail={authUser.identifier}
+            dmoDisplayName={authUser.displayName}
+            sessionToken={sessionToken}
             records={records}
+            isLoadingRecords={isLoadingRecords}
+            activeTab={dmoTab}
+            onSelectTab={setDmoTab}
             sirenActive={sirenActive}
             sirenMuted={sirenMuted}
             onTriggerTestSiren={handleTriggerTestSiren}
@@ -298,7 +488,7 @@ export function App() {
             onDispatchAmbulance={handleDispatchAmbulance}
           />
         ) : (
-          <LoginPage onLoginAsha={handleLoginAsha} onLoginDmo={handleLoginDmo} />
+          <LoginPage networkState={networkState} onAuthenticated={handleAuthenticated} />
         )}
       </main>
     </div>

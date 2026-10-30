@@ -8,10 +8,17 @@
 @layer base {
   html {
     font-family: var(--font-sans);
-    background-color: #020617;
-    color: #F1F5F9;
-    color-scheme: dark;
+    background-color: #F8FAFC;
+    color: #0F172A;
+    color-scheme: light;
     -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    margin: 0;
+    min-width: 320px;
+    background-color: #F8FAFC;
+    color: #0F172A;
   }
 
   button,
@@ -19,28 +26,7 @@
   input,
   textarea,
   a {
-    @apply focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500;
-  }
-}
-
-@keyframes red-alert-flash {
-  0%, 100% {
-    border-color: #EF4444;
-    box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.28);
-  }
-  50% {
-    border-color: #7F1D1D;
-    box-shadow: 0 0 0 0px rgba(239, 68, 68, 0);
-  }
-}
-
-.flashing-red-border {
-  animation: red-alert-flash 1.4s ease-in-out infinite;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .flashing-red-border {
-    animation: none;
+    @apply focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-700;
   }
 }
 
@@ -48,18 +34,25 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* Subtle dark scrollbars for fixed-height mobile container & dashboard streams */
+.pb-safe {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* Subtle, accessible light scrollbars */
 .custom-scrollbar::-webkit-scrollbar {
   width: 6px;
   height: 6px;
 }
+
 .custom-scrollbar::-webkit-scrollbar-track {
-  background: rgba(15, 23, 42, 0.6);
+  background: #F1F5F9;
 }
+
 .custom-scrollbar::-webkit-scrollbar-thumb {
-  background: rgba(71, 85, 105, 0.7);
+  background: #CBD5E1;
   border-radius: 9999px;
 }
+
 .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-  background: rgba(100, 116, 139, 0.9);
+  background: #94A3B8;
 }

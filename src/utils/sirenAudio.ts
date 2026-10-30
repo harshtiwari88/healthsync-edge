@@ -13,6 +13,7 @@ class EmergencySirenEngine {
   private sweepInterval: number | null = null;
   private isPlayingLoop = false;
   private masterMuted = false;
+  private activeTestBurst = false;
 
   private ensureContext(): AudioContext | null {
     if (typeof window === 'undefined') return null;
@@ -48,6 +49,10 @@ class EmergencySirenEngine {
 
   public isSirenActive(): boolean {
     return this.isPlayingLoop;
+  }
+
+  public isTestBurstActive(): boolean {
+    return this.activeTestBurst;
   }
 
   public startLoopingSiren() {
@@ -126,10 +131,12 @@ class EmergencySirenEngine {
    * can grant browser AudioContext permission and verify speaker output.
    */
   public playTestSirenBurst() {
+    if (this.activeTestBurst) return; // Prevent overlapping oscillator stacking
     const ctx = this.ensureContext();
     if (!ctx) return;
 
     try {
+      this.activeTestBurst = true;
       const now = ctx.currentTime;
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
@@ -149,10 +156,20 @@ class EmergencySirenEngine {
       osc.connect(gain);
       gain.connect(ctx.destination);
 
+      osc.onended = () => {
+        try {
+          osc.disconnect();
+          gain.disconnect();
+        } catch {
+          // Ignore disconnect errors
+        }
+        this.activeTestBurst = false;
+      };
+
       osc.start(now);
       osc.stop(now + 1.58);
     } catch {
-      // Ignore if blocked before gesture
+      this.activeTestBurst = false;
     }
   }
 

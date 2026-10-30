@@ -1,10 +1,10 @@
 import {
   ALL_SYMPTOMS,
-  EdgeAiDiagnostics,
-  SeverityLevel,
-  SymptomKey,
-  VitalsSnapshot,
-} from '../types/triage';
+  type EdgeAiDiagnostics,
+  type SeverityLevel,
+  type SymptomKey,
+  type VitalsSnapshot,
+} from '../types/triage.ts';
 
 export interface EncodedPatientInput {
   patientId: string;
@@ -68,17 +68,50 @@ function base64ToUint8(b64: string): Uint8Array {
   return out;
 }
 
+export const MAX_SMS_PATIENT_ID = 0xffffffff; // 4,294,967,295 (32-bit unsigned integer)
+export const MAX_SMS_VILLAGE_CODE = 0xffff; // 65,535 (16-bit unsigned integer)
+
+function parseStrictNumericId(raw: string, fieldName: string, maxVal: number, fallbackIfEmpty?: number): number {
+  const digits = raw.replace(/\D/g, '');
+  if (!digits) {
+    if (fallbackIfEmpty !== undefined) return fallbackIfEmpty;
+    throw new RangeError(`${fieldName} must contain at least one numeric digit (received "${raw}").`);
+  }
+  const parsed = Number(digits);
+  if (!Number.isSafeInteger(parsed) || parsed < 0 || parsed > maxVal) {
+    throw new RangeError(
+      `${fieldName} numeric value (${digits}) exceeds maximum representable SMS frame value (${maxVal}).`
+    );
+  }
+  return parsed;
+}
+
 /**
- * Generates a 28-character bit-packed Base64 SMS payload:
- * Prefix `HS#` (3 chars) + Version tag `1` (1 char) + 24-char Base64 of 18-byte DataView = 28 characters exact!
+ * Generates a 32-character bit-packed Base64 SMS payload (v2):
+ * Prefix `HS#B` (4 chars) + 28-char Base64 of 21-byte DataView = 32 characters exact!
+ * - Patient ID is stored as a full 32-bit unsigned integer (0..4,294,967,295) with explicit range validation
+ *   so IDs > 65,535 never wrap around or corrupt patient identity.
  */
 export function encodeVitalsToSMS(patientData: EncodedPatientInput): string {
-  const buffer = new ArrayBuffer(18);
+  const buffer = new ArrayBuffer(21);
   const view = new DataView(buffer);
   const bytes = new Uint8Array(buffer);
 
-  const ptDigits = Number(patientData.patientId.replace(/\D/g, '')) || 8931;
-  const vilDigits = Number(patientData.villageCode.replace(/\D/g, '')) || 204;
+  const ptDigits = parseStrictNumericId(
+    patientData.patientId,
+    'Patient ID',
+    MAX_SMS_PATIENT_ID
+  );
+  const vilDigits = parseStrictNumericId(
+    patientData.villageCode,
+    'Village code',
+    MAX_SMS_VILLAGE_CODE,
+    204
+  );
+
+  // Worker attribution ID (24-bit unsigned int: up to 16,777,215; trailing 7 digits if mobile number)
+  const rawAshaDigits = (patientData.ashaId || '8842').replace(/\D/g, '');
+  const ashaNum = rawAshaDigits ? Number(rawAshaDigits.slice(-7)) & 0xffffff : 8842;
 
   const sys = Math.min(300, Math.max(0, Math.round(patientData.vitals.systolic)));
   const dia = Math.min(255, Math.max(0, Math.round(patientData.vitals.diastolic)));
@@ -103,46 +136,52 @@ export function encodeVitalsToSMS(patientData: EncodedPatientInput): string {
   const sevCode =
     patientData.severity === 'emergency' ? 3 : patientData.severity === 'moderate' ? 2 : 1;
 
-  view.setUint8(0, 0x01);
-  view.setUint16(1, ptDigits & 0xffff, false);
-  view.setUint16(3, vilDigits & 0xffff, false);
-  view.setUint16(5, sys, false);
-  view.setUint8(7, dia);
-  view.setUint8(8, spo2);
-  view.setUint16(9, tempTenths, false);
-  view.setUint8(11, hr);
-  view.setUint8(12, symptomMask & 0x3f);
-  view.setUint8(13, ((sevCode & 0x03) << 4) | (aiMask & 0x03));
-  view.setUint16(14, 8842, false); // ASHA numeric ID
+  view.setUint8(0, 0x02); // Frame version 2 (32-bit patient ID)
+  view.setUint32(1, ptDigits, false); // Bytes 1..4: uint32 patient ID (no 16-bit wrap!)
+  view.setUint16(5, vilDigits, false); // Bytes 5..6: uint16 village code
+  view.setUint16(7, sys, false); // Bytes 7..8: systolic BP
+  view.setUint8(9, dia); // Byte 9: diastolic BP
+  view.setUint8(10, spo2); // Byte 10: SpO2 %
+  view.setUint16(11, tempTenths, false); // Bytes 11..12: temperature * 10
+  view.setUint8(13, hr); // Byte 13: heart rate
+  view.setUint8(14, symptomMask & 0x3f); // Byte 14: 6-bit symptom mask
+  view.setUint8(15, ((sevCode & 0x03) << 4) | (aiMask & 0x03)); // Byte 15: severity + screening flags
+  // Bytes 16..18: 24-bit ASHA numeric ID
+  view.setUint8(16, (ashaNum >>> 16) & 0xff);
+  view.setUint8(17, (ashaNum >>> 8) & 0xff);
+  view.setUint8(18, ashaNum & 0xff);
 
-  const crc16 = computeCrc16(bytes, 16);
-  view.setUint16(16, crc16, false);
+  const crc16 = computeCrc16(bytes, 19);
+  view.setUint16(19, crc16, false);
 
-  // "HS#B" (4 chars) + 24 Base64 chars = 28 characters exact
+  // "HS#B" (4 chars) + 28 Base64 chars = 32 characters exact
   return `HS#B${uint8ToBase64(bytes)}`;
 }
 
 /**
- * Generates compact human-verifiable SMS shorthand (e.g. HS#A8842#BP160/100#SPO288#RED)
+ * Generates compact human-verifiable SMS shorthand (e.g. HS#A8842#PT70000#BP160/100#SPO288#RED)
  */
 export function formatCompactSmsTag(patientData: EncodedPatientInput): string {
   const ashaDigits = (patientData.ashaId || '8842').replace(/\D/g, '') || '8842';
+  const ptDigits = patientData.patientId.replace(/\D/g, '');
+  const ptSegment = ptDigits ? `#PT${ptDigits}` : '';
   const sevTag =
     patientData.severity === 'emergency'
       ? 'RED'
       : patientData.severity === 'moderate'
       ? 'YLW'
       : 'GRN';
-  return `HS#A${ashaDigits}#BP${Math.round(patientData.vitals.systolic)}/${Math.round(
+  return `HS#A${ashaDigits}${ptSegment}#BP${Math.round(patientData.vitals.systolic)}/${Math.round(
     patientData.vitals.diastolic
   )}#SPO2${Math.round(patientData.vitals.spo2)}#${sevTag}`;
 }
 
 /**
  * Universal SMS Payload Decoder:
- * Decodes BOTH:
- * 1) Shorthand emergency SMS strings like `HS#A8842#BP160/100#SPO288#RED`
- * 2) 28-char / 27-char bit-packed Base64 frames (`HS#B...` / `HS#...`) and legacy `HS3#...` frames
+ * Decodes:
+ * 1) Shorthand emergency SMS strings like `HS#A8842#BP160/100#SPO288#RED` or `HS#A8842#PT70000#BP...`
+ * 2) 32-char v2 bit-packed Base64 frames (`HS#B` + 21 bytes with 32-bit patient ID)
+ * 3) Legacy 28-char v1 bit-packed Base64 frames (`HS#B` + 18 bytes) and `HS3#` frames
  */
 export function decodeSMSPayload(payloadString: string): DecodedSmsResult {
   const trimmed = payloadString.trim();
@@ -172,18 +211,21 @@ export function decodeSMSPayload(payloadString: string): DecodedSmsResult {
   const segments = trimmed.split('#');
   if (segments.length >= 4) {
     let ashaId = 'ASHA-8842-UP';
+    let patientId = 'PT8931';
     let systolic = 120;
     let diastolic = 80;
     let spo2 = 98;
     let temperature = 98.6;
-    let heartRate = 84;
+    const heartRate = 84;
     let severity: SeverityLevel = 'routine';
     const symptoms: SymptomKey[] = [];
 
     for (const seg of segments.slice(1)) {
       const upper = seg.trim().toUpperCase();
-      if (/^A\d+/.test(upper)) {
+      if (/^A\d+$/.test(upper)) {
         ashaId = `ASHA-${upper.slice(1)}-UP`;
+      } else if (/^PT\d+$/.test(upper)) {
+        patientId = upper;
       } else if (upper.startsWith('BP')) {
         const m = upper.match(/BP(\d{2,3})\/(\d{2,3})/);
         if (m) {
@@ -218,7 +260,7 @@ export function decodeSMSPayload(payloadString: string): DecodedSmsResult {
       formatLabel: 'Compact Emergency SMS Frame',
       rawPayload: trimmed,
       ashaId,
-      patientId: 'PT8931',
+      patientId,
       villageCode: 'VIL-204',
       vitals: {
         systolic,
@@ -235,13 +277,13 @@ export function decodeSMSPayload(payloadString: string): DecodedSmsResult {
     };
   }
 
-  // Case 2: Bit-Packed Base64 Frame (`HS#B<24-char>` = 28 chars, or `HS#<24-char>` = 27 chars, or `HS3#<156-char>`)
+  // Case 2: Bit-Packed Base64 Frame (`HS#B<28-char>` = 32 chars v2, `HS#B<24-char>` = 28 chars v1, or `HS3#<156-char>`)
   let b64Body = '';
   let isV32 = false;
   if (trimmed.startsWith('HS3#')) {
     b64Body = trimmed.slice(4).trim();
     isV32 = true;
-  } else if (trimmed.startsWith('HS#B') && trimmed.length === 28) {
+  } else if (trimmed.startsWith('HS#B') && (trimmed.length === 32 || trimmed.length === 28)) {
     b64Body = trimmed.slice(4).trim();
   } else if (trimmed.startsWith('HS#')) {
     b64Body = trimmed.slice(3).trim();
@@ -296,60 +338,118 @@ export function decodeSMSPayload(payloadString: string): DecodedSmsResult {
     };
   }
 
-  if (bytes.length !== 18) {
-    return makeInvalid(
-      `Expected 18-byte bit-packed Base64 frame (28 chars) or HS#A8842#BP... format.`
-    );
+  // Frame v2: 21 bytes (32-bit unsigned patient ID + CRC-16)
+  if (bytes.length === 21) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const version = view.getUint8(0);
+    if (version !== 0x02) {
+      return makeInvalid(`Unsupported 21-byte SMS frame version: 0x${version.toString(16)}.`);
+    }
+    const ptNum = view.getUint32(1, false);
+    const vilNum = view.getUint16(5, false);
+    const systolic = view.getUint16(7, false);
+    const diastolic = view.getUint8(9);
+    const spo2 = view.getUint8(10);
+    const tempTenths = view.getUint16(11, false);
+    const heartRate = view.getUint8(13);
+    const symptomBitmask = view.getUint8(14) & 0x3f;
+    const packedFlags = view.getUint8(15);
+    const ashaNum =
+      ((view.getUint8(16) << 16) | (view.getUint8(17) << 8) | view.getUint8(18)) >>> 0 || 8842;
+
+    const sevCode = (packedFlags >> 4) & 0x03;
+    const aiMask = packedFlags & 0x03;
+
+    const receivedCrc = view.getUint16(19, false);
+    const computedCrc = computeCrc16(bytes, 19);
+    const crcValid = receivedCrc === computedCrc;
+
+    const symptoms: SymptomKey[] = [];
+    ALL_SYMPTOMS.forEach((sym, idx) => {
+      if ((symptomBitmask & (1 << idx)) !== 0) {
+        symptoms.push(sym);
+      }
+    });
+
+    return {
+      valid: crcValid,
+      crcValid,
+      formatLabel: '32-Char Bit-Packed Base64 SMS (32-bit ID)',
+      error: crcValid ? undefined : 'CRC-16 checksum mismatch in decoded packet.',
+      rawPayload: trimmed,
+      ashaId: `ASHA-${ashaNum}-UP`,
+      patientId: `PT${ptNum}`,
+      villageCode: `VIL-${vilNum}`,
+      vitals: {
+        systolic,
+        diastolic,
+        spo2,
+        temperature: Number((tempTenths / 10).toFixed(1)),
+        heartRate,
+      },
+      symptoms,
+      anemiaSuspected: (aiMask & 0b01) !== 0,
+      respiratoryRiskHigh: (aiMask & 0b10) !== 0,
+      severity: sevCode === 3 ? 'emergency' : sevCode === 2 ? 'moderate' : 'routine',
+      checksumHex: `0x${receivedCrc.toString(16).toUpperCase().padStart(4, '0')}`,
+    };
   }
 
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const ptNum = view.getUint16(1, false);
-  const vilNum = view.getUint16(3, false);
-  const systolic = view.getUint16(5, false);
-  const diastolic = view.getUint8(7);
-  const spo2 = view.getUint8(8);
-  const tempTenths = view.getUint16(9, false);
-  const heartRate = view.getUint8(11);
-  const symptomBitmask = view.getUint8(12) & 0x3f;
-  const packedFlags = view.getUint8(13);
-  const ashaNum = view.getUint16(14, false) || 8842;
+  // Legacy Frame v1: 18 bytes (backward-compatible decoding)
+  if (bytes.length === 18) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const ptNum = view.getUint16(1, false);
+    const vilNum = view.getUint16(3, false);
+    const systolic = view.getUint16(5, false);
+    const diastolic = view.getUint8(7);
+    const spo2 = view.getUint8(8);
+    const tempTenths = view.getUint16(9, false);
+    const heartRate = view.getUint8(11);
+    const symptomBitmask = view.getUint8(12) & 0x3f;
+    const packedFlags = view.getUint8(13);
+    const ashaNum = view.getUint16(14, false) || 8842;
 
-  const sevCode = (packedFlags >> 4) & 0x03;
-  const aiMask = packedFlags & 0x03;
+    const sevCode = (packedFlags >> 4) & 0x03;
+    const aiMask = packedFlags & 0x03;
 
-  const receivedCrc = view.getUint16(16, false);
-  const computedCrc = computeCrc16(bytes, 16);
-  const crcValid = receivedCrc === computedCrc;
+    const receivedCrc = view.getUint16(16, false);
+    const computedCrc = computeCrc16(bytes, 16);
+    const crcValid = receivedCrc === computedCrc;
 
-  const symptoms: SymptomKey[] = [];
-  ALL_SYMPTOMS.forEach((sym, idx) => {
-    if ((symptomBitmask & (1 << idx)) !== 0) {
-      symptoms.push(sym);
-    }
-  });
+    const symptoms: SymptomKey[] = [];
+    ALL_SYMPTOMS.forEach((sym, idx) => {
+      if ((symptomBitmask & (1 << idx)) !== 0) {
+        symptoms.push(sym);
+      }
+    });
 
-  return {
-    valid: true,
-    crcValid,
-    formatLabel: '28-Char Bit-Packed Base64 SMS',
-    error: crcValid ? undefined : 'CRC-16 checksum mismatch in decoded packet.',
-    rawPayload: trimmed,
-    ashaId: `ASHA-${ashaNum}-UP`,
-    patientId: `PT${ptNum}`,
-    villageCode: `VIL-${vilNum}`,
-    vitals: {
-      systolic,
-      diastolic,
-      spo2,
-      temperature: Number((tempTenths / 10).toFixed(1)),
-      heartRate,
-    },
-    symptoms,
-    anemiaSuspected: (aiMask & 0b01) !== 0,
-    respiratoryRiskHigh: (aiMask & 0b10) !== 0,
-    severity: sevCode === 3 ? 'emergency' : sevCode === 2 ? 'moderate' : 'routine',
-    checksumHex: `0x${receivedCrc.toString(16).toUpperCase().padStart(4, '0')}`,
-  };
+    return {
+      valid: crcValid,
+      crcValid,
+      formatLabel: '28-Char Bit-Packed Base64 SMS (Legacy v1)',
+      error: crcValid ? undefined : 'CRC-16 checksum mismatch in decoded packet.',
+      rawPayload: trimmed,
+      ashaId: `ASHA-${ashaNum}-UP`,
+      patientId: `PT${ptNum}`,
+      villageCode: `VIL-${vilNum}`,
+      vitals: {
+        systolic,
+        diastolic,
+        spo2,
+        temperature: Number((tempTenths / 10).toFixed(1)),
+        heartRate,
+      },
+      symptoms,
+      anemiaSuspected: (aiMask & 0b01) !== 0,
+      respiratoryRiskHigh: (aiMask & 0b10) !== 0,
+      severity: sevCode === 3 ? 'emergency' : sevCode === 2 ? 'moderate' : 'routine',
+      checksumHex: `0x${receivedCrc.toString(16).toUpperCase().padStart(4, '0')}`,
+    };
+  }
+
+  return makeInvalid(
+    'Expected 21-byte bit-packed Base64 frame (32 chars) or HS#A8842#BP... format.'
+  );
 }
 
 export function buildFhirBundleFromDecoded(
