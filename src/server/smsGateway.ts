@@ -142,6 +142,10 @@ export async function dispatchEmergencySms(params: {
     const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(sid)}/Messages.json`;
     const authHeader = Buffer.from(`${sid}:${token}`).toString('base64');
 
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10_000);
+    timeoutId.unref?.();
+
     try {
       const form = new URLSearchParams({
         To: toPhone,
@@ -155,6 +159,7 @@ export async function dispatchEmergencySms(params: {
           'Content-Type': 'application/x-www-form-urlencoded',
         },
         body: form.toString(),
+        signal: controller.signal,
       });
       const rawTwilioText = await resp.text();
       let json: {sid?: string; message?: string} = {};
@@ -165,6 +170,7 @@ export async function dispatchEmergencySms(params: {
       }
       if (!resp.ok) {
         const errMsg = json.message || `Twilio HTTP ${resp.status}`;
+        console.warn(`[HealthSync SMS Fallback] Twilio carrier returned non-OK (${errMsg}); providing native SMS URI.`);
         const log = params.db.logSmsDispatch({
           recordId: params.recordId ?? null,
           toPhone: maskedPhone,
@@ -208,6 +214,7 @@ export async function dispatchEmergencySms(params: {
       };
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
+      console.warn(`[HealthSync SMS Fallback] Twilio network timeout/failure (${errMsg}); providing native SMS URI.`);
       const log = params.db.logSmsDispatch({
         recordId: params.recordId ?? null,
         toPhone: maskedPhone,
@@ -227,12 +234,18 @@ export async function dispatchEmergencySms(params: {
         statusMessage: `Twilio network failure: ${errMsg}`,
         dispatchLog: log,
       };
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 
   if (gateway.provider === 'fast2sms') {
     const apiKey = process.env.FAST2SMS_API_KEY!.trim();
     const digitsOnly = toPhone.replace(/\D/g, '').slice(-10);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10_000);
+    timeoutId.unref?.();
+
     try {
       const resp = await fetch('https://www.fast2sms.com/dev/bulkV2', {
         method: 'POST',
@@ -247,6 +260,7 @@ export async function dispatchEmergencySms(params: {
           flash: 0,
           numbers: digitsOnly,
         }),
+        signal: controller.signal,
       });
       const rawFastText = await resp.text();
       let json: {
@@ -267,6 +281,7 @@ export async function dispatchEmergencySms(params: {
         const errMsg = Array.isArray(json.message)
           ? json.message.join(', ')
           : json.message || `Fast2SMS HTTP ${resp.status}`;
+        console.warn(`[HealthSync SMS Fallback] Fast2SMS carrier returned non-OK (${errMsg}); providing native SMS URI.`);
         const log = params.db.logSmsDispatch({
           recordId: params.recordId ?? null,
           toPhone: maskedPhone,
@@ -310,6 +325,7 @@ export async function dispatchEmergencySms(params: {
       };
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
+      console.warn(`[HealthSync SMS Fallback] Fast2SMS network timeout/failure (${errMsg}); providing native SMS URI.`);
       const log = params.db.logSmsDispatch({
         recordId: params.recordId ?? null,
         toPhone: maskedPhone,
@@ -329,9 +345,14 @@ export async function dispatchEmergencySms(params: {
         statusMessage: `Fast2SMS network failure: ${errMsg}`,
         dispatchLog: log,
       };
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 
+  console.warn(
+    '[HealthSync SMS Fallback] Carrier credentials (TWILIO_* / FAST2SMS_API_KEY) not configured; returning native SMS app fallback.'
+  );
   // Honest unconfigured carrier state: logs payload in SQLite and provides native device sms: URI
   const log = params.db.logSmsDispatch({
     recordId: params.recordId ?? null,

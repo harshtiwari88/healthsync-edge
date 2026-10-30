@@ -145,20 +145,32 @@ export function useIsDesktopViewport(minWidthPx = 768): boolean {
     if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
       return true;
     }
-    return window.matchMedia(`(min-width: ${minWidthPx}px)`).matches;
+    try {
+      return Boolean(window.matchMedia(`(min-width: ${minWidthPx}px)`)?.matches);
+    } catch {
+      return true;
+    }
   });
 
   useEffect(() => {
     if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
       return;
     }
-    const mql = window.matchMedia(`(min-width: ${minWidthPx}px)`);
-    const onChange = (e: MediaQueryListEvent) => setIsDesktop(e.matches);
-    setIsDesktop(mql.matches);
-    mql.addEventListener('change', onChange);
-    return () => {
-      mql.removeEventListener('change', onChange);
-    };
+    try {
+      const mql = window.matchMedia(`(min-width: ${minWidthPx}px)`);
+      if (!mql) return;
+      const onChange = (e: MediaQueryListEvent) => setIsDesktop(Boolean(e?.matches));
+      setIsDesktop(Boolean(mql.matches));
+      if (typeof mql.addEventListener === 'function') {
+        mql.addEventListener('change', onChange);
+        return () => {
+          mql.removeEventListener('change', onChange);
+        };
+      }
+    } catch {
+      // Ignore non-standard matchMedia environments
+    }
+    return undefined;
   }, [minWidthPx]);
 
   return isDesktop;

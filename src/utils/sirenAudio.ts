@@ -14,31 +14,94 @@ class EmergencySirenEngine {
   private isPlayingLoop = false;
   private masterMuted = false;
   private activeTestBurst = false;
+  private gestureListenersAttached = false;
+  private userGestureUnlocked = false;
+  private pendingLoopAfterGesture = false;
 
-  private ensureContext(): AudioContext | null {
+  constructor() {
+    this.attachGestureUnlockListeners();
+  }
+
+  private attachGestureUnlockListeners(): void {
+    if (
+      this.gestureListenersAttached ||
+      typeof window === 'undefined' ||
+      typeof window.addEventListener !== 'function'
+    ) {
+      return;
+    }
+    this.gestureListenersAttached = true;
+
+    const onFirstGesture = () => {
+      this.userGestureUnlocked = true;
+      this.unlock();
+      if (this.pendingLoopAfterGesture && !this.masterMuted) {
+        this.pendingLoopAfterGesture = false;
+        this.startLoopingSiren();
+      }
+      window.removeEventListener('pointerdown', onFirstGesture);
+      window.removeEventListener('keydown', onFirstGesture);
+      window.removeEventListener('touchstart', onFirstGesture);
+    };
+
+    try {
+      window.addEventListener('pointerdown', onFirstGesture, {passive: true});
+      window.addEventListener('keydown', onFirstGesture, {passive: true});
+      window.addEventListener('touchstart', onFirstGesture, {passive: true});
+    } catch {
+      // Ignore event listener attachment issues in restricted environments
+    }
+  }
+
+  private ensureContext(fromUserGesture = false): AudioContext | null {
     if (typeof window === 'undefined') return null;
+    if (fromUserGesture) {
+      this.userGestureUnlocked = true;
+    }
+
     const Ctor: AudioContextConstructor | undefined =
       window.AudioContext ||
       (window as unknown as {webkitAudioContext?: AudioContextConstructor}).webkitAudioContext;
     if (!Ctor) return null;
 
-    if (!this.ctx) {
-      this.ctx = new Ctor();
+    // Avoid creating a suspended AudioContext before user interaction when real browser event listeners exist
+    if (
+      !this.ctx &&
+      !fromUserGesture &&
+      !this.userGestureUnlocked &&
+      typeof window.addEventListener === 'function'
+    ) {
+      return null;
     }
-    if (this.ctx.state === 'suspended') {
-      this.ctx.resume().catch(() => {});
+
+    try {
+      if (!this.ctx || this.ctx.state === 'closed') {
+        this.ctx = new Ctor();
+      }
+      if (this.ctx.state === 'suspended' && typeof this.ctx.resume === 'function') {
+        const resumeResult = this.ctx.resume();
+        if (resumeResult && typeof resumeResult.catch === 'function') {
+          resumeResult.catch(() => {
+            // Autoplay policy still waiting for user gesture; handled cleanly
+          });
+        }
+      }
+      return this.ctx;
+    } catch (err) {
+      console.warn('[SwasthyaSetu Audio] AudioContext initialization deferred until user gesture:', err);
+      return null;
     }
-    return this.ctx;
   }
 
   public unlock(): boolean {
-    const ctx = this.ensureContext();
+    const ctx = this.ensureContext(true);
     return Boolean(ctx);
   }
 
   public setMasterMuted(muted: boolean) {
     this.masterMuted = muted;
     if (muted) {
+      this.pendingLoopAfterGesture = false;
       this.stopSiren();
     }
   }
@@ -59,8 +122,12 @@ class EmergencySirenEngine {
     if (this.masterMuted) return;
     if (this.isPlayingLoop) return;
 
-    const ctx = this.ensureContext();
-    if (!ctx) return;
+    const ctx = this.ensureContext(false);
+    if (!ctx) {
+      // Queue siren to start automatically on next user tap/click without throwing DOMException
+      this.pendingLoopAfterGesture = true;
+      return;
+    }
 
     try {
       const osc = ctx.createOscillator();
@@ -79,24 +146,33 @@ class EmergencySirenEngine {
       this.isPlayingLoop = true;
 
       let highTone = true;
-      this.sweepInterval = window.setInterval(() => {
-        if (!this.ctx || !this.osc || this.masterMuted) {
-          this.stopSiren();
-          return;
-        }
-        const now = this.ctx.currentTime;
-        const targetHz = highTone ? 960 : 660;
-        this.osc.frequency.exponentialRampToValueAtTime(targetHz, now + 0.32);
-        highTone = !highTone;
-      }, 380);
+      if (typeof window !== 'undefined' && typeof window.setInterval === 'function') {
+        this.sweepInterval = window.setInterval(() => {
+          if (!this.ctx || !this.osc || this.masterMuted) {
+            this.stopSiren();
+            return;
+          }
+          try {
+            const now = this.ctx.currentTime;
+            const targetHz = highTone ? 960 : 660;
+            this.osc.frequency.exponentialRampToValueAtTime(targetHz, now + 0.32);
+            highTone = !highTone;
+          } catch {
+            this.stopSiren();
+          }
+        }, 380);
+      }
     } catch {
       this.isPlayingLoop = false;
     }
   }
 
   public stopSiren() {
-    if (this.sweepInterval !== null) {
+    this.pendingLoopAfterGesture = false;
+    if (this.sweepInterval !== null && typeof window !== 'undefined' && typeof window.clearInterval === 'function') {
       window.clearInterval(this.sweepInterval);
+      this.sweepInterval = null;
+    } else {
       this.sweepInterval = null;
     }
     if (this.gain && this.ctx) {
@@ -132,7 +208,7 @@ class EmergencySirenEngine {
    */
   public playTestSirenBurst() {
     if (this.activeTestBurst) return; // Prevent overlapping oscillator stacking
-    const ctx = this.ensureContext();
+    const ctx = this.ensureContext(true);
     if (!ctx) return;
 
     try {

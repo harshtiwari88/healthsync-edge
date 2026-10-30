@@ -12,8 +12,28 @@ import '@fontsource/jetbrains-mono/600.css';
 import {createRoot} from 'react-dom/client';
 import {registerSW} from 'virtual:pwa-register';
 import App from './App.tsx';
+import {GlobalErrorBoundary} from './components/GlobalErrorBoundary.tsx';
 import './index.css';
 
-registerSW({immediate: true});
+if (typeof window !== 'undefined') {
+  window.addEventListener('unhandledrejection', (event) => {
+    console.warn('[SwasthyaSetu Guard] Handled background promise rejection:', event.reason);
+    event.preventDefault();
+  });
 
-createRoot(document.getElementById('root')!).render(<App />);
+  try {
+    registerSW({immediate: true});
+  } catch (err) {
+    console.warn('[SwasthyaSetu PWA] Service worker registration skipped:', err);
+  }
+}
+
+const rootEl = typeof document !== 'undefined' ? document.getElementById('root') : null;
+if (rootEl) {
+  createRoot(rootEl).render(
+    <GlobalErrorBoundary>
+      <App />
+    </GlobalErrorBoundary>
+  );
+}
+

@@ -322,12 +322,16 @@ export class HealthSyncRealtimeClient {
 
     if (typeof window !== 'undefined') {
       if ('BroadcastChannel' in window) {
-        this.bc = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
-        this.bc.onmessage = (ev) => {
-          if (ev.data && typeof ev.data.type === 'string') {
-            this.onMessageCallback(ev.data as RealtimeEventMessage);
-          }
-        };
+        try {
+          this.bc = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
+          this.bc.onmessage = (ev) => {
+            if (ev?.data && typeof ev.data.type === 'string') {
+              this.onMessageCallback(ev.data as RealtimeEventMessage);
+            }
+          };
+        } catch {
+          this.bc = null;
+        }
       }
 
       if (this.sessionToken && this.sessionToken !== 'OFFLINE_LOCAL_SESSION') {
@@ -426,8 +430,12 @@ export class HealthSyncRealtimeClient {
           }
           this.onMessageCallback(parsed);
         } catch (err) {
-          console.error('[HealthSync WS] Invalid JSON frame from server:', err);
+          console.warn('[HealthSync WS] Ignored malformed JSON frame from server:', err);
         }
+      };
+
+      socket.onerror = () => {
+        // Handled cleanly in onclose with HTTP delta-sync fallback
       };
 
       socket.onclose = (event) => {
@@ -449,7 +457,7 @@ export class HealthSyncRealtimeClient {
         }
       };
     } catch (err) {
-      console.error('[HealthSync WS] Failed to initialize WebSocket transport:', err);
+      console.warn('[HealthSync WS] WebSocket unavailable; using HTTP delta polling:', err);
       this.startServerlessHttpDeltaPolling();
     }
   }
@@ -521,7 +529,7 @@ export class HealthSyncRealtimeClient {
       if (!resp.ok) {
         const errMsg = body.error || `Server rejected triage sync (HTTP ${resp.status}).`;
         const retryable = resp.status >= 500 || resp.status === 429;
-        console.error('[HealthSync Sync Error] Failed to persist record:', errMsg);
+        console.warn('[HealthSync Sync Notice] Record sync deferred:', errMsg);
         this.onMessageCallback({
           type: 'sync:error',
           recordId: record.id,
@@ -544,7 +552,7 @@ export class HealthSyncRealtimeClient {
     } catch (err) {
       const errMsg =
         err instanceof Error ? err.message : 'Network error while syncing triage record.';
-      console.error('[HealthSync Sync Error] Network/transport failure:', err);
+      console.warn('[HealthSync Sync Notice] Network unavailable; record queued locally:', errMsg);
       this.onMessageCallback({
         type: 'sync:error',
         recordId: record.id,

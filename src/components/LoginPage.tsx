@@ -57,20 +57,23 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
 
   useEffect(() => {
     if (networkState === 'offline') return;
-    let cancelled = false;
-    fetch('/api/auth/status')
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 6000);
+    fetch('/api/auth/status', {signal: controller.signal})
       .then(async (r) => {
         if (!r.ok) return null;
         await safeReadJson<{status?: string}>(r);
         return null;
       })
       .catch(() => {
-        if (!cancelled) {
-          // Offline / unreachable status probe ignored gracefully
-        }
+        // Offline / unreachable status probe ignored gracefully
+      })
+      .finally(() => {
+        window.clearTimeout(timeoutId);
       });
     return () => {
-      cancelled = true;
+      window.clearTimeout(timeoutId);
+      controller.abort();
     };
   }, [networkState]);
 
@@ -237,8 +240,8 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
         return;
       }
 
-      const data = parsed.data || {};
-      if (!resp.ok || !data.token || !data.user) {
+      const data = parsed?.data || {};
+      if (!resp.ok || !data?.token || !data?.user) {
         if (
           authMode === 'LOGIN' &&
           activeRole === 'ASHA' &&
@@ -250,35 +253,47 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
             role: 'ASHA',
             secret,
           });
-          const syncRegResp = await fetch('/api/auth/register', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({
-              identifier: verifiedLocal.user.identifier,
-              secret,
-              role: 'ASHA',
-              displayName: verifiedLocal.user.displayName,
-              villageCode: verifiedLocal.user.villageCode,
-            }),
-          });
-          const syncParsed = await safeReadJson<{
-            token?: string;
-            user?: {
-              identifier: string;
-              role: 'ASHA' | 'DMO';
-              displayName: string;
-              villageCode: string;
-              isVerified?: boolean;
-            };
-          }>(syncRegResp);
-          if (syncRegResp.ok && syncParsed.isJson && syncParsed.data?.token && syncParsed.data?.user) {
-            onAuthenticated({
-              token: syncParsed.data.token,
-              user: syncParsed.data.user,
-              vaultKey: verifiedLocal.vaultKey,
-              salt: verifiedLocal.salt,
+          try {
+            const syncRegResp = await fetch('/api/auth/register', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({
+                identifier: verifiedLocal.user.identifier,
+                secret,
+                role: 'ASHA',
+                displayName: verifiedLocal.user.displayName,
+                villageCode: verifiedLocal.user.villageCode,
+              }),
             });
-            return;
+            const syncParsed = await safeReadJson<{
+              token?: string;
+              user?: {
+                identifier: string;
+                role: 'ASHA' | 'DMO';
+                displayName: string;
+                villageCode: string;
+                isVerified?: boolean;
+              };
+            }>(syncRegResp);
+            if (
+              syncRegResp.ok &&
+              syncParsed.isJson &&
+              syncParsed.data?.token &&
+              syncParsed.data?.user
+            ) {
+              onAuthenticated({
+                token: syncParsed.data.token,
+                user: syncParsed.data.user,
+                vaultKey: verifiedLocal.vaultKey,
+                salt: verifiedLocal.salt,
+              });
+              return;
+            }
+          } catch (syncErr) {
+            console.warn(
+              '[SwasthyaSetu Auth] Auto-registration sync skipped; continuing with local vault session:',
+              syncErr
+            );
           }
           onAuthenticated({
             token: 'OFFLINE_LOCAL_SESSION',
@@ -288,20 +303,28 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
           });
           return;
         }
-        throw new Error(data.error || 'Could not sign in. Please check your ID and passcode.');
+        throw new Error(data?.error || 'Could not sign in. Please check your ID and passcode.');
       }
 
+      const safeUser = {
+        identifier: data.user?.identifier || cleanId,
+        role: data.user?.role || activeRole,
+        displayName: data.user?.displayName || displayName.trim() || cleanId,
+        villageCode: data.user?.villageCode || villageCode.trim() || 'VIL-204',
+        isVerified: data.user?.isVerified,
+      };
+
       const {vaultKey, salt} = await saveOfflineLoginVerifier({
-        identifier: data.user.identifier,
-        role: data.user.role,
-        displayName: data.user.displayName,
-        villageCode: data.user.villageCode,
+        identifier: safeUser.identifier,
+        role: safeUser.role,
+        displayName: safeUser.displayName,
+        villageCode: safeUser.villageCode,
         secret,
       });
 
       onAuthenticated({
         token: data.token,
-        user: data.user,
+        user: safeUser,
         vaultKey,
         salt,
       });

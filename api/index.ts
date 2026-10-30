@@ -8,19 +8,23 @@ export function resetServerlessInstanceForTests(): void {
 }
 
 export default async function handler(req: IncomingMessage, res: ServerResponse) {
-  if (req.url) {
-    const parsed = new URL(req.url, 'http://localhost');
-    const rewrittenSubpath = parsed.searchParams.get('__hs_path');
-    if (rewrittenSubpath !== null) {
-      parsed.searchParams.delete('__hs_path');
-      const restQuery = parsed.searchParams.toString();
-      if (parsed.pathname === '/api/index' || parsed.pathname === '/api') {
-        const cleanSubpath = rewrittenSubpath.replace(/^\/+/, '');
-        req.url = `/api/${cleanSubpath}${restQuery ? `?${restQuery}` : ''}`;
-      } else {
-        req.url = `${parsed.pathname}${restQuery ? `?${restQuery}` : ''}`;
+  try {
+    if (req.url) {
+      const parsed = new URL(req.url, 'http://localhost');
+      const rewrittenSubpath = parsed.searchParams.get('__hs_path');
+      if (rewrittenSubpath !== null) {
+        parsed.searchParams.delete('__hs_path');
+        const restQuery = parsed.searchParams.toString();
+        if (parsed.pathname === '/api/index' || parsed.pathname === '/api') {
+          const cleanSubpath = rewrittenSubpath.replace(/^\/+/, '');
+          req.url = `/api/${cleanSubpath}${restQuery ? `?${restQuery}` : ''}`;
+        } else {
+          req.url = `${parsed.pathname}${restQuery ? `?${restQuery}` : ''}`;
+        }
       }
     }
+  } catch (urlErr) {
+    console.warn('[HealthSync Serverless] Malformed request URL normalized safely:', urlErr);
   }
 
   try {
@@ -33,13 +37,18 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
     serverPromise = null;
     const message =
       err instanceof Error ? err.message : 'Server initialization error on serverless runtime.';
-    res.statusCode = 503;
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    res.end(
-      JSON.stringify({
-        error: message,
-        code: err instanceof Error ? err.name : 'SERVER_INIT_ERROR',
-      })
-    );
+    console.warn('[HealthSync Serverless] Initialization fallback response:', message);
+    if (!res.headersSent) {
+      res.statusCode = 503;
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.end(
+        JSON.stringify({
+          success: false,
+          isDemoFallback: true,
+          error: message,
+          code: err instanceof Error ? err.name : 'SERVER_INIT_ERROR',
+        })
+      );
+    }
   }
 }

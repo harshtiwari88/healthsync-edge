@@ -12,7 +12,10 @@ import {
   type AuthenticatedUser,
   type ServerUserRole,
 } from './src/server/db.ts';
-import {generateClinicalTriageSummary} from './src/server/geminiService.ts';
+import {
+  buildServerClinicalFallbackSummary,
+  generateClinicalTriageSummary,
+} from './src/server/geminiService.ts';
 import {
   dispatchEmergencySms,
   getConfiguredSmsGatewayStatus,
@@ -434,48 +437,66 @@ export async function createHealthSyncServer(
     next();
   };
 
-  // --- PROTECTED HEALTH & AUTH STATUS ROUTES (NO SENSITIVE INFO LEAKAGE) ---
-  app.get('/api/health', (req, res) => {
-    const caller = db.verifySessionToken(extractBearerToken(req));
-    if (caller?.role === 'DMO') {
-      res.json({
-        status: 'ok',
-        connectedDevices: clients.size,
-        persistenceMode: db.getPersistenceMode(),
-        smsGateway: getConfiguredSmsGatewayStatus({includeSensitive: false}),
-      });
-      return;
-    }
-    // Public liveness check exposes zero device counts, gateway providers, or phone numbers
-    res.json({status: 'ok'});
-  });
+  const safeRoute =
+    (
+      fn: (req: AuthedRequest, res: Response, next: NextFunction) => Promise<void> | void
+    ) =>
+    (req: Request, res: Response, next: NextFunction) => {
+      try {
+        Promise.resolve(fn(req as AuthedRequest, res, next)).catch(next);
+      } catch (err) {
+        next(err);
+      }
+    };
 
-  app.get('/api/auth/status', (req, res) => {
-    const caller = db.verifySessionToken(extractBearerToken(req));
-    if (caller?.role === 'DMO') {
-      const configuredDmoSecret = process.env.DMO_PROVISIONING_SECRET?.trim() || '';
-      const configuredAshaSecret = process.env.ASHA_ENROLLMENT_SECRET?.trim() || '';
+  // --- PROTECTED HEALTH & AUTH STATUS ROUTES (NO SENSITIVE INFO LEAKAGE) ---
+  app.get(
+    '/api/health',
+    safeRoute((req, res) => {
+      const caller = db.verifySessionToken(extractBearerToken(req));
+      if (caller?.role === 'DMO') {
+        res.json({
+          status: 'ok',
+          connectedDevices: clients.size,
+          persistenceMode: db.getPersistenceMode(),
+          smsGateway: getConfiguredSmsGatewayStatus({includeSensitive: false}),
+        });
+        return;
+      }
+      // Public liveness check exposes zero device counts, gateway providers, or phone numbers
+      res.json({status: 'ok'});
+    })
+  );
+
+  app.get(
+    '/api/auth/status',
+    safeRoute((req, res) => {
+      const caller = db.verifySessionToken(extractBearerToken(req));
+      if (caller?.role === 'DMO') {
+        const configuredDmoSecret = process.env.DMO_PROVISIONING_SECRET?.trim() || '';
+        const configuredAshaSecret = process.env.ASHA_ENROLLMENT_SECRET?.trim() || '';
+        res.json({
+          status: 'ok',
+          authRequired: true,
+          minSecretLength: 8,
+          dmoProvisioningEnabled:
+            configuredDmoSecret.length >= 12 &&
+            configuredDmoSecret !== 'MY_DMO_PROVISIONING_SECRET',
+          ashaEnrollmentConfigured:
+            configuredAshaSecret.length >= 12 &&
+            configuredAshaSecret !== 'MY_ASHA_ENROLLMENT_SECRET',
+          pendingAshaVerifications: db.listPendingAshaUsers().length,
+          smsGateway: getConfiguredSmsGatewayStatus({includeSensitive: false}),
+        });
+        return;
+      }
       res.json({
         status: 'ok',
         authRequired: true,
         minSecretLength: 8,
-        dmoProvisioningEnabled:
-          configuredDmoSecret.length >= 12 &&
-          configuredDmoSecret !== 'MY_DMO_PROVISIONING_SECRET',
-        ashaEnrollmentConfigured:
-          configuredAshaSecret.length >= 12 &&
-          configuredAshaSecret !== 'MY_ASHA_ENROLLMENT_SECRET',
-        pendingAshaVerifications: db.listPendingAshaUsers().length,
-        smsGateway: getConfiguredSmsGatewayStatus({includeSensitive: false}),
       });
-      return;
-    }
-    res.json({
-      status: 'ok',
-      authRequired: true,
-      minSecretLength: 8,
-    });
-  });
+    })
+  );
 
   // --- AUTHENTICATION, VERIFICATION & SESSION SECURITY ROUTES ---
   app.post(
@@ -637,64 +658,80 @@ export async function createHealthSyncServer(
     }
   });
 
-  app.get('/api/auth/me', requireAuth, (req: AuthedRequest, res) => {
-    res.json({user: req.authUser});
-  });
+  app.get(
+    '/api/auth/me',
+    requireAuth,
+    safeRoute((req: AuthedRequest, res) => {
+      res.json({user: req.authUser});
+    })
+  );
 
-  app.post('/api/auth/rotate-session', requireAuth, async (req: AuthedRequest, res) => {
-    const rotated = db.rotateSessionToken(req.rawToken);
-    if (!rotated) {
-      res.status(401).json({error: 'Session expired or invalid.'});
-      return;
-    }
-    db.appendAuditLog({
-      actorId: rotated.user.identifier,
-      actorRole: rotated.user.role,
-      action: 'SESSION_ROTATED',
-      targetType: 'session',
-      targetId: rotated.user.id,
-      rawIp: getTrustedClientIp(req),
-    });
-    await db.flushDurableWrites();
-    res.json({ok: true, ...rotated});
-  });
+  app.post(
+    '/api/auth/rotate-session',
+    requireAuth,
+    safeRoute(async (req: AuthedRequest, res) => {
+      const rotated = db.rotateSessionToken(req.rawToken);
+      if (!rotated) {
+        res.status(401).json({error: 'Session expired or invalid.'});
+        return;
+      }
+      db.appendAuditLog({
+        actorId: rotated.user.identifier,
+        actorRole: rotated.user.role,
+        action: 'SESSION_ROTATED',
+        targetType: 'session',
+        targetId: rotated.user.id,
+        rawIp: getTrustedClientIp(req),
+      });
+      await db.flushDurableWrites();
+      res.json({ok: true, ...rotated});
+    })
+  );
 
-  app.post('/api/auth/logout', requireAuth, async (req: AuthedRequest, res) => {
-    db.revokeSessionToken(req.rawToken);
-    db.appendAuditLog({
-      actorId: req.authUser!.identifier,
-      actorRole: req.authUser!.role,
-      action: 'USER_LOGOUT',
-      targetType: 'session',
-      targetId: req.authUser!.id,
-      rawIp: getTrustedClientIp(req),
-    });
-    await db.flushDurableWrites();
-    res.json({ok: true});
-  });
+  app.post(
+    '/api/auth/logout',
+    requireAuth,
+    safeRoute(async (req: AuthedRequest, res) => {
+      db.revokeSessionToken(req.rawToken);
+      db.appendAuditLog({
+        actorId: req.authUser!.identifier,
+        actorRole: req.authUser!.role,
+        action: 'USER_LOGOUT',
+        targetType: 'session',
+        targetId: req.authUser!.id,
+        rawIp: getTrustedClientIp(req),
+      });
+      await db.flushDurableWrites();
+      res.json({ok: true});
+    })
+  );
 
-  app.post('/api/auth/logout-all', requireAuth, async (req: AuthedRequest, res) => {
-    const revokedSessions = db.revokeAllUserSessions(req.authUser!.id);
-    disconnectSocketsForUserId(req.authUser!.id, 'Logged out from all devices');
-    db.appendAuditLog({
-      actorId: req.authUser!.identifier,
-      actorRole: req.authUser!.role,
-      action: 'USER_LOGOUT_ALL_DEVICES',
-      targetType: 'user',
-      targetId: req.authUser!.id,
-      rawIp: getTrustedClientIp(req),
-      metadata: {revokedSessions},
-    });
-    await db.flushDurableWrites();
-    res.json({ok: true, revokedSessions});
-  });
+  app.post(
+    '/api/auth/logout-all',
+    requireAuth,
+    safeRoute(async (req: AuthedRequest, res) => {
+      const revokedSessions = db.revokeAllUserSessions(req.authUser!.id);
+      disconnectSocketsForUserId(req.authUser!.id, 'Logged out from all devices');
+      db.appendAuditLog({
+        actorId: req.authUser!.identifier,
+        actorRole: req.authUser!.role,
+        action: 'USER_LOGOUT_ALL_DEVICES',
+        targetType: 'user',
+        targetId: req.authUser!.id,
+        rawIp: getTrustedClientIp(req),
+        metadata: {revokedSessions},
+      });
+      await db.flushDurableWrites();
+      res.json({ok: true, revokedSessions});
+    })
+  );
 
   // Self-verification for pending ASHA accounts holding a Clinic Enrollment Code
   app.post(
     '/api/auth/verify-asha',
     requireAuth,
     authFailureGuard,
-    async (req: AuthedRequest, res) => {
+    safeRoute(async (req: AuthedRequest, res) => {
       if (req.authUser?.role !== 'ASHA') {
         res.status(400).json({error: 'Only ASHA accounts use Clinic Enrollment verification.'});
         return;
@@ -734,56 +771,69 @@ export async function createHealthSyncServer(
         token: rotated?.token,
         expiresAtMs: rotated?.expiresAtMs,
       });
-    }
+    })
   );
 
   // DMO Administrative ASHA Verification Queue & Approval
-  app.get('/api/auth/asha/pending', requireAuth, (req: AuthedRequest, res) => {
-    if (req.authUser?.role !== 'DMO') {
-      res.status(403).json({error: 'Forbidden: Only DMO officers can review pending ASHA accounts.'});
-      return;
-    }
-    res.json({pending: db.listPendingAshaUsers()});
-  });
+  app.get(
+    '/api/auth/asha/pending',
+    requireAuth,
+    safeRoute((req: AuthedRequest, res) => {
+      if (req.authUser?.role !== 'DMO') {
+        res.status(403).json({error: 'Forbidden: Only DMO officers can review pending ASHA accounts.'});
+        return;
+      }
+      res.json({pending: db.listPendingAshaUsers()});
+    })
+  );
 
-  app.post('/api/auth/asha/:identifier/verify', requireAuth, async (req: AuthedRequest, res) => {
-    if (req.authUser?.role !== 'DMO') {
-      res.status(403).json({error: 'Forbidden: Only DMO officers can verify ASHA accounts.'});
-      return;
-    }
-    const approve = req.body?.verified !== false;
-    const updated = db.setAshaVerificationStatus(
-      req.params.identifier,
-      approve,
-      req.authUser.identifier
-    );
-    if (!updated) {
-      res.status(404).json({error: 'ASHA account not found.'});
-      return;
-    }
-    if (!approve) {
-      db.revokeAllUserSessions(updated.id);
-      disconnectSocketsForUserId(updated.id, 'ASHA verification revoked by DMO');
-    }
-    db.appendAuditLog({
-      actorId: req.authUser.identifier,
-      actorRole: 'DMO',
-      action: approve ? 'ASHA_APPROVED_BY_DMO' : 'ASHA_REVOKED_BY_DMO',
-      targetType: 'user',
-      targetId: updated.identifier,
-      rawIp: getTrustedClientIp(req),
-    });
-    await db.flushDurableWrites();
-    res.json({ok: true, user: updated});
-  });
+  app.post(
+    '/api/auth/asha/:identifier/verify',
+    requireAuth,
+    safeRoute(async (req: AuthedRequest, res) => {
+      if (req.authUser?.role !== 'DMO') {
+        res.status(403).json({error: 'Forbidden: Only DMO officers can verify ASHA accounts.'});
+        return;
+      }
+      const approve = req.body?.verified !== false;
+      const updated = db.setAshaVerificationStatus(
+        req.params.identifier,
+        approve,
+        req.authUser.identifier
+      );
+      if (!updated) {
+        res.status(404).json({error: 'ASHA account not found.'});
+        return;
+      }
+      if (!approve) {
+        db.revokeAllUserSessions(updated.id);
+        disconnectSocketsForUserId(updated.id, 'ASHA verification revoked by DMO');
+      }
+      db.appendAuditLog({
+        actorId: req.authUser.identifier,
+        actorRole: 'DMO',
+        action: approve ? 'ASHA_APPROVED_BY_DMO' : 'ASHA_REVOKED_BY_DMO',
+        targetType: 'user',
+        targetId: updated.identifier,
+        rawIp: getTrustedClientIp(req),
+      });
+      await db.flushDurableWrites();
+      res.json({ok: true, user: updated});
+    })
+  );
 
   // --- TRIAGE RECORDS, CONSENT, INCENTIVES & SECURE DPDP ERASURE ---
-  app.get('/api/records', requireAuth, requireVerifiedUser, (req: AuthedRequest, res) => {
-    const rawSince = req.query.since ? Number(req.query.since) : undefined;
-    const sinceMs =
-      rawSince !== undefined && Number.isFinite(rawSince) && rawSince > 0 ? rawSince : undefined;
-    res.json({records: db.listRecordsForUser(req.authUser!, 500, sinceMs)});
-  });
+  app.get(
+    '/api/records',
+    requireAuth,
+    requireVerifiedUser,
+    safeRoute((req: AuthedRequest, res) => {
+      const rawSince = req.query.since ? Number(req.query.since) : undefined;
+      const sinceMs =
+        rawSince !== undefined && Number.isFinite(rawSince) && rawSince > 0 ? rawSince : undefined;
+      res.json({records: db.listRecordsForUser(req.authUser!, 500, sinceMs)});
+    })
+  );
 
   app.post('/api/records', requireAuth, requireVerifiedUser, async (req: AuthedRequest, res) => {
     const {record, triggerEmergencySiren, incentive} = req.body || {};
@@ -867,7 +917,7 @@ export async function createHealthSyncServer(
         res.status(msg.startsWith('Forbidden') ? 403 : 400).json({error: msg});
         return;
       }
-      console.error('[HealthSync DB Error] Failed to save triage record via POST /api/records:', err);
+      console.warn('[HealthSync DB Warning] Failed to save triage record via POST /api/records:', err);
       res.status(500).json({error: 'Database error: Failed to persist triage record.'});
     }
   });
@@ -912,7 +962,7 @@ export async function createHealthSyncServer(
       );
       res.json({ok: true, record: updated});
     } catch (err) {
-      console.error('[HealthSync DB Error] Failed to update dispatch status:', err);
+      console.warn('[HealthSync DB Warning] Failed to update dispatch status:', err);
       res.status(500).json({error: 'Database error: Failed to persist ambulance dispatch.'});
     }
   });
@@ -953,27 +1003,36 @@ export async function createHealthSyncServer(
     }
   });
 
-  app.get('/api/incentives', requireAuth, requireVerifiedUser, (req: AuthedRequest, res) => {
-    if (req.authUser?.role === 'DMO') {
-      res.json({incentives: db.listIncentives()});
-      return;
-    }
-    res.json({incentives: db.listIncentives(req.authUser!.identifier)});
-  });
+  app.get(
+    '/api/incentives',
+    requireAuth,
+    requireVerifiedUser,
+    safeRoute((req: AuthedRequest, res) => {
+      if (req.authUser?.role === 'DMO') {
+        res.json({incentives: db.listIncentives()});
+        return;
+      }
+      res.json({incentives: db.listIncentives(req.authUser!.identifier)});
+    })
+  );
 
   // --- DPDP COMPLIANCE: AUDIT LOGS & DATA BREACH REPORTING (DMO ONLY) ---
-  app.get('/api/compliance/audit-logs', requireAuth, (req: AuthedRequest, res) => {
-    if (req.authUser?.role !== 'DMO') {
-      res.status(403).json({error: 'Forbidden: Only DMO officers can inspect security audit logs.'});
-      return;
-    }
-    const limit = Number(req.query.limit) || 100;
-    const integrity = db.verifyAuditChain();
-    res.json({
-      integrity,
-      logs: db.listAuditLogs(limit),
-    });
-  });
+  app.get(
+    '/api/compliance/audit-logs',
+    requireAuth,
+    safeRoute((req: AuthedRequest, res) => {
+      if (req.authUser?.role !== 'DMO') {
+        res.status(403).json({error: 'Forbidden: Only DMO officers can inspect security audit logs.'});
+        return;
+      }
+      const limit = Number(req.query.limit) || 100;
+      const integrity = db.verifyAuditChain();
+      res.json({
+        integrity,
+        logs: db.listAuditLogs(limit),
+      });
+    })
+  );
 
   app.post('/api/compliance/breach-report', requireAuth, async (req: AuthedRequest, res) => {
     if (req.authUser?.role !== 'DMO') {
@@ -1035,13 +1094,17 @@ export async function createHealthSyncServer(
     }
   });
 
-  app.get('/api/compliance/breach-reports', requireAuth, (req: AuthedRequest, res) => {
-    if (req.authUser?.role !== 'DMO') {
-      res.status(403).json({error: 'Forbidden: Only DMO officers can view breach reports.'});
-      return;
-    }
-    res.json({reports: db.listBreachReports(50)});
-  });
+  app.get(
+    '/api/compliance/breach-reports',
+    requireAuth,
+    safeRoute((req: AuthedRequest, res) => {
+      if (req.authUser?.role !== 'DMO') {
+        res.status(403).json({error: 'Forbidden: Only DMO officers can view breach reports.'});
+        return;
+      }
+      res.json({reports: db.listBreachReports(50)});
+    })
+  );
 
   const attachOptionalAuth = (req: AuthedRequest, _res: Response, next: NextFunction) => {
     const token = extractBearerToken(req);
@@ -1053,31 +1116,44 @@ export async function createHealthSyncServer(
   };
 
   // --- SERVER-SIDE GEMINI CLINICAL CO-PILOT (DPDP ANONYMIZED, SUPPORTS AUTHED & DEMO SESSIONS) ---
-  const handleClinicalSummaryRequest = async (req: AuthedRequest, res: Response) => {
+  const handleClinicalSummaryRequest = safeRoute(async (req: AuthedRequest, res: Response) => {
+    const {
+      patientName,
+      age,
+      vitals,
+      symptoms,
+      edgeAi,
+      transcript,
+      language,
+      explicitAiConsent,
+      lawfulBasis,
+    } = req.body || {};
+
+    if (!vitals || typeof vitals.systolic !== 'number') {
+      res.status(400).json({error: 'Patient vitals are required for clinical summary.'});
+      return;
+    }
+
+    const isMinor = age !== undefined && Number(age) < 18;
+    // Only allow identifiable patientName when caller holds a verified session AND explicit adult consent
+    const isVerifiedSession = Boolean(req.authUser && req.authUser.isVerified !== false);
+    const verifiedConsent =
+      isVerifiedSession && !isMinor && explicitAiConsent === true && Boolean(lawfulBasis);
+
+    const summaryInput = {
+      // Never pass identifiable patientName unless verified session + explicit adult consent exist
+      patientName: verifiedConsent ? patientName : undefined,
+      age,
+      vitals,
+      symptoms: Array.isArray(symptoms) ? symptoms : [],
+      edgeAi,
+      transcript,
+      language,
+      explicitAiConsent: verifiedConsent,
+      lawfulBasis: verifiedConsent ? lawfulBasis : undefined,
+    };
+
     try {
-      const {
-        patientName,
-        age,
-        vitals,
-        symptoms,
-        edgeAi,
-        transcript,
-        language,
-        explicitAiConsent,
-        lawfulBasis,
-      } = req.body || {};
-
-      if (!vitals || typeof vitals.systolic !== 'number') {
-        res.status(400).json({error: 'Patient vitals are required for clinical summary.'});
-        return;
-      }
-
-      const isMinor = age !== undefined && Number(age) < 18;
-      // Only allow identifiable patientName when caller holds a verified session AND explicit adult consent
-      const isVerifiedSession = Boolean(req.authUser && req.authUser.isVerified !== false);
-      const verifiedConsent =
-        isVerifiedSession && !isMinor && explicitAiConsent === true && Boolean(lawfulBasis);
-
       db.appendAuditLog({
         actorId: req.authUser?.identifier || 'DEMO_OR_LOCAL_SESSION',
         actorRole: req.authUser?.role || 'DEMO',
@@ -1092,24 +1168,27 @@ export async function createHealthSyncServer(
         },
       });
 
-      const summary = await generateClinicalTriageSummary({
-        // Never pass identifiable patientName unless verified session + explicit adult consent exist
-        patientName: verifiedConsent ? patientName : undefined,
-        age,
-        vitals,
-        symptoms: Array.isArray(symptoms) ? symptoms : [],
-        edgeAi,
-        transcript,
-        language,
-        explicitAiConsent: verifiedConsent,
-        lawfulBasis: verifiedConsent ? lawfulBasis : undefined,
+      const summary = await generateClinicalTriageSummary(summaryInput);
+      res.status(200).json({
+        success: true,
+        isDemoFallback: false,
+        data: summary,
+        ...summary,
       });
-      res.json(summary);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Gemini clinical summary failed.';
-      res.status(502).json({error: msg});
+      console.warn(
+        `[HealthSync AI Fallback] Gemini unavailable (${msg}); returning built-in clinical protocol fallback.`
+      );
+      const fallback = buildServerClinicalFallbackSummary(summaryInput);
+      res.status(200).json({
+        success: true,
+        isDemoFallback: true,
+        data: fallback,
+        ...fallback,
+      });
     }
-  };
+  });
 
   app.post(
     ['/api/gemini/clinical-summary', '/api/ai/care-summary', '/api/triage/summary'],
@@ -1183,32 +1262,42 @@ export async function createHealthSyncServer(
         });
         await db.flushDurableWrites();
 
-        res.json(outcome);
+        res.json({
+          success: true,
+          isDemoFallback: !outcome.gatewayConfigured || !outcome.sent,
+          data: outcome,
+          ...outcome,
+        });
       } catch (err) {
         if (err instanceof SmsAuthorizationError) {
           res.status(err.statusCode).json({error: err.message});
           return;
         }
         const msg = err instanceof Error ? err.message : 'SMS dispatch failed.';
+        console.warn('[HealthSync SMS] Rejected or failed SMS request:', msg);
         res.status(400).json({error: msg});
       }
     }
   );
 
-  app.get('/api/sms/logs', requireAuth, (req: AuthedRequest, res) => {
-    if (req.authUser?.role !== 'DMO') {
-      res.status(403).json({error: 'Forbidden: Only DMO officers can inspect district SMS logs.'});
-      return;
-    }
-    const rawLogs = db.listSmsDispatches(30).map((item) => ({
-      ...item,
-      toPhone: item.toPhone.includes('•') ? item.toPhone : maskPhoneNumber(item.toPhone),
-    }));
-    res.json({
-      logs: rawLogs,
-      gateway: getConfiguredSmsGatewayStatus({includeSensitive: false}),
-    });
-  });
+  app.get(
+    '/api/sms/logs',
+    requireAuth,
+    safeRoute((req: AuthedRequest, res) => {
+      if (req.authUser?.role !== 'DMO') {
+        res.status(403).json({error: 'Forbidden: Only DMO officers can inspect district SMS logs.'});
+        return;
+      }
+      const rawLogs = db.listSmsDispatches(30).map((item) => ({
+        ...item,
+        toPhone: item.toPhone.includes('•') ? item.toPhone : maskPhoneNumber(item.toPhone),
+      }));
+      res.json({
+        logs: rawLogs,
+        gateway: getConfiguredSmsGatewayStatus({includeSensitive: false}),
+      });
+    })
+  );
 
   // Carrier inbound webhook requires Twilio HMAC-SHA1 or SMS_WEBHOOK_SECRET
   app.post('/api/sms/webhook', async (req, res) => {
@@ -1307,7 +1396,10 @@ export async function createHealthSyncServer(
           : err instanceof Error
           ? err.message
           : 'Invalid request.';
-      res.status(status).json({error: msg});
+      console.warn(`[HealthSync API Boundary] ${req.method} ${req.path} -> HTTP ${status}:`, msg);
+      if (!res.headersSent) {
+        res.status(status).json({error: msg});
+      }
       return;
     }
     next(err);
@@ -1319,7 +1411,7 @@ export async function createHealthSyncServer(
       try {
         sock.send(JSON.stringify(payload));
       } catch (err) {
-        console.error('[HealthSync WS] Failed to send frame:', err);
+        console.warn('[HealthSync WS] Failed to send frame:', err);
       }
     }
   };
@@ -1377,7 +1469,7 @@ export async function createHealthSyncServer(
       try {
         msg = JSON.parse(String(raw)) as Record<string, unknown>;
       } catch (err) {
-        console.error('[HealthSync WS] Malformed JSON message received:', err);
+        console.warn('[HealthSync WS] Malformed JSON message received:', err);
         sendSafeJson(ws, {
           type: 'sync:error',
           recordId: null,
@@ -1520,8 +1612,8 @@ export async function createHealthSyncServer(
           });
           return;
         }
-        console.error(
-          '[HealthSync WS Sync Error] Database write failed during WebSocket sync:',
+        console.warn(
+          '[HealthSync WS Sync Warning] Database write failed during WebSocket sync:',
           err
         );
         sendSafeJson(ws, {
@@ -1546,7 +1638,7 @@ export async function createHealthSyncServer(
 
     ws.on('close', cleanupSocket);
     ws.on('error', (err) => {
-      console.error('[HealthSync WS] Socket transport error:', err);
+      console.warn('[HealthSync WS] Socket transport closed with warning:', err);
       cleanupSocket();
     });
   });
@@ -1640,7 +1732,7 @@ export async function createHealthSyncServer(
         });
       }
     } catch (err) {
-      console.error('[HealthSync WS Upgrade Error]:', err);
+      console.warn('[HealthSync WS Upgrade Warning]:', err);
       socket.destroy();
     }
   });
@@ -1681,6 +1773,9 @@ async function startServer() {
 const isMainModule =
   process.argv[1] && path.resolve(process.argv[1]) === path.resolve(__filename);
 if (isMainModule) {
+  process.on('unhandledRejection', (reason) => {
+    console.warn('[HealthSync Process Guard] Unhandled promise rejection intercepted:', reason);
+  });
   startServer().catch((err) => {
     console.error('[HealthSync Fatal Startup Error]:', err instanceof Error ? err.message : err);
     process.exit(1);

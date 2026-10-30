@@ -1,6 +1,7 @@
 import {GoogleGenAI, Type} from '@google/genai';
 import {
   ALL_SYMPTOMS,
+  evaluateTriage,
   type EdgeAiDiagnostics,
   type SymptomKey,
   type VitalsSnapshot,
@@ -149,24 +150,24 @@ export function buildHardenedClinicalPrompt(input: ClinicalAiSummaryInput): {
   anonymized: boolean;
 } {
   // Always inspect incoming name & transcript for prompt injection attempts before anonymizing
-  const rawNameCheck = sanitizeUntrustedClinicalText(input.patientName, 80);
-  const rawTranscriptCheck = sanitizeUntrustedClinicalText(input.transcript, 400);
+  const rawNameCheck = sanitizeUntrustedClinicalText(input?.patientName, 80);
+  const rawTranscriptCheck = sanitizeUntrustedClinicalText(input?.transcript, 400);
 
   const numericAge =
-    input.age !== undefined && Number.isFinite(Number(input.age))
+    input?.age !== undefined && Number.isFinite(Number(input.age))
       ? Math.min(120, Math.max(0, Math.round(Number(input.age))))
       : null;
   const isMinor = numericAge !== null && numericAge < 18;
   const hasExplicitValidConsent =
     !isMinor &&
     numericAge !== null &&
-    input.explicitAiConsent === true &&
-    (input.lawfulBasis === 'explicit_consent' ||
-      input.lawfulBasis === 'medical_emergency_vital_interest');
+    input?.explicitAiConsent === true &&
+    (input?.lawfulBasis === 'explicit_consent' ||
+      input?.lawfulBasis === 'medical_emergency_vital_interest');
 
   const anonymizedTranscriptSource = hasExplicitValidConsent
-    ? input.transcript
-    : anonymizePersonalIdentifiers(input.transcript, input.patientName);
+    ? input?.transcript
+    : anonymizePersonalIdentifiers(input?.transcript, input?.patientName);
   const safeTranscript = sanitizeUntrustedClinicalText(anonymizedTranscriptSource, 400);
 
   const patientLabelForPrompt = hasExplicitValidConsent
@@ -175,31 +176,31 @@ export function buildHardenedClinicalPrompt(input: ClinicalAiSummaryInput): {
 
   const safeAge = numericAge !== null ? String(numericAge) : 'Unknown';
 
-  const systolic = Math.round(clampFiniteNumber(input.vitals.systolic, 40, 300, 120));
-  const diastolic = Math.round(clampFiniteNumber(input.vitals.diastolic, 20, 200, 80));
-  const spo2 = Math.round(clampFiniteNumber(input.vitals.spo2, 30, 100, 98));
+  const systolic = Math.round(clampFiniteNumber(input?.vitals?.systolic, 40, 300, 120));
+  const diastolic = Math.round(clampFiniteNumber(input?.vitals?.diastolic, 20, 200, 80));
+  const spo2 = Math.round(clampFiniteNumber(input?.vitals?.spo2, 30, 100, 98));
   const temperature = Number(
-    clampFiniteNumber(input.vitals.temperature, 85, 115, 98.6).toFixed(1)
+    clampFiniteNumber(input?.vitals?.temperature, 85, 115, 98.6).toFixed(1)
   );
-  const heartRate = Math.round(clampFiniteNumber(input.vitals.heartRate, 20, 260, 80));
+  const heartRate = Math.round(clampFiniteNumber(input?.vitals?.heartRate, 20, 260, 80));
 
   // Whitelist symptoms strictly against canonical SymptomKey enum to prevent array-element injection
-  const validSymptoms = Array.isArray(input.symptoms)
+  const validSymptoms = Array.isArray(input?.symptoms)
     ? input.symptoms.filter((sym): sym is SymptomKey => ALL_SYMPTOMS.includes(sym))
     : [];
 
-  const safeHb = clampFiniteNumber(input.edgeAi?.estimatedHb, 3, 22, 7.8).toFixed(1);
-  const safeHz = Math.round(clampFiniteNumber(input.edgeAi?.coughPeakHz, 50, 4000, 740));
+  const safeHb = clampFiniteNumber(input?.edgeAi?.estimatedHb, 3, 22, 7.8).toFixed(1);
+  const safeHz = Math.round(clampFiniteNumber(input?.edgeAi?.coughPeakHz, 50, 4000, 740));
 
   const lines = [
     '<trusted_clinical_telemetry>',
     `Age: ${safeAge}`,
     `Vitals: BP ${systolic}/${diastolic} mmHg, SpO2 ${spo2}%, Temp ${temperature} °F, Pulse ${heartRate} BPM`,
     `Verified Symptoms: ${validSymptoms.length > 0 ? validSymptoms.join(', ') : 'None reported'}`,
-    input.edgeAi?.anemiaSuspected
+    input?.edgeAi?.anemiaSuspected
       ? `Optical Conjunctiva Screening (uncalibrated): Suspected pallor (Est. Hb ${safeHb} g/dL)`
       : 'Optical Conjunctiva Screening: Not flagged',
-    input.edgeAi?.respiratoryRiskHigh
+    input?.edgeAi?.respiratoryRiskHigh
       ? `Acoustic Cough Screening (uncalibrated): Flagged (${safeHz} Hz)`
       : 'Acoustic Cough Screening: Not flagged',
     '</trusted_clinical_telemetry>',
@@ -243,8 +244,9 @@ export async function generateClinicalTriageSummary(
   const {prompt} = buildHardenedClinicalPrompt(input);
 
   let rawText: string | undefined;
+  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
   try {
-    const response = await ai.models.generateContent({
+    const geminiCall = ai.models.generateContent({
       model: 'gemini-3.8-flash',
       contents: prompt,
       config: {
@@ -277,6 +279,15 @@ export async function generateClinicalTriageSummary(
         },
       },
     });
+
+    const timeoutPromise = new Promise<never>((_resolve, reject) => {
+      timeoutHandle = setTimeout(() => {
+        reject(new Error('Gemini clinical summary request timed out after 12s.'));
+      }, 12_000);
+      timeoutHandle.unref?.();
+    });
+
+    const response = await Promise.race([geminiCall, timeoutPromise]);
     rawText = response.text?.trim();
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -291,6 +302,8 @@ export async function generateClinicalTriageSummary(
       );
     }
     throw new Error(msg || 'Failed to generate clinical summary from Gemini.');
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
   }
 
   if (!rawText) {
@@ -320,5 +333,73 @@ export async function generateClinicalTriageSummary(
     hindiGuidance: String(parsed.hindiGuidance || '').slice(0, 500),
     disclaimer: MEDICAL_DISCLAIMER,
     model: 'gemini-3.8-flash',
+  };
+}
+
+/**
+ * Deterministic server-side clinical fallback summary (NHM / ABDM triage protocol)
+ * used whenever GEMINI_API_KEY is missing or the upstream LLM times out / fails,
+ * ensuring API routes never crash with unhandled 500/502 errors during demos or offline clinics.
+ */
+export function buildServerClinicalFallbackSummary(
+  input: ClinicalAiSummaryInput
+): ClinicalAiSummaryOutput {
+  const safeVitals: VitalsSnapshot = {
+    systolic: Math.round(clampFiniteNumber(input?.vitals?.systolic, 40, 300, 120)),
+    diastolic: Math.round(clampFiniteNumber(input?.vitals?.diastolic, 20, 200, 80)),
+    spo2: Math.round(clampFiniteNumber(input?.vitals?.spo2, 30, 100, 98)),
+    temperature: Number(
+      clampFiniteNumber(input?.vitals?.temperature, 85, 115, 98.6).toFixed(1)
+    ),
+    heartRate: Math.round(clampFiniteNumber(input?.vitals?.heartRate, 20, 260, 76)),
+  };
+  const validSymptoms = Array.isArray(input?.symptoms)
+    ? input.symptoms.filter((sym): sym is SymptomKey => ALL_SYMPTOMS.includes(sym))
+    : [];
+
+  const assessment = evaluateTriage(safeVitals, validSymptoms, input?.edgeAi);
+  const ageText =
+    input?.age !== undefined && Number.isFinite(Number(input.age))
+      ? `${Math.round(Number(input.age))}-year-old patient`
+      : 'Adult patient';
+  const symText =
+    validSymptoms.length > 0 ? `Reported symptoms: ${validSymptoms.join(', ')}.` : 'No acute symptoms reported.';
+  const hbText =
+    typeof input?.edgeAi?.estimatedHb === 'number'
+      ? ` Eyelid screening est. Hb ${input.edgeAi.estimatedHb.toFixed(1)} g/dL.`
+      : '';
+
+  const severityLabel = `${assessment.severity.toUpperCase()} / ${assessment.scoreCode}`;
+  const handoffSummary =
+    `SBAR Handoff (${severityLabel}): ${ageText} recorded with BP ${safeVitals.systolic}/${safeVitals.diastolic} mmHg, ` +
+    `SpO₂ ${safeVitals.spo2}%, Temp ${safeVitals.temperature}°F, and Pulse ${safeVitals.heartRate} BPM. ` +
+    `${symText}${hbText} ${assessment.protocolEn}`;
+
+  const stabilizationSteps =
+    assessment.severity === 'emergency'
+      ? [
+          'Seat or position the patient semi-upright in a calm, ventilated space and loosen tight clothing.',
+          'Arrange immediate 108 ambulance referral or PHC Medical Officer review; do not leave the patient unattended.',
+          'Recheck blood pressure, oxygen saturation, and pulse every 10–15 minutes until hospital handoff.',
+          'Do not administer unprescribed medications; share the compact SwasthyaSetu referral code if offline.',
+        ]
+      : assessment.severity === 'moderate'
+      ? [
+          'Ensure the patient rests comfortably for 15 minutes and re-verify blood pressure and temperature.',
+          'Encourage oral hydration (clean water / ORS if appropriate) and schedule same-day PHC doctor review.',
+          'Monitor closely for worsening breathlessness, chest pain, dizziness, or falling SpO₂.',
+        ]
+      : [
+          'Continue routine NHM preventive wellness counseling, balanced iron-rich nutrition, and hydration.',
+          'Record baseline checkup in the village register and advise clinic follow-up if new symptoms appear.',
+        ];
+
+  return {
+    handoffSummary: handoffSummary.slice(0, 800),
+    redFlags: (assessment.triggers || []).slice(0, 4),
+    stabilizationSteps,
+    hindiGuidance: assessment.protocolHi,
+    disclaimer: `${MEDICAL_DISCLAIMER} (Generated via built-in NHM clinical protocol fallback.)`,
+    model: 'clinical-protocol-fallback',
   };
 }

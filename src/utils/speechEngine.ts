@@ -16,12 +16,12 @@ export interface ParsedVoiceEntities {
 /**
  * Real Regex & Clinical Keyword Parser over live Hindi / Hinglish / English speech transcripts.
  */
-export function parseClinicalTranscript(transcript: string): ParsedVoiceEntities {
+export function parseClinicalTranscript(transcript?: string | null): ParsedVoiceEntities {
   const vitalsPatch: Partial<VitalsSnapshot> = {};
   const detectedSymptoms: SymptomKey[] = [];
   const badges: DetectedEntityBadge[] = [];
 
-  const text = transcript.trim();
+  const text = String(transcript || '').trim();
   if (!text) {
     return {vitalsPatch, detectedSymptoms, badges, isEmergencyFirstAidQuery: false};
   }
@@ -214,21 +214,34 @@ export interface BrowserSpeechRecognition {
   stop: () => void;
 }
 
+export function isBrowserSpeechRecognitionSupported(): boolean {
+  if (typeof window === 'undefined') return false;
+  return Boolean(
+    (window as unknown as {SpeechRecognition?: unknown}).SpeechRecognition ||
+      (window as unknown as {webkitSpeechRecognition?: unknown}).webkitSpeechRecognition
+  );
+}
+
 export function createBrowserSpeechRecognition(
   lang: 'hi-IN' | 'en-IN' = 'hi-IN'
 ): BrowserSpeechRecognition | null {
-  if (typeof window === 'undefined') return null;
-  const Ctor =
-    (window as unknown as {SpeechRecognition?: new () => BrowserSpeechRecognition})
-      .SpeechRecognition ||
-    (window as unknown as {webkitSpeechRecognition?: new () => BrowserSpeechRecognition})
-      .webkitSpeechRecognition;
+  if (!isBrowserSpeechRecognitionSupported()) return null;
+  try {
+    const Ctor =
+      (window as unknown as {SpeechRecognition?: new () => BrowserSpeechRecognition})
+        .SpeechRecognition ||
+      (window as unknown as {webkitSpeechRecognition?: new () => BrowserSpeechRecognition})
+        .webkitSpeechRecognition;
 
-  if (!Ctor) return null;
+    if (!Ctor) return null;
 
-  const instance = new Ctor();
-  instance.lang = lang;
-  instance.continuous = false;
-  instance.interimResults = true;
-  return instance;
+    const instance = new Ctor();
+    instance.lang = lang;
+    instance.continuous = false;
+    instance.interimResults = true;
+    return instance;
+  } catch (err) {
+    console.warn('[SwasthyaSetu Speech] SpeechRecognition unavailable; falling back to manual input:', err);
+    return null;
+  }
 }

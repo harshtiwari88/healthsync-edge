@@ -1,10 +1,11 @@
 import React, {useEffect, useRef, useState} from 'react';
-import {FileText, Info, Mic, MicOff, Volume2, X} from 'lucide-react';
+import {AlertCircle, FileText, Info, Mic, MicOff, Volume2, X} from 'lucide-react';
 import {EdgeAiDiagnostics, NetworkState, SymptomKey, VitalsSnapshot} from '../types/triage';
 import {
   BrowserSpeechRecognition,
   createBrowserSpeechRecognition,
   DetectedEntityBadge,
+  isBrowserSpeechRecognitionSupported,
   parseClinicalTranscript,
   speakClinicalGuidance,
 } from '../utils/speechEngine';
@@ -57,12 +58,16 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
   explicitAiConsent = false,
   onApplyVoiceEntities,
 }) => {
+  const [speechSupported, setSpeechSupported] = useState<boolean>(() =>
+    isBrowserSpeechRecognitionSupported()
+  );
   const [speechLang, setSpeechLang] = useState<'hi-IN' | 'en-IN'>('en-IN');
   const [isListening, setIsListening] = useState(false);
   const [isCallingGemini, setIsCallingGemini] = useState(false);
   const [liveTranscript, setLiveTranscript] = useState('');
   const [manualInput, setManualInput] = useState('');
   const [speechStatus, setSpeechStatus] = useState<string>('');
+  const [voiceToast, setVoiceToast] = useState<string | null>(null);
   const [turns, setTurns] = useState<ChatTurn[]>([
     {
       id: 'welcome',
@@ -72,8 +77,30 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
   ]);
 
   const recognitionRef = useRef<BrowserSpeechRecognition | null>(null);
+  const manualInputRef = useRef<HTMLInputElement | null>(null);
+  const toastTimerRef = useRef<number | null>(null);
   const isMountedRef = useRef<boolean>(true);
   const abortControllerRef = useRef<AbortController | null>(null);
+
+  const showFallbackToast = (message: string) => {
+    if (!isMountedRef.current) return;
+    setVoiceToast(message);
+    if (toastTimerRef.current !== null && typeof window !== 'undefined') {
+      window.clearTimeout(toastTimerRef.current);
+    }
+    if (typeof window !== 'undefined') {
+      toastTimerRef.current = window.setTimeout(() => {
+        if (isMountedRef.current) {
+          setVoiceToast(null);
+        }
+      }, 6000);
+    }
+    try {
+      manualInputRef.current?.focus();
+    } catch {
+      // Ignore focus errors on mobile viewports
+    }
+  };
 
   const stopActiveRecognition = () => {
     const rec = recognitionRef.current;
@@ -92,10 +119,15 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
 
   useEffect(() => {
     isMountedRef.current = true;
+    setSpeechSupported(isBrowserSpeechRecognitionSupported());
     return () => {
       isMountedRef.current = false;
       stopActiveRecognition();
       abortControllerRef.current?.abort();
+      if (toastTimerRef.current !== null && typeof window !== 'undefined') {
+        window.clearTimeout(toastTimerRef.current);
+        toastTimerRef.current = null;
+      }
       if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
         try {
           window.speechSynthesis.cancel();
@@ -158,14 +190,23 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
     setSpeechStatus('');
 
     try {
-      const allowIdentifiableName = Boolean(explicitAiConsent) && Number(patientAge) >= 18;
+      const safeName = (patientName || '').trim();
+      const allowIdentifiableName =
+        Boolean(explicitAiConsent) && Number(patientAge) >= 18 && Boolean(safeName);
+      const safeVitals: VitalsSnapshot = {
+        systolic: currentVitals?.systolic ?? 120,
+        diastolic: currentVitals?.diastolic ?? 80,
+        spo2: currentVitals?.spo2 ?? 98,
+        temperature: currentVitals?.temperature ?? 98.6,
+        heartRate: currentVitals?.heartRate ?? 76,
+      };
       const data = await fetchCareSummaryWithFallback({
         sessionToken,
         networkState,
-        patientName: allowIdentifiableName ? patientName.trim() : undefined,
+        patientName: allowIdentifiableName ? safeName : undefined,
         age: patientAge,
-        vitals: currentVitals,
-        symptoms: currentSymptoms,
+        vitals: safeVitals,
+        symptoms: Array.isArray(currentSymptoms) ? currentSymptoms : [],
         edgeAi: currentEdgeAi,
         transcript: liveTranscript || undefined,
         language: speechLang === 'hi-IN' ? 'hi' : 'en',
@@ -176,20 +217,20 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
       if (!isMountedRef.current) return;
 
       const formatted = [
-        `Doctor Handoff Summary:\n${data.handoffSummary}`,
-        data.redFlags && data.redFlags.length > 0
+        `Doctor Handoff Summary:\n${data?.handoffSummary || ''}`,
+        Array.isArray(data?.redFlags) && data.redFlags.length > 0
           ? `Key Signs to Watch:\n• ${data.redFlags.join('\n• ')}`
           : '',
-        data.stabilizationSteps && data.stabilizationSteps.length > 0
+        Array.isArray(data?.stabilizationSteps) && data.stabilizationSteps.length > 0
           ? `Recommended Care Steps:\n• ${data.stabilizationSteps.join('\n• ')}`
           : '',
-        data.hindiGuidance ? `हिन्दी मार्गदर्शन:\n${data.hindiGuidance}` : '',
+        data?.hindiGuidance ? `हिन्दी मार्गदर्शन:\n${data.hindiGuidance}` : '',
       ]
         .filter(Boolean)
         .join('\n\n');
 
       setTurns((prev) => [
-        ...prev,
+        ...(prev || []),
         {
           id: `gem-${Date.now()}`,
           sender: 'saheli',
@@ -198,9 +239,9 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
         },
       ]);
 
-      if (data.hindiGuidance && speechLang === 'hi-IN') {
+      if (data?.hindiGuidance && speechLang === 'hi-IN') {
         speakClinicalGuidance(data.hindiGuidance, 'hi-IN', false);
-      } else {
+      } else if (data?.handoffSummary) {
         speakClinicalGuidance(data.handoffSummary, 'en-IN', false);
       }
     } catch (err) {
@@ -220,16 +261,26 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
       return;
     }
 
+    if (!speechSupported || !isBrowserSpeechRecognitionSupported()) {
+      const unsupportedMsg =
+        'Speech recognition is not available in this browser — switched to manual input below.';
+      setSpeechStatus(unsupportedMsg);
+      showFallbackToast(unsupportedMsg);
+      return;
+    }
+
     const recognition = createBrowserSpeechRecognition(speechLang);
     if (!recognition) {
-      setSpeechStatus(
-        'Voice input is not supported in this browser. You can type readings below or tap an example phrase.'
-      );
+      const initMsg =
+        'Voice recognition could not initialize — switched cleanly to manual input below.';
+      setSpeechStatus(initMsg);
+      showFallbackToast(initMsg);
       return;
     }
 
     stopActiveRecognition();
     recognitionRef.current = recognition;
+    setVoiceToast(null);
     setSpeechStatus('Listening... Speak clearly into your microphone.');
     setLiveTranscript('');
     setIsListening(true);
@@ -237,10 +288,10 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
     let latestTranscript = '';
 
     recognition.onresult = (event) => {
-      if (!isMountedRef.current) return;
+      if (!isMountedRef.current || !event?.results) return;
       let combined = '';
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        combined += event.results[i][0].transcript;
+      for (let i = event.resultIndex || 0; i < event.results.length; i++) {
+        combined += event.results[i]?.[0]?.transcript || '';
       }
       latestTranscript = combined;
       setLiveTranscript(combined);
@@ -248,8 +299,17 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
 
     recognition.onerror = (err) => {
       if (!isMountedRef.current) return;
+      const errCode = err?.error || 'audio-failure';
+      console.warn('[SwasthyaSetu Voice] Microphone error; falling back to manual input:', errCode);
       setIsListening(false);
-      setSpeechStatus(`Microphone unavailable (${err.error}). Type readings below instead.`);
+      const friendlyMsg =
+        errCode === 'not-allowed' || errCode === 'service-not-allowed'
+          ? 'Microphone permission was denied — switched to manual text input below.'
+          : errCode === 'no-speech'
+          ? 'No speech detected — try speaking again or type readings manually below.'
+          : `Microphone audio unavailable (${errCode}) — switched to manual text input below.`;
+      setSpeechStatus(friendlyMsg);
+      showFallbackToast(friendlyMsg);
     };
 
     recognition.onend = () => {
@@ -263,10 +323,13 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
 
     try {
       recognition.start();
-    } catch {
+    } catch (err) {
+      console.warn('[SwasthyaSetu Voice] Failed to start microphone; using manual input:', err);
       if (!isMountedRef.current) return;
       setIsListening(false);
-      setSpeechStatus('Could not start microphone. Type readings below instead.');
+      const startErrMsg = 'Could not start microphone — switched to manual text input below.';
+      setSpeechStatus(startErrMsg);
+      showFallbackToast(startErrMsg);
     }
   };
 
@@ -355,9 +418,37 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
           </button>
         </div>
 
-        {speechStatus && (
+        {voiceToast && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="flex items-start justify-between gap-2.5 rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs font-medium text-amber-950 shadow-xs"
+          >
+            <div className="flex items-start gap-2">
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
+              <span>{voiceToast}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setVoiceToast(null)}
+              className="text-amber-700 hover:text-amber-950 cursor-pointer"
+              aria-label="Dismiss voice notification"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        )}
+
+        {speechStatus && !voiceToast && (
           <p role="status" className="text-xs font-medium text-amber-800">
             {speechStatus}
+          </p>
+        )}
+
+        {!speechSupported && !voiceToast && (
+          <p className="text-xs text-slate-600">
+            Browser voice recognition is unavailable on this device — manual typing &amp; quick
+            phrases are active below.
           </p>
         )}
 
@@ -389,7 +480,7 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
 
       {/* Activity Feed */}
       <div className="custom-scrollbar flex-1 space-y-3 overflow-y-auto px-5 py-4 max-h-[360px]">
-        {turns.map((turn) => (
+        {(turns || []).map((turn) => (
           <div
             key={turn.id}
             className={`rounded-xl border p-3.5 text-sm leading-relaxed whitespace-pre-line ${
@@ -418,7 +509,7 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
               )}
             </div>
             <p>{turn.text}</p>
-            {turn.badges && turn.badges.length > 0 && (
+            {Array.isArray(turn.badges) && turn.badges.length > 0 && (
               <p className="mt-2 text-xs font-medium text-teal-800">
                 Filled into form: {turn.badges.map((b) => b.label).join(' · ')}
               </p>
@@ -441,6 +532,7 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
         className="flex flex-wrap items-center gap-2 border-t border-slate-200 bg-slate-50 px-4 py-3"
       >
         <input
+          ref={manualInputRef}
           type="text"
           value={manualInput}
           onChange={(e) => setManualInput(e.target.value)}

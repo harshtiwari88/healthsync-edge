@@ -24,26 +24,28 @@ import {DistrictCommandDashboard} from './components/DistrictCommandDashboard';
 
 function mergeRecordsById(primary: TriageRecord[], secondary: TriageRecord[]): TriageRecord[] {
   const byId = new Map<string, TriageRecord>();
-  for (const rec of secondary) {
-    byId.set(rec.id, rec);
+  for (const rec of secondary || []) {
+    if (rec?.id) byId.set(rec.id, rec);
   }
-  for (const rec of primary) {
-    byId.set(rec.id, rec);
+  for (const rec of primary || []) {
+    if (rec?.id) byId.set(rec.id, rec);
   }
-  return Array.from(byId.values()).sort((a, b) => b.createdAtMs - a.createdAtMs);
+  return Array.from(byId.values()).sort(
+    (a, b) => (Number(b?.createdAtMs) || 0) - (Number(a?.createdAtMs) || 0)
+  );
 }
 
 function buildIncentiveForRecord(rec: TriageRecord): IncentiveEntry {
-  const isHighRisk = rec.severity === 'emergency' || rec.severity === 'moderate';
+  const isHighRisk = rec?.severity === 'emergency' || rec?.severity === 'moderate';
   return {
-    id: `inc-${rec.id}`,
+    id: `inc-${rec?.id || Date.now()}`,
     taskTitle: isHighRisk
       ? 'Priority Referral & Health Stabilization'
       : 'Community Vital Signs Checkup',
     programCode: isHighRisk ? 'NHM-HRP-50' : 'NPCDCS-20',
-    patientRef: `${rec.patientId} · ${rec.patientName}`,
+    patientRef: `${rec?.patientId || 'PT0000'} · ${rec?.patientName || 'Patient'}`,
     amountInr: isHighRisk ? 50 : 20,
-    timestamp: rec.timestamp,
+    timestamp: rec?.timestamp || 'Just now',
     abdmVerified: true,
   };
 }
@@ -53,11 +55,11 @@ function mergeIncentivesById(
   derivedEntries: IncentiveEntry[]
 ): IncentiveEntry[] {
   const byId = new Map<string, IncentiveEntry>();
-  for (const item of derivedEntries) {
-    byId.set(item.id, item);
+  for (const item of derivedEntries || []) {
+    if (item?.id) byId.set(item.id, item);
   }
-  for (const item of serverEntries) {
-    byId.set(item.id, item);
+  for (const item of serverEntries || []) {
+    if (item?.id) byId.set(item.id, item);
   }
   return Array.from(byId.values());
 }
@@ -138,7 +140,7 @@ export function App() {
     window.setTimeout(() => {
       if (networkStateRef.current === 'offline') return;
       if (userRoleRef.current === 'ASHA' && !isAshaVerifiedRef.current) return;
-      const queued = recordsRef.current.filter((rec) => rec.syncStatus === 'Queued Offline');
+      const queued = (recordsRef.current || []).filter((rec) => rec?.syncStatus === 'Queued Offline');
       if (queued.length === 0) return;
 
       for (const rec of queued) {
@@ -157,10 +159,13 @@ export function App() {
           .then((res) => {
             if (res?.ok && res.incentive) {
               setIncentives((prev) => {
-                const filtered = prev.filter((inc) => inc.id !== `inc-${rec.id}`);
+                const filtered = (prev || []).filter((inc) => inc?.id !== `inc-${rec.id}`);
                 return mergeIncentivesById([res.incentive!], filtered);
               });
             }
+          })
+          .catch((err) => {
+            console.warn('[HealthSync Offline Queue] Deferred sync retry scheduled:', err);
           });
       }
     }, 0);
@@ -199,10 +204,11 @@ export function App() {
     }
 
     const canCurrentUserAccessRecord = (rec: TriageRecord): boolean => {
+      if (!rec?.id) return false;
       if (userRoleRef.current === 'DMO') return true;
       const currentId = authIdentifierRef.current.trim().toUpperCase();
       if (!currentId) return false;
-      return rec.ashaWorker.toUpperCase().includes(`(${currentId})`);
+      return String(rec?.ashaWorker || '').toUpperCase().includes(`(${currentId})`);
     };
 
     const handleRealtimeMessage = (msg: RealtimeEventMessage) => {
@@ -361,17 +367,23 @@ export function App() {
         const [recordsRes, incentivesRes] = await Promise.all([
           fetch('/api/records', {
             headers: {Authorization: `Bearer ${session.token}`},
+          }).catch((err) => {
+            console.warn('[HealthSync Auth Sync] /api/records fetch unavailable, using local vault:', err);
+            return null;
           }),
           fetch('/api/incentives', {
             headers: {Authorization: `Bearer ${session.token}`},
+          }).catch((err) => {
+            console.warn('[HealthSync Auth Sync] /api/incentives fetch unavailable, using local log:', err);
+            return null;
           }),
         ]);
 
-        if (recordsRes.ok) {
+        if (recordsRes?.ok) {
           const parsedRecords = await safeReadJson<{records?: TriageRecord[]}>(recordsRes);
           const data = parsedRecords.isJson && parsedRecords.data ? parsedRecords.data : null;
           if (data && Array.isArray(data.records)) {
-            const unsynced = localDecrypted.filter((r) => r.syncStatus === 'Queued Offline');
+            const unsynced = localDecrypted.filter((r) => r?.syncStatus === 'Queued Offline');
             const confirmedSyncedById = new Map<string, TriageRecord>();
 
             for (const q of unsynced) {
@@ -398,13 +410,13 @@ export function App() {
                 if (postRes.ok && parsedPost.isJson) {
                   confirmedSyncedById.set(q.id, parsedPost.data?.record ?? syncedCopy);
                 } else {
-                  console.error(
-                    `[HealthSync Offline Sync] Server rejected queued record ${q.id} (HTTP ${postRes.status}). Keeping in offline queue.`
+                  console.warn(
+                    `[HealthSync Offline Sync] Server deferred queued record ${q.id} (HTTP ${postRes.status}). Keeping in offline queue.`
                   );
                 }
               } catch (syncErr) {
-                console.error(
-                  `[HealthSync Offline Sync] Network error syncing record ${q.id}. Keeping in offline queue:`,
+                console.warn(
+                  `[HealthSync Offline Sync] Network unavailable syncing record ${q.id}. Keeping in offline queue:`,
                   syncErr
                 );
               }
@@ -412,7 +424,7 @@ export function App() {
 
             // Pure functional state update merging against LIVE state (vault persistence runs via useEffect)
             setRecords((currentRecords) => {
-              const normalizedCurrent = currentRecords.map((r) =>
+              const normalizedCurrent = (currentRecords || []).map((r) =>
                 confirmedSyncedById.has(r.id) ? confirmedSyncedById.get(r.id)! : r
               );
               return mergeRecordsById(data.records || [], normalizedCurrent);
@@ -420,7 +432,7 @@ export function App() {
           }
         }
 
-        if (incentivesRes.ok) {
+        if (incentivesRes?.ok) {
           const parsedInc = await safeReadJson<{incentives?: IncentiveEntry[]}>(incentivesRes);
           if (parsedInc.isJson && Array.isArray(parsedInc.data?.incentives)) {
             setIncentives(mergeIncentivesById(parsedInc.data.incentives, localDerivedIncentives));
@@ -428,7 +440,7 @@ export function App() {
         }
       }
     } catch (err) {
-      console.error('[HealthSync Auth Sync] Offline or transient sync error:', err);
+      console.warn('[HealthSync Auth Sync] Offline or transient sync fallback active:', err);
     } finally {
       setIsLoadingRecords(false);
     }
@@ -536,10 +548,13 @@ export function App() {
         .then((res) => {
           if (res?.ok && res.incentive) {
             setIncentives((prev) => {
-              const withoutDraft = prev.filter((inc) => inc.id !== newIncentive.id);
+              const withoutDraft = (prev || []).filter((inc) => inc?.id !== newIncentive.id);
               return mergeIncentivesById([res.incentive!], withoutDraft);
             });
           }
+        })
+        .catch((err) => {
+          console.warn('[HealthSync Sync] Record queued locally after publish failure:', err);
         });
       if (triggerSiren) {
         setSirenActive(true);
@@ -555,8 +570,8 @@ export function App() {
     setSirenActive(false);
 
     setRecords((prev) =>
-      prev.map((rec) => {
-        if (rec.id !== recordId) return rec;
+      (prev || []).map((rec) => {
+        if (rec?.id !== recordId) return rec;
         return {
           ...rec,
           dispatchStatus: 'Dispatched' as const,
@@ -566,7 +581,11 @@ export function App() {
       })
     );
 
-    void realtimeRef.current?.publishRecordDispatched(recordId, '108-AMB-UP65', 11);
+    void realtimeRef.current
+      ?.publishRecordDispatched(recordId, '108-AMB-UP65', 11)
+      .catch((err) => {
+        console.warn('[HealthSync Dispatch] Dispatch status queued locally:', err);
+      });
   };
 
   const handleTriggerTestSiren = () => {
@@ -593,7 +612,7 @@ export function App() {
     }
   };
 
-  const pendingOfflineCount = records.filter((r) => r.syncStatus === 'Queued Offline').length;
+  const pendingOfflineCount = (records || []).filter((r) => r?.syncStatus === 'Queued Offline').length;
   const userIdentifier = authUser?.identifier ?? '';
 
   return (

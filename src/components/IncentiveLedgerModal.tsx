@@ -17,13 +17,14 @@ export const IncentiveLedgerModal: React.FC<IncentiveLedgerModalProps> = ({
   workerName,
   onClose,
   onStartCheckup,
-  entries,
+  entries = [],
 }) => {
   const [submittedToBmo, setSubmittedToBmo] = useState(false);
 
   if (!open && !inline) return null;
 
-  const totalEarned = entries.reduce((sum, item) => sum + item.amountInr, 0);
+  const safeEntries = Array.isArray(entries) ? entries : [];
+  const totalEarned = safeEntries.reduce((sum, item) => sum + (Number(item?.amountInr) || 0), 0);
 
   const content = (
     <div
@@ -67,7 +68,7 @@ export const IncentiveLedgerModal: React.FC<IncentiveLedgerModalProps> = ({
           <p className="mt-0.5 text-2xl font-bold text-slate-900 tabular-nums">
             ₹{totalEarned}{' '}
             <span className="text-xs font-normal text-slate-500">
-              across {entries.length} {entries.length === 1 ? 'visit' : 'visits'}
+              across {safeEntries.length} {safeEntries.length === 1 ? 'visit' : 'visits'}
             </span>
           </p>
         </div>
@@ -78,7 +79,7 @@ export const IncentiveLedgerModal: React.FC<IncentiveLedgerModalProps> = ({
       </div>
 
       {/* Entries or Honest Empty State */}
-      {entries.length === 0 ? (
+      {safeEntries.length === 0 ? (
         <div className="flex flex-col items-center justify-center px-6 py-10 text-center">
           <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-slate-100 text-slate-500">
             <ClipboardCheck className="h-6 w-6" />
@@ -101,16 +102,22 @@ export const IncentiveLedgerModal: React.FC<IncentiveLedgerModalProps> = ({
       ) : (
         <>
           <div className="custom-scrollbar flex-1 divide-y divide-slate-100 overflow-y-auto px-5 py-2 max-h-[340px]">
-            {entries.map((entry) => (
-              <div key={entry.id} className="flex items-center justify-between gap-3 py-3.5">
+            {safeEntries.map((entry, idx) => (
+              <div
+                key={entry?.id || `inc-row-${idx}`}
+                className="flex items-center justify-between gap-3 py-3.5"
+              >
                 <div className="min-w-0">
-                  <p className="text-sm font-semibold text-slate-900">{entry.taskTitle}</p>
+                  <p className="text-sm font-semibold text-slate-900">
+                    {entry?.taskTitle || 'Community Health Visit'}
+                  </p>
                   <p className="mt-0.5 text-xs text-slate-500 truncate">
-                    {entry.patientRef} · {entry.programCode} · {entry.timestamp}
+                    {entry?.patientRef || 'Patient Checkup'} · {entry?.programCode || 'NHM-VISIT'} ·{' '}
+                    {entry?.timestamp || 'Just now'}
                   </p>
                 </div>
                 <span className="shrink-0 font-mono text-sm font-semibold text-emerald-700 tabular-nums">
-                  +₹{entry.amountInr}
+                  +₹{Number(entry?.amountInr) || 0}
                 </span>
               </div>
             ))}

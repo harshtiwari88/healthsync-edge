@@ -299,7 +299,7 @@ function loadV2VerifierMap(): Record<string, HardenedOfflineVerifierSlot> {
     const raw = storage.getItem(OFFLINE_VERIFIERS_V2_KEY);
     if (!raw) return {};
     const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === 'object'
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
       ? (parsed as Record<string, HardenedOfflineVerifierSlot>)
       : {};
   } catch {
@@ -323,7 +323,10 @@ function loadLegacyV1VerifierMap(): Record<string, LegacyOfflineVerifierRecord> 
   try {
     const raw = storage.getItem(LEGACY_OFFLINE_VERIFIERS_V1_KEY);
     if (!raw) return {};
-    return JSON.parse(raw) as Record<string, LegacyOfflineVerifierRecord>;
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, LegacyOfflineVerifierRecord>)
+      : {};
   } catch {
     return {};
   }

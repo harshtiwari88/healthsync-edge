@@ -45,11 +45,12 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraReady, setCameraReady] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
+  const [scannerToast, setScannerToast] = useState<string | null>(null);
   const [isScanningEye, setIsScanningEye] = useState(false);
   const [isDemoScanning, setIsDemoScanning] = useState(false);
   const [demoStep, setDemoStep] = useState<number>(0);
   const [previewImageUrl, setPreviewImageUrl] = useState<string | null>(
-    diagnostics.conjunctivaMetrics?.capturedDataUrl ?? null
+    diagnostics?.conjunctivaMetrics?.capturedDataUrl ?? null
   );
   const [sampleVariant, setSampleVariant] = useState<'anemic' | 'normal'>('anemic');
 
@@ -67,14 +68,17 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
   const scanSessionIdRef = useRef<number>(0);
   const scanTimerRef = useRef<number | null>(null);
   const demoIntervalRef = useRef<number | null>(null);
+  const toastTimerRef = useRef<number | null>(null);
   const coughPollIntervalRef = useRef<number | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
-  const diagnosticsRef = useRef<EdgeAiDiagnostics>(diagnostics);
+  const diagnosticsRef = useRef<EdgeAiDiagnostics>(
+    diagnostics || {anemiaSuspected: false, respiratoryRiskHigh: false}
+  );
 
   useEffect(() => {
-    diagnosticsRef.current = diagnostics;
-    if (diagnostics.conjunctivaMetrics?.capturedDataUrl) {
+    diagnosticsRef.current = diagnostics || {anemiaSuspected: false, respiratoryRiskHigh: false};
+    if (diagnostics?.conjunctivaMetrics?.capturedDataUrl) {
       setPreviewImageUrl(diagnostics.conjunctivaMetrics.capturedDataUrl);
     }
   }, [diagnostics]);
@@ -142,29 +146,56 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
       stopCamera(false);
       stopCoughSampling(false);
       revokeActiveObjectUrl();
+      if (toastTimerRef.current !== null && typeof window !== 'undefined') {
+        window.clearTimeout(toastTimerRef.current);
+        toastTimerRef.current = null;
+      }
     };
   }, []);
+
+  const showScannerToast = (message: string) => {
+    if (!isMountedRef.current) return;
+    setScannerToast(message);
+    if (toastTimerRef.current !== null && typeof window !== 'undefined') {
+      window.clearTimeout(toastTimerRef.current);
+    }
+    if (typeof window !== 'undefined') {
+      toastTimerRef.current = window.setTimeout(() => {
+        if (isMountedRef.current) {
+          setScannerToast(null);
+        }
+      }, 6000);
+    }
+  };
 
   useEffect(() => {
     if (cameraActive && videoRef.current && streamRef.current) {
       if (videoRef.current.srcObject !== streamRef.current) {
         videoRef.current.srcObject = streamRef.current;
       }
-      void videoRef.current.play().catch(() => {});
+      void videoRef.current.play().catch((err) => {
+        console.warn('[SwasthyaSetu Camera] Video preview play deferred:', err);
+      });
     }
   }, [cameraActive]);
 
   const startCameraPreview = async () => {
     stopCamera(false);
     setCameraError(null);
+    setScannerToast(null);
     setIsDemoScanning(false);
     setDemoStep(0);
     const sessionId = ++scanSessionIdRef.current;
 
-    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
-      setCameraError(
-        'Live camera access is unavailable in this browser. Use "Upload Photo", "Use Sample Image", or "Quick Demo Scan" below.'
-      );
+    if (
+      typeof navigator === 'undefined' ||
+      !navigator.mediaDevices ||
+      typeof navigator.mediaDevices.getUserMedia !== 'function'
+    ) {
+      const noMediaMsg =
+        'Camera API unavailable in this browser — automatically running ⚡ Quick Demo Scan.';
+      console.warn('[SwasthyaSetu Camera] navigator.mediaDevices.getUserMedia unavailable; auto-toggling Quick Demo Scan.');
+      handleQuickDemoScan(noMediaMsg);
       return;
     }
 
@@ -187,13 +218,23 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
       setPreviewImageUrl(null);
       setCameraReady(false);
       setCameraActive(true);
-    } catch {
+    } catch (err) {
       if (!isMountedRef.current || sessionId !== scanSessionIdRef.current) return;
+      const errName = err instanceof Error ? err.name : 'CameraError';
+      console.warn(
+        `[SwasthyaSetu Camera] getUserMedia failed (${errName}); automatically toggling Quick Demo Scan.`
+      );
       setCameraActive(false);
       setCameraReady(false);
-      setCameraError(
-        'Camera permission was declined or no camera hardware was detected. You can upload an eyelid photo, test with a sample image, or run Quick Demo Scan below.'
-      );
+      const reasonMsg =
+        errName === 'NotAllowedError' || errName === 'PermissionDeniedError'
+          ? 'Camera permission denied — automatically switched to ⚡ Quick Demo Scan (or use Upload Photo below).'
+          : errName === 'NotFoundError' || errName === 'DevicesNotFoundError'
+          ? 'No camera hardware detected — automatically switched to ⚡ Quick Demo Scan.'
+          : errName === 'NotReadableError' || errName === 'TrackStartError'
+          ? 'Camera is busy in another app — automatically switched to ⚡ Quick Demo Scan.'
+          : 'Camera unavailable — automatically switched to ⚡ Quick Demo Scan.';
+      handleQuickDemoScan(reasonMsg);
     }
   };
 
@@ -346,10 +387,16 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
     });
   };
 
-  const handleQuickDemoScan = () => {
+  const handleQuickDemoScan = (autoFallbackNotice?: string) => {
     if (isDemoScanning) return;
     stopCamera(true);
-    setCameraError(null);
+    if (typeof autoFallbackNotice === 'string' && autoFallbackNotice) {
+      setCameraError(autoFallbackNotice);
+      showScannerToast(autoFallbackNotice);
+    } else {
+      setCameraError(null);
+      setScannerToast(null);
+    }
 
     const sessionId = ++scanSessionIdRef.current;
     const sampleCanvas = canvasRef.current ?? document.createElement('canvas');
@@ -392,7 +439,11 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
     if (isRecordingCough) return;
     setCoughError(null);
 
-    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+    if (
+      typeof navigator === 'undefined' ||
+      !navigator.mediaDevices ||
+      typeof navigator.mediaDevices.getUserMedia !== 'function'
+    ) {
       setCoughError(
         'Microphone access is not supported in this browser. Listen to breathing manually and mark "Cough" in symptoms if present.'
       );
@@ -413,7 +464,14 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
 
       const Ctor =
         window.AudioContext ||
-        (window as unknown as {webkitAudioContext: typeof AudioContext}).webkitAudioContext;
+        (window as unknown as {webkitAudioContext?: typeof AudioContext}).webkitAudioContext;
+      if (!Ctor) {
+        stopCoughSampling(true);
+        setCoughError(
+          'Web Audio spectrum analyzer unavailable in this browser. Mark cough symptoms manually above.'
+        );
+        return;
+      }
       const audioCtx = new Ctor();
       audioCtxRef.current = audioCtx;
       if (audioCtx.state === 'suspended') {
@@ -507,9 +565,9 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
     });
   };
 
-  const currentHb = diagnostics.estimatedHb ?? diagnostics.conjunctivaMetrics?.estimatedHb;
+  const currentHb = diagnostics?.estimatedHb ?? diagnostics?.conjunctivaMetrics?.estimatedHb;
   const isAnemiaFlagged =
-    (typeof currentHb === 'number' && currentHb < 10.0) || diagnostics.anemiaSuspected;
+    (typeof currentHb === 'number' && currentHb < 10.0) || Boolean(diagnostics?.anemiaSuspected);
   const isSevereAnemia = typeof currentHb === 'number' && currentHb < 7.0;
 
   return (
@@ -524,11 +582,11 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
           </p>
         </div>
 
-        {(diagnostics.anemiaSuspected ||
-          diagnostics.estimatedHb !== undefined ||
-          diagnostics.respiratoryRiskHigh ||
-          diagnostics.conjunctivaMetrics ||
-          diagnostics.coughMetrics) && (
+        {(diagnostics?.anemiaSuspected ||
+          diagnostics?.estimatedHb !== undefined ||
+          diagnostics?.respiratoryRiskHigh ||
+          diagnostics?.conjunctivaMetrics ||
+          diagnostics?.coughMetrics) && (
           <button
             type="button"
             onClick={handleClearChecks}
@@ -539,6 +597,17 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
           </button>
         )}
       </div>
+
+      {scannerToast && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="flex items-center gap-2 rounded-xl border border-teal-200 bg-teal-50/80 px-3.5 py-2.5 text-xs font-medium text-teal-950"
+        >
+          <Zap className="h-4 w-4 shrink-0 text-teal-700" />
+          <span>{scannerToast}</span>
+        </div>
+      )}
 
       {/* Clear, Non-Dismissible Medical Disclaimer */}
       <div
@@ -748,7 +817,7 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
 
             <button
               type="button"
-              onClick={handleQuickDemoScan}
+              onClick={() => handleQuickDemoScan()}
               disabled={isDemoScanning}
               className="flex min-h-[42px] items-center justify-center gap-1.5 rounded-xl border border-teal-200 bg-teal-50 px-3 py-2 text-xs font-semibold text-teal-900 hover:bg-teal-100 disabled:opacity-60 cursor-pointer"
             >
@@ -789,7 +858,7 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
           )}
 
           {/* Hemoglobin & RGB Analysis Result Card */}
-          {(diagnostics.conjunctivaMetrics || currentHb !== undefined) && !isDemoScanning && (
+          {(diagnostics?.conjunctivaMetrics || currentHb !== undefined) && !isDemoScanning && (
             <div
               className={`rounded-xl border p-4 text-sm space-y-2.5 ${
                 isSevereAnemia
@@ -809,7 +878,7 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
                     <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-700" />
                   )}
                   <span className="font-semibold">
-                    {diagnostics.conjunctivaMetrics?.diagnosticLabel ??
+                    {diagnostics?.conjunctivaMetrics?.diagnosticLabel ??
                       (isAnemiaFlagged
                         ? 'Anemia Risk Flagged (< 10.0 g/dL)'
                         : 'Hemoglobin Within Normal Range')}
@@ -831,7 +900,7 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
                 )}
               </div>
 
-              {diagnostics.conjunctivaMetrics && (
+              {diagnostics?.conjunctivaMetrics && (
                 <p className="text-xs text-slate-700 tabular-nums">
                   Conjunctiva ROI Avg RGB: R {diagnostics.conjunctivaMetrics.avgR} · G{' '}
                   {diagnostics.conjunctivaMetrics.avgG} · B {diagnostics.conjunctivaMetrics.avgB} ·
@@ -856,7 +925,7 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
               aria-hidden="true"
               className="mx-auto h-16 w-44 overflow-visible"
             >
-              {coughBars.map((pct, idx) => {
+              {(coughBars || []).map((pct, idx) => {
                 const barHeight = Math.max(8, Math.round((pct / 100) * 60));
                 return (
                   <rect
@@ -898,15 +967,15 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
             </div>
           )}
 
-          {diagnostics.coughMetrics && (
+          {diagnostics?.coughMetrics && (
             <div
               className={`flex items-start gap-2.5 rounded-xl border p-3.5 text-sm ${
-                diagnostics.respiratoryRiskHigh
+                diagnostics?.respiratoryRiskHigh
                   ? 'border-amber-200 bg-amber-50/80 text-amber-950'
                   : 'border-emerald-200 bg-emerald-50/70 text-emerald-950'
               }`}
             >
-              {diagnostics.respiratoryRiskHigh ? (
+              {diagnostics?.respiratoryRiskHigh ? (
                 <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
               ) : (
                 <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-700" />
@@ -914,7 +983,7 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
               <div>
                 <p className="font-semibold">{diagnostics.coughMetrics.diagnosticLabel}</p>
                 <p className="mt-0.5 text-xs text-slate-600 tabular-nums">
-                  Measured pitch peak: {diagnostics.coughMetrics.dominantFrequencyHz} Hz · Confirm
+                  Measured pitch peak: {diagnostics.coughMetrics.dominantFrequencyHz ?? 0} Hz · Confirm
                   with stethoscope exam.
                 </p>
               </div>

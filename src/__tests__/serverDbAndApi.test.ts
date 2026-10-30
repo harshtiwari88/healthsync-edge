@@ -1030,9 +1030,16 @@ describe('SQLite Persistence, AES-256-GCM At-Rest PHI Encryption & Authenticated
           transcript: 'Fever for two days',
         }),
       });
-      expect(geminiRes.status).toBe(502);
-      const geminiErr = (await geminiRes.json()) as {error?: string};
-      expect(geminiErr.error).toContain('GEMINI_API_KEY');
+      expect(geminiRes.status).toBe(200);
+      const geminiBody = (await geminiRes.json()) as {
+        success?: boolean;
+        isDemoFallback?: boolean;
+        handoffSummary?: string;
+        data?: {handoffSummary?: string};
+      };
+      expect(geminiBody.success).toBe(true);
+      expect(geminiBody.isDemoFallback).toBe(true);
+      expect(geminiBody.handoffSummary || geminiBody.data?.handoffSummary).toContain('124/82');
     } finally {
       if (prevGemKey === undefined) delete process.env.GEMINI_API_KEY;
       else process.env.GEMINI_API_KEY = prevGemKey;

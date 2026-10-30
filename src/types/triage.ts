@@ -136,75 +136,85 @@ export function evaluateVitalStatus(
   field: keyof VitalsSnapshot,
   value: number
 ): SeverityLevel {
+  const safeVal = Number.isFinite(Number(value)) ? Number(value) : 0;
   switch (field) {
     case 'systolic':
-      if (value >= 160 || value < 80) return 'emergency';
-      if (value > 130 || (value >= 80 && value < 90)) return 'moderate';
+      if (safeVal >= 160 || safeVal < 80) return 'emergency';
+      if (safeVal > 130 || (safeVal >= 80 && safeVal < 90)) return 'moderate';
       return 'routine';
     case 'diastolic':
-      if (value >= 100 || value < 50) return 'emergency';
-      if (value >= 88) return 'moderate';
+      if (safeVal >= 100 || safeVal < 50) return 'emergency';
+      if (safeVal >= 88) return 'moderate';
       return 'routine';
     case 'spo2':
-      if (value < 90) return 'emergency';
-      if (value <= 94) return 'moderate';
+      if (safeVal < 90) return 'emergency';
+      if (safeVal <= 94) return 'moderate';
       return 'routine';
     case 'temperature':
-      if (value >= 103.0 || value < 95.0) return 'emergency';
-      if (value > 100.0) return 'moderate';
+      if (safeVal >= 103.0 || safeVal < 95.0) return 'emergency';
+      if (safeVal > 100.0) return 'moderate';
       return 'routine';
     case 'heartRate':
-      if (value >= 130 || value < 45) return 'emergency';
-      if (value > 100 || value < 55) return 'moderate';
+      if (safeVal >= 130 || safeVal < 45) return 'emergency';
+      if (safeVal > 100 || safeVal < 55) return 'moderate';
       return 'routine';
   }
 }
 
 export function evaluateTriage(
-  vitals: VitalsSnapshot,
-  symptoms: SymptomKey[] = [],
-  edgeAi?: EdgeAiDiagnostics
+  vitals?: Partial<VitalsSnapshot> | null,
+  symptoms: SymptomKey[] | null | undefined = [],
+  edgeAi?: EdgeAiDiagnostics | null
 ): TriageEvaluation {
+  const systolic = Number.isFinite(Number(vitals?.systolic)) ? Number(vitals?.systolic) : 120;
+  const diastolic = Number.isFinite(Number(vitals?.diastolic)) ? Number(vitals?.diastolic) : 80;
+  const spo2 = Number.isFinite(Number(vitals?.spo2)) ? Number(vitals?.spo2) : 98;
+  const temperature = Number.isFinite(Number(vitals?.temperature))
+    ? Number(vitals?.temperature)
+    : 98.6;
+  const heartRate = Number.isFinite(Number(vitals?.heartRate)) ? Number(vitals?.heartRate) : 76;
+  const safeSymptoms = Array.isArray(symptoms) ? symptoms : [];
+
   const redReasons: string[] = [];
   const yellowReasons: string[] = [];
 
-  if (vitals.systolic >= 160 || vitals.systolic < 80) {
-    redReasons.push(`Critical Systolic BP (${vitals.systolic}/${vitals.diastolic} mmHg)`);
+  if (systolic >= 160 || systolic < 80) {
+    redReasons.push(`Critical Systolic BP (${systolic}/${diastolic} mmHg)`);
   }
-  if (vitals.diastolic >= 105) {
-    redReasons.push(`Critical Diastolic BP (${vitals.diastolic} mmHg)`);
+  if (diastolic >= 105) {
+    redReasons.push(`Critical Diastolic BP (${diastolic} mmHg)`);
   }
-  if (vitals.spo2 < 90) {
-    redReasons.push(`Severe Hypoxia (SpO₂ ${vitals.spo2}% < 90%)`);
+  if (spo2 < 90) {
+    redReasons.push(`Severe Hypoxia (SpO₂ ${spo2}% < 90%)`);
   }
-  if (vitals.heartRate >= 130 || vitals.heartRate < 45) {
-    redReasons.push(`Critical Heart Rate (${vitals.heartRate} BPM)`);
+  if (heartRate >= 130 || heartRate < 45) {
+    redReasons.push(`Critical Heart Rate (${heartRate} BPM)`);
   }
-  if (symptoms.includes('Severe Chest Pain')) {
+  if (safeSymptoms.includes('Severe Chest Pain')) {
     redReasons.push('Severe Chest Pain Reported');
   }
-  if (symptoms.includes('Bleeding')) {
+  if (safeSymptoms.includes('Bleeding')) {
     redReasons.push('Active Hemorrhage / Bleeding Flagged');
   }
 
-  if (vitals.systolic > 130 && vitals.systolic < 160) {
-    yellowReasons.push(`Elevated BP (${vitals.systolic}/${vitals.diastolic} mmHg)`);
-  } else if (vitals.diastolic >= 90 && vitals.diastolic < 105 && vitals.systolic <= 130) {
-    yellowReasons.push(`Elevated Diastolic BP (${vitals.diastolic} mmHg)`);
+  if (systolic > 130 && systolic < 160) {
+    yellowReasons.push(`Elevated BP (${systolic}/${diastolic} mmHg)`);
+  } else if (diastolic >= 90 && diastolic < 105 && systolic <= 130) {
+    yellowReasons.push(`Elevated Diastolic BP (${diastolic} mmHg)`);
   }
-  if (vitals.temperature > 100.0) {
-    yellowReasons.push(`Fever (${vitals.temperature.toFixed(1)}°F > 100°F)`);
+  if (temperature > 100.0) {
+    yellowReasons.push(`Fever (${temperature.toFixed(1)}°F > 100°F)`);
   }
-  if (vitals.spo2 >= 90 && vitals.spo2 <= 94) {
-    yellowReasons.push(`Borderline SpO₂ (${vitals.spo2}%)`);
+  if (spo2 >= 90 && spo2 <= 94) {
+    yellowReasons.push(`Borderline SpO₂ (${spo2}%)`);
   }
-  if (vitals.heartRate > 100 && vitals.heartRate < 130) {
-    yellowReasons.push(`Tachycardia (${vitals.heartRate} BPM)`);
+  if (heartRate > 100 && heartRate < 130) {
+    yellowReasons.push(`Tachycardia (${heartRate} BPM)`);
   }
-  if (symptoms.includes('High BP') && vitals.systolic <= 130) {
+  if (safeSymptoms.includes('High BP') && systolic <= 130) {
     yellowReasons.push('History / Symptom of High BP');
   }
-  if (symptoms.includes('Dizziness')) {
+  if (safeSymptoms.includes('Dizziness')) {
     yellowReasons.push('Dizziness / Syncope Warning');
   }
   const estimatedHb =
@@ -227,7 +237,7 @@ export function evaluateTriage(
   }
   if (edgeAi?.respiratoryRiskHigh) {
     yellowReasons.push(
-      `Cough Spectral Risk (${edgeAi.coughPeakHz ?? 890} Hz Bronchial Signature)`
+      `Cough Spectral Risk (${edgeAi?.coughPeakHz ?? 890} Hz Bronchial Signature)`
     );
   }
 
