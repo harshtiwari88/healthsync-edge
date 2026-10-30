@@ -35,6 +35,7 @@ import {
   VitalsSnapshot,
 } from '../types/triage';
 import {encodeVitalsToSMS, formatCompactSmsTag} from '../utils/binarySmsCodec';
+import {safeReadJson} from '../utils/safeFetchJson';
 import {useVirtualWindow} from '../utils/virtualWindow';
 import {EdgeAiDiagnosticsPanel} from './EdgeAiDiagnosticsPanel';
 import {AshaSaheliModal} from './AshaSaheliModal';
@@ -119,6 +120,7 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
     temperature: 98.6,
     heartRate: 76,
   });
+  const [vitalDrafts, setVitalDrafts] = useState<Partial<Record<keyof VitalsSnapshot, string>>>({});
   const [symptoms, setSymptoms] = useState<SymptomKey[]>([]);
   const [edgeAi, setEdgeAi] = useState<EdgeAiDiagnostics>({
     anemiaSuspected: false,
@@ -129,6 +131,13 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
   const [lastVoiceTranscript, setLastVoiceTranscript] = useState('');
   const [saheliModalOpen, setSaheliModalOpen] = useState(false);
   const [smsModalOpen, setSmsModalOpen] = useState(false);
+  const [smsDraft, setSmsDraft] = useState<{
+    record: TriageRecord;
+    bitPackedSms: string;
+    compactTag: string;
+    nativeUri: string;
+    saved: boolean;
+  } | null>(null);
   const [copiedPayload, setCopiedPayload] = useState(false);
   const [sendingGatewaySms, setSendingGatewaySms] = useState(false);
   const [smsGatewayFeedback, setSmsGatewayFeedback] = useState<{
@@ -182,7 +191,17 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
     [vitals, symptoms, edgeAi]
   );
 
-  const nextPatientId = useMemo(() => `PT${1001 + records.length}`, [records.length]);
+  const nextPatientId = useMemo(() => {
+    let maxNum = 1000;
+    for (const r of records) {
+      const digits = r.patientId.replace(/\D/g, '');
+      const n = digits ? Number(digits) : 0;
+      if (Number.isSafeInteger(n) && n > maxNum && n < 9_000_000) {
+        maxNum = n;
+      }
+    }
+    return `PT${maxNum + 1}`;
+  }, [records]);
 
   const bitPacked28CharSms = useMemo(
     () =>
@@ -243,6 +262,7 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
   ) => {
     setLastVoiceTranscript(transcript);
     if (Object.keys(vitalsPatch).length > 0) {
+      setVitalDrafts({});
       setVitals((prev) => ({
         ...prev,
         ...vitalsPatch,
@@ -259,6 +279,46 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
     );
   };
 
+  const handleVitalInputChange = (
+    field: keyof VitalsSnapshot,
+    raw: string,
+    min: number,
+    max: number,
+    decimals = 0
+  ) => {
+    setVitalDrafts((prev) => ({...prev, [field]: raw}));
+    const trimmed = raw.trim();
+    if (!trimmed) return;
+    const parsed = Number(trimmed);
+    if (!Number.isFinite(parsed)) return;
+    if (parsed >= min && parsed <= max) {
+      const rounded = decimals > 0 ? Number(parsed.toFixed(decimals)) : Math.round(parsed);
+      setVitals((prev) => ({...prev, [field]: rounded}));
+    }
+  };
+
+  const handleVitalInputBlur = (
+    field: keyof VitalsSnapshot,
+    min: number,
+    max: number,
+    decimals = 0
+  ) => {
+    const raw = vitalDrafts[field];
+    if (raw !== undefined) {
+      const parsed = Number(raw.trim());
+      if (raw.trim() !== '' && Number.isFinite(parsed)) {
+        const clamped = Math.min(max, Math.max(min, parsed));
+        const finalVal = decimals > 0 ? Number(clamped.toFixed(decimals)) : Math.round(clamped);
+        setVitals((prev) => ({...prev, [field]: finalVal}));
+      }
+      setVitalDrafts((prev) => {
+        const next = {...prev};
+        delete next[field];
+        return next;
+      });
+    }
+  };
+
   const adjustVital = (
     field: keyof VitalsSnapshot,
     delta: number,
@@ -266,6 +326,11 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
     max: number,
     decimals = 0
   ) => {
+    setVitalDrafts((prev) => {
+      const next = {...prev};
+      delete next[field];
+      return next;
+    });
     setVitals((prev) => {
       const nextRaw = Math.min(max, Math.max(min, prev[field] + delta));
       const nextVal = decimals > 0 ? Number(nextRaw.toFixed(decimals)) : Math.round(nextRaw);
@@ -279,6 +344,7 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
     setPatientGender('F');
     setAbhaNumber('');
     setClinicalNoteInput('');
+    setVitalDrafts({});
     setVitals({
       systolic: 120,
       diastolic: 80,
@@ -295,7 +361,16 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
   const buildRecord = (isEmergencySms: boolean): TriageRecord => {
     const now = new Date();
     const timeStr = now.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
-    const parsedAge = Math.min(115, Math.max(1, Number(patientAge) || 35));
+    const parsedAge = Math.min(115, Math.max(1, Math.round(Number(patientAge) || 35)));
+    const safeVitals: VitalsSnapshot = {
+      systolic: Math.min(260, Math.max(50, Math.round(Number(vitals.systolic) || 120))),
+      diastolic: Math.min(170, Math.max(35, Math.round(Number(vitals.diastolic) || 80))),
+      spo2: Math.min(100, Math.max(50, Math.round(Number(vitals.spo2) || 98))),
+      temperature: Number(
+        Math.min(109, Math.max(93, Number(vitals.temperature) || 98.6)).toFixed(1)
+      ),
+      heartRate: Math.min(220, Math.max(35, Math.round(Number(vitals.heartRate) || 76))),
+    };
     const uniqueSuffix =
       typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
         ? crypto.randomUUID().slice(0, 8)
@@ -311,7 +386,7 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
       villageCode,
       villageName: clinicMeta.name,
       ashaWorker: `${ashaDisplayName} (${ashaId})`,
-      vitals: {...vitals},
+      vitals: safeVitals,
       symptoms: [...symptoms],
       edgeAi: {...edgeAi},
       severity: triage.severity,
@@ -331,6 +406,35 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
     };
   };
 
+  const openEmergencySmsModal = () => {
+    setFormError(null);
+    if (!patientName.trim()) {
+      setFormError('Please enter the patient’s name before preparing an urgent SMS alert.');
+      return;
+    }
+    const snapshotRecord = buildRecord(true);
+    setSmsGatewayFeedback(null);
+    setCopiedPayload(false);
+    setSmsDraft({
+      record: snapshotRecord,
+      bitPackedSms: bitPacked28CharSms,
+      compactTag: compactSmsTag,
+      nativeUri: defaultNativeSmsUri,
+      saved: false,
+    });
+    setSmsModalOpen(true);
+  };
+
+  const ensureSmsDraftRecordSaved = () => {
+    if (!smsDraft) return null;
+    if (!smsDraft.saved) {
+      onSaveRecord(smsDraft.record, true);
+      setSmsDraft((prev) => (prev ? {...prev, saved: true} : null));
+      resetFormForNextPatient();
+    }
+    return smsDraft;
+  };
+
   const handlePrimarySaveClick = () => {
     setFormError(null);
     if (!patientName.trim()) {
@@ -339,17 +443,16 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
     }
 
     if (networkState === 'offline' && triage.severity === 'emergency') {
-      setSmsGatewayFeedback(null);
-      setSmsModalOpen(true);
+      openEmergencySmsModal();
       return;
     }
 
     const record = buildRecord(false);
     onSaveRecord(record, false);
 
-    if (networkState === 'offline') {
+    if (networkState === 'offline' || sessionToken === 'OFFLINE_LOCAL_SESSION') {
       setFeedbackNotice(
-        `Saved privately on this device for ${record.patientName}. It will sync automatically when internet returns.`
+        `Saved privately on this device for ${record.patientName}. It will sync automatically when connected to the hospital server.`
       );
     } else if (triage.severity === 'emergency') {
       setFeedbackNotice(
@@ -372,23 +475,19 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
   };
 
   const handleConfirmSendEmergencySms = async () => {
-    if (!patientName.trim()) {
-      setFormError('Please enter the patient’s name first.');
+    const activeDraft = ensureSmsDraftRecordSaved();
+    if (!activeDraft) {
       setSmsModalOpen(false);
       return;
     }
-
-    const record = buildRecord(true);
-    onSaveRecord(record, true);
 
     if (networkState === 'offline' || sessionToken === 'OFFLINE_LOCAL_SESSION') {
       setSmsGatewayFeedback({
         sent: false,
         message:
           'Checkup saved on this device. Because internet is offline, tap "Open Phone Text Message App" below to send the urgent code over basic cellular signal.',
-        nativeUri: defaultNativeSmsUri,
+        nativeUri: activeDraft.nativeUri,
       });
-      resetFormForNextPatient();
       return;
     }
 
@@ -401,29 +500,40 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
           Authorization: `Bearer ${sessionToken}`,
         },
         body: JSON.stringify({
-          payloadText: bitPacked28CharSms,
-          recordId: record.id,
+          payloadText: activeDraft.bitPackedSms,
+          recordId: activeDraft.record.id,
         }),
       });
-      const data = (await resp.json()) as {
+      const parsed = await safeReadJson<{
         sent?: boolean;
         statusMessage?: string;
         nativeSmsUri?: string;
-      };
+        error?: string;
+      }>(resp);
       if (!isMountedRef.current) return;
+      if (!resp.ok || !parsed.isJson || !parsed.data) {
+        setSmsGatewayFeedback({
+          sent: false,
+          message:
+            parsed.data?.error ||
+            'Could not reach server SMS service. Tap "Open Phone Text Message App" below to send directly from your phone.',
+          nativeUri: activeDraft.nativeUri,
+        });
+        return;
+      }
+      const data = parsed.data;
       setSmsGatewayFeedback({
         sent: Boolean(data.sent),
         message: data.statusMessage || 'Urgent SMS request processed.',
-        nativeUri: data.nativeSmsUri || defaultNativeSmsUri,
+        nativeUri: data.nativeSmsUri || activeDraft.nativeUri,
       });
-      resetFormForNextPatient();
     } catch {
       if (!isMountedRef.current) return;
       setSmsGatewayFeedback({
         sent: false,
         message:
           'Could not reach server SMS service. Tap "Open Phone Text Message App" below to send directly from your phone.',
-        nativeUri: defaultNativeSmsUri,
+        nativeUri: activeDraft.nativeUri,
       });
     } finally {
       if (isMountedRef.current) {
@@ -652,10 +762,9 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
                       type="number"
                       min={50}
                       max={260}
-                      value={vitals.systolic}
-                      onChange={(e) =>
-                        setVitals((prev) => ({...prev, systolic: Number(e.target.value)}))
-                      }
+                      value={vitalDrafts.systolic ?? String(vitals.systolic)}
+                      onChange={(e) => handleVitalInputChange('systolic', e.target.value, 50, 260)}
+                      onBlur={() => handleVitalInputBlur('systolic', 50, 260)}
                       className="min-h-[44px] w-full rounded-xl border border-slate-300 bg-white px-3 text-center font-mono text-lg font-semibold text-slate-900 tabular-nums focus:border-teal-700 focus:outline-none"
                     />
                     <button
@@ -695,10 +804,9 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
                       type="number"
                       min={35}
                       max={170}
-                      value={vitals.diastolic}
-                      onChange={(e) =>
-                        setVitals((prev) => ({...prev, diastolic: Number(e.target.value)}))
-                      }
+                      value={vitalDrafts.diastolic ?? String(vitals.diastolic)}
+                      onChange={(e) => handleVitalInputChange('diastolic', e.target.value, 35, 170)}
+                      onBlur={() => handleVitalInputBlur('diastolic', 35, 170)}
                       className="min-h-[44px] w-full rounded-xl border border-slate-300 bg-white px-3 text-center font-mono text-lg font-semibold text-slate-900 tabular-nums focus:border-teal-700 focus:outline-none"
                     />
                     <button
@@ -738,10 +846,9 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
                       type="number"
                       min={50}
                       max={100}
-                      value={vitals.spo2}
-                      onChange={(e) =>
-                        setVitals((prev) => ({...prev, spo2: Number(e.target.value)}))
-                      }
+                      value={vitalDrafts.spo2 ?? String(vitals.spo2)}
+                      onChange={(e) => handleVitalInputChange('spo2', e.target.value, 50, 100)}
+                      onBlur={() => handleVitalInputBlur('spo2', 50, 100)}
                       className="min-h-[44px] w-full rounded-xl border border-slate-300 bg-white px-3 text-center font-mono text-lg font-semibold text-slate-900 tabular-nums focus:border-teal-700 focus:outline-none"
                     />
                     <button
@@ -782,10 +889,11 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
                       step="0.1"
                       min={93}
                       max={109}
-                      value={vitals.temperature}
+                      value={vitalDrafts.temperature ?? String(vitals.temperature)}
                       onChange={(e) =>
-                        setVitals((prev) => ({...prev, temperature: Number(e.target.value)}))
+                        handleVitalInputChange('temperature', e.target.value, 93, 109, 1)
                       }
+                      onBlur={() => handleVitalInputBlur('temperature', 93, 109, 1)}
                       className="min-h-[44px] w-full rounded-xl border border-slate-300 bg-white px-3 text-center font-mono text-lg font-semibold text-slate-900 tabular-nums focus:border-teal-700 focus:outline-none"
                     />
                     <button
@@ -826,10 +934,9 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
                     type="number"
                     min={35}
                     max={220}
-                    value={vitals.heartRate}
-                    onChange={(e) =>
-                      setVitals((prev) => ({...prev, heartRate: Number(e.target.value)}))
-                    }
+                    value={vitalDrafts.heartRate ?? String(vitals.heartRate)}
+                    onChange={(e) => handleVitalInputChange('heartRate', e.target.value, 35, 220)}
+                    onBlur={() => handleVitalInputBlur('heartRate', 35, 220)}
                     className="min-h-[44px] w-full rounded-xl border border-slate-300 bg-white px-3 text-center font-mono text-base font-semibold text-slate-900 tabular-nums focus:border-teal-700 focus:outline-none"
                   />
                   <button
@@ -1017,14 +1124,7 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
                 {triage.severity === 'emergency' && networkState !== 'offline' && (
                   <button
                     type="button"
-                    onClick={() => {
-                      if (!patientName.trim()) {
-                        setFormError('Please enter the patient’s name before sending an SMS alert.');
-                        return;
-                      }
-                      setSmsGatewayFeedback(null);
-                      setSmsModalOpen(true);
-                    }}
+                    onClick={openEmergencySmsModal}
                     className="flex min-h-[46px] w-full items-center justify-center gap-2 rounded-xl border border-red-300 bg-white px-4 py-2.5 text-sm font-semibold text-red-700 transition-colors hover:bg-red-50 whitespace-nowrap cursor-pointer"
                   >
                     <Send className="h-4 w-4 shrink-0" />
@@ -1273,7 +1373,7 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
       />
 
       {/* Emergency Text Message (SMS) Modal */}
-      {smsModalOpen && (
+      {smsModalOpen && smsDraft && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-xs"
           role="dialog"
@@ -1291,13 +1391,17 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
                     Send Urgent Text Alert (SMS)
                   </h3>
                   <p className="text-xs text-slate-600">
-                    Reaches the hospital even without mobile internet
+                    {smsDraft.record.patientName} ({smsDraft.record.patientId}) · Reaches hospital
+                    without internet
                   </p>
                 </div>
               </div>
               <button
                 type="button"
-                onClick={() => setSmsModalOpen(false)}
+                onClick={() => {
+                  setSmsModalOpen(false);
+                  setSmsDraft(null);
+                }}
                 className="flex min-h-[38px] min-w-[38px] items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 hover:text-slate-900 cursor-pointer"
                 aria-label="Close SMS dialog"
               >
@@ -1309,14 +1413,16 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
               <div>
                 <div className="mb-1.5 flex items-center justify-between text-xs text-slate-600">
                   <span className="font-semibold text-slate-800">Compact SMS Code</span>
-                  <span className="font-mono tabular-nums">{bitPacked28CharSms.length} chars</span>
+                  <span className="font-mono tabular-nums">
+                    {smsDraft.bitPackedSms.length} chars
+                  </span>
                 </div>
                 <div className="flex items-center justify-between gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-3 font-mono text-sm font-semibold text-slate-900">
-                  <span className="truncate">{bitPacked28CharSms}</span>
+                  <span className="truncate">{smsDraft.bitPackedSms}</span>
                   <button
                     type="button"
                     onClick={() => {
-                      navigator.clipboard?.writeText(bitPacked28CharSms);
+                      navigator.clipboard?.writeText(smsDraft.bitPackedSms);
                       setCopiedPayload(true);
                       if (copyTimerRef.current !== null) {
                         window.clearTimeout(copyTimerRef.current);
@@ -1338,7 +1444,7 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
 
               <div className="rounded-xl border border-slate-200 bg-slate-50 p-3.5 text-xs text-slate-700">
                 <p className="font-semibold text-slate-800">Readable Summary Format</p>
-                <p className="mt-1 font-mono text-slate-900 break-all">{compactSmsTag}</p>
+                <p className="mt-1 font-mono text-slate-900 break-all">{smsDraft.compactTag}</p>
               </div>
 
               {smsGatewayFeedback && (
@@ -1367,7 +1473,10 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
                 </button>
 
                 <a
-                  href={smsGatewayFeedback?.nativeUri || defaultNativeSmsUri}
+                  href={smsGatewayFeedback?.nativeUri || smsDraft.nativeUri}
+                  onClick={() => {
+                    ensureSmsDraftRecordSaved();
+                  }}
                   className="flex min-h-[46px] w-full items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-800 transition-colors hover:bg-slate-50"
                 >
                   <ExternalLink className="h-4 w-4 text-teal-700" />

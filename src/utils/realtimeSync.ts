@@ -5,6 +5,7 @@ import {
   encryptVaultData,
   isEncryptedVaultEnvelope,
 } from './cryptoVault';
+import {safeReadJson} from './safeFetchJson';
 
 export const LEGACY_SINGLETON_VAULT_KEY = 'healthsync_aes_gcm_vault_v1';
 export const SCOPED_VAULT_KEY_PREFIX = 'healthsync_aes_gcm_vault_v2_';
@@ -304,6 +305,7 @@ export class HealthSyncRealtimeClient {
   private ws: WebSocket | null = null;
   private bc: BroadcastChannel | null = null;
   private reconnectTimer: number | null = null;
+  private reconnectAttempts = 0;
   private destroyed = false;
   private sessionToken: string;
   private onMessageCallback: (msg: RealtimeEventMessage) => void;
@@ -359,6 +361,9 @@ export class HealthSyncRealtimeClient {
       socket.onmessage = (event) => {
         try {
           const parsed = JSON.parse(String(event.data)) as RealtimeEventMessage;
+          if (parsed.type === 'sync:init') {
+            this.reconnectAttempts = 0;
+          }
           this.onMessageCallback(parsed);
         } catch (err) {
           console.error('[HealthSync WS] Invalid JSON frame from server:', err);
@@ -366,10 +371,12 @@ export class HealthSyncRealtimeClient {
       };
 
       socket.onclose = (event) => {
-        if (!this.destroyed && event.code !== 4001) {
+        if (!this.destroyed && event.code !== 4001 && this.reconnectAttempts < 8) {
+          const delayMs = Math.min(30_000, 3_000 * 2 ** this.reconnectAttempts);
+          this.reconnectAttempts += 1;
           this.reconnectTimer = window.setTimeout(() => {
             this.connectWebSocket();
-          }, 3000);
+          }, delayMs);
         }
       };
     } catch (err) {
@@ -415,12 +422,25 @@ export class HealthSyncRealtimeClient {
         body: JSON.stringify({record, triggerEmergencySiren, incentive}),
       });
 
-      const body = (await resp.json().catch(() => ({}))) as {
+      const parsed = await safeReadJson<{
         ok?: boolean;
         record?: TriageRecord;
         error?: string;
-      };
+      }>(resp);
 
+      if (!parsed.isJson) {
+        const unavailableMsg =
+          'Server sync endpoint unavailable on this connection; record safely queued offline.';
+        this.onMessageCallback({
+          type: 'sync:error',
+          recordId: record.id,
+          error: unavailableMsg,
+          retryable: true,
+        });
+        return {ok: false, error: unavailableMsg, retryable: true};
+      }
+
+      const body = parsed.data || {};
       if (!resp.ok) {
         const errMsg = body.error || `Server rejected triage sync (HTTP ${resp.status}).`;
         const retryable = resp.status >= 500 || resp.status === 429;
@@ -476,10 +496,10 @@ export class HealthSyncRealtimeClient {
         body: JSON.stringify({ambulanceUnit, etaMinutes}),
       });
       if (!resp.ok) return null;
-      const data = (await resp.json()) as {record?: TriageRecord};
-      if (data.record) {
-        this.bc?.postMessage({type: 'record:updated', record: data.record});
-        return data.record;
+      const parsed = await safeReadJson<{record?: TriageRecord}>(resp);
+      if (parsed.isJson && parsed.data?.record) {
+        this.bc?.postMessage({type: 'record:updated', record: parsed.data.record});
+        return parsed.data.record;
       }
       return null;
     } catch {

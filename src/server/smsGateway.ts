@@ -71,7 +71,13 @@ export async function dispatchEmergencySms(params: {
         },
         body: form.toString(),
       });
-      const json = (await resp.json()) as {sid?: string; message?: string};
+      const rawTwilioText = await resp.text();
+      let json: {sid?: string; message?: string} = {};
+      try {
+        json = JSON.parse(rawTwilioText) as {sid?: string; message?: string};
+      } catch {
+        json = {};
+      }
       if (!resp.ok) {
         const errMsg = json.message || `Twilio HTTP ${resp.status}`;
         const log = params.db.logSmsDispatch({
@@ -157,11 +163,21 @@ export async function dispatchEmergencySms(params: {
           numbers: digitsOnly,
         }),
       });
-      const json = (await resp.json()) as {
+      const rawFastText = await resp.text();
+      let json: {
         return?: boolean;
         request_id?: string;
         message?: string[] | string;
-      };
+      } = {};
+      try {
+        json = JSON.parse(rawFastText) as {
+          return?: boolean;
+          request_id?: string;
+          message?: string[] | string;
+        };
+      } catch {
+        json = {};
+      }
       if (!resp.ok || json.return === false) {
         const errMsg = Array.isArray(json.message)
           ? json.message.join(', ')

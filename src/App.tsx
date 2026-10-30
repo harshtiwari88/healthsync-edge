@@ -8,6 +8,7 @@ import {
   purgeLegacyPlaintextStorage,
   RealtimeEventMessage,
 } from './utils/realtimeSync';
+import {safeReadJson} from './utils/safeFetchJson';
 import {sirenEngine} from './utils/sirenAudio';
 import {
   AshaNavTab,
@@ -29,6 +30,35 @@ function mergeRecordsById(primary: TriageRecord[], secondary: TriageRecord[]): T
     byId.set(rec.id, rec);
   }
   return Array.from(byId.values()).sort((a, b) => b.createdAtMs - a.createdAtMs);
+}
+
+function buildIncentiveForRecord(rec: TriageRecord): IncentiveEntry {
+  const isHighRisk = rec.severity === 'emergency' || rec.severity === 'moderate';
+  return {
+    id: `inc-${rec.id}`,
+    taskTitle: isHighRisk
+      ? 'Priority Referral & Health Stabilization'
+      : 'Community Vital Signs Checkup',
+    programCode: isHighRisk ? 'NHM-HRP-50' : 'NPCDCS-20',
+    patientRef: `${rec.patientId} · ${rec.patientName}`,
+    amountInr: isHighRisk ? 50 : 20,
+    timestamp: rec.timestamp,
+    abdmVerified: true,
+  };
+}
+
+function mergeIncentivesById(
+  serverEntries: IncentiveEntry[],
+  derivedEntries: IncentiveEntry[]
+): IncentiveEntry[] {
+  const byId = new Map<string, IncentiveEntry>();
+  for (const item of derivedEntries) {
+    byId.set(item.id, item);
+  }
+  for (const item of serverEntries) {
+    byId.set(item.id, item);
+  }
+  return Array.from(byId.values());
 }
 
 export function App() {
@@ -96,17 +126,27 @@ export function App() {
     );
   }, [records]);
 
+  const networkStateRef = useRef<NetworkState>(networkState);
+  networkStateRef.current = networkState;
+
   const flushOfflineQueue = useCallback(() => {
     // Defer network side-effects outside React state updaters so StrictMode/concurrent renders never double-fire
     window.setTimeout(() => {
+      if (networkStateRef.current === 'offline') return;
       const queued = recordsRef.current.filter((rec) => rec.syncStatus === 'Queued Offline');
       if (queued.length === 0) return;
 
       for (const rec of queued) {
-        const candidateSynced: TriageRecord = {...rec, syncStatus: 'Synced'};
+        const candidateSynced: TriageRecord = {
+          ...rec,
+          syncStatus: rec.channel === 'Emergency SMS' ? 'SMS Delivered' : 'Synced',
+        };
+        const incentive =
+          userRoleRef.current === 'ASHA' ? buildIncentiveForRecord(rec) : undefined;
         void realtimeRef.current?.publishRecordCreated(
           candidateSynced,
-          candidateSynced.severity === 'emergency'
+          candidateSynced.severity === 'emergency',
+          incentive
         );
       }
     }, 0);
@@ -151,20 +191,26 @@ export function App() {
       if (msg.type === 'sync:init' && Array.isArray(msg.records)) {
         const allowedRecords = msg.records.filter(canCurrentUserAccessRecord);
         setRecords((prev) => mergeRecordsById(allowedRecords, prev));
+        if (networkStateRef.current !== 'offline') {
+          flushOfflineQueue();
+        }
       } else if (msg.type === 'record:created') {
         if (!canCurrentUserAccessRecord(msg.record)) return;
+        const alreadyKnown = recordsRef.current.some((r) => r.id === msg.record.id);
         setRecords((prev) => {
           if (prev.some((r) => r.id === msg.record.id)) return prev;
           return [msg.record, ...prev];
         });
 
-        if (msg.triggerEmergencySiren || msg.record.severity === 'emergency') {
-          setSirenActive(true);
-          if (isAuthRef.current && userRoleRef.current === 'DMO') {
-            sirenEngine.startLoopingSiren();
+        if (!alreadyKnown) {
+          if (msg.triggerEmergencySiren || msg.record.severity === 'emergency') {
+            setSirenActive(true);
+            if (isAuthRef.current && userRoleRef.current === 'DMO') {
+              sirenEngine.startLoopingSiren();
+            }
+          } else if (isAuthRef.current && userRoleRef.current === 'DMO') {
+            sirenEngine.playAlertBeep();
           }
-        } else if (isAuthRef.current && userRoleRef.current === 'DMO') {
-          sirenEngine.playAlertBeep();
         }
       } else if (msg.type === 'record:updated') {
         setRecords((prev) => {
@@ -213,7 +259,7 @@ export function App() {
       client.destroy();
       realtimeRef.current = null;
     };
-  }, [isAuthenticated, sessionToken]);
+  }, [isAuthenticated, sessionToken, flushOfflineQueue]);
 
   const handleSelectNetwork = (nextMode: NetworkState) => {
     const wasOffline = networkState === 'offline';
@@ -248,6 +294,11 @@ export function App() {
       const localDecrypted = await loadEncryptedRecords(session.vaultKey, [], userScope);
       isVaultHydratedRef.current = true;
       setRecords([...localDecrypted]);
+      const localDerivedIncentives =
+        session.user.role === 'ASHA' ? localDecrypted.map(buildIncentiveForRecord) : [];
+      if (localDerivedIncentives.length > 0) {
+        setIncentives(localDerivedIncentives);
+      }
 
       // 2. Sync authoritative records & incentives from SQLite server when online
       if (networkState !== 'offline' && session.token !== 'OFFLINE_LOCAL_SESSION') {
@@ -261,13 +312,19 @@ export function App() {
         ]);
 
         if (recordsRes.ok) {
-          const data = (await recordsRes.json()) as {records?: TriageRecord[]};
-          if (Array.isArray(data.records)) {
+          const parsedRecords = await safeReadJson<{records?: TriageRecord[]}>(recordsRes);
+          const data = parsedRecords.isJson && parsedRecords.data ? parsedRecords.data : null;
+          if (data && Array.isArray(data.records)) {
             const unsynced = localDecrypted.filter((r) => r.syncStatus === 'Queued Offline');
             const confirmedSyncedById = new Map<string, TriageRecord>();
 
             for (const q of unsynced) {
-              const syncedCopy: TriageRecord = {...q, syncStatus: 'Synced'};
+              const syncedCopy: TriageRecord = {
+                ...q,
+                syncStatus: q.channel === 'Emergency SMS' ? 'SMS Delivered' : 'Synced',
+              };
+              const derivedIncentive =
+                session.user.role === 'ASHA' ? buildIncentiveForRecord(q) : undefined;
               try {
                 const postRes = await fetch('/api/records', {
                   method: 'POST',
@@ -278,13 +335,12 @@ export function App() {
                   body: JSON.stringify({
                     record: syncedCopy,
                     triggerEmergencySiren: syncedCopy.severity === 'emergency',
+                    incentive: derivedIncentive,
                   }),
                 });
-                if (postRes.ok) {
-                  const postJson = (await postRes.json().catch(() => ({}))) as {
-                    record?: TriageRecord;
-                  };
-                  confirmedSyncedById.set(q.id, postJson.record ?? syncedCopy);
+                const parsedPost = await safeReadJson<{record?: TriageRecord}>(postRes);
+                if (postRes.ok && parsedPost.isJson) {
+                  confirmedSyncedById.set(q.id, parsedPost.data?.record ?? syncedCopy);
                 } else {
                   console.error(
                     `[HealthSync Offline Sync] Server rejected queued record ${q.id} (HTTP ${postRes.status}). Keeping in offline queue.`
@@ -309,9 +365,9 @@ export function App() {
         }
 
         if (incentivesRes.ok) {
-          const incData = (await incentivesRes.json()) as {incentives?: IncentiveEntry[]};
-          if (Array.isArray(incData.incentives)) {
-            setIncentives(incData.incentives);
+          const parsedInc = await safeReadJson<{incentives?: IncentiveEntry[]}>(incentivesRes);
+          if (parsedInc.isJson && Array.isArray(parsedInc.data?.incentives)) {
+            setIncentives(mergeIncentivesById(parsedInc.data.incentives, localDerivedIncentives));
           }
         }
       }
@@ -352,33 +408,26 @@ export function App() {
   const handleSaveRecord = (newRecord: TriageRecord, isEmergencySms: boolean) => {
     sirenEngine.unlock();
 
-    // Until the server confirms SQLite persistence via sync:ack, store non-SMS records safely as 'Queued Offline'
-    const safeLocalRecord: TriageRecord = isEmergencySms
-      ? newRecord
-      : {...newRecord, syncStatus: 'Queued Offline'};
+    // Until the server confirms SQLite persistence via sync:ack, store records safely as 'Queued Offline'
+    const safeLocalRecord: TriageRecord = {...newRecord, syncStatus: 'Queued Offline'};
 
-    setRecords((prev) => [safeLocalRecord, ...prev]);
+    setRecords((prev) => {
+      if (prev.some((r) => r.id === safeLocalRecord.id)) return prev;
+      return [safeLocalRecord, ...prev];
+    });
 
-    const isHighRisk = newRecord.severity === 'emergency' || newRecord.severity === 'moderate';
-    const rewardAmount = isHighRisk ? 50 : 20;
-    const newIncentive: IncentiveEntry = {
-      id: `inc-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      taskTitle: isHighRisk
-        ? 'Priority Referral & Health Stabilization'
-        : 'Community Vital Signs Checkup',
-      programCode: isHighRisk ? 'NHM-HRP-50' : 'NPCDCS-20',
-      patientRef: `${newRecord.patientId} · ${newRecord.patientName}`,
-      amountInr: rewardAmount,
-      timestamp: newRecord.timestamp,
-      abdmVerified: true,
-    };
-    setIncentives((prev) => [newIncentive, ...prev]);
+    const newIncentive = buildIncentiveForRecord(newRecord);
+    setIncentives((prev) => {
+      if (prev.some((inc) => inc.id === newIncentive.id)) return prev;
+      return [newIncentive, ...prev];
+    });
 
-    if (networkState !== 'offline' || isEmergencySms) {
+    if (networkState !== 'offline' && sessionToken !== 'OFFLINE_LOCAL_SESSION') {
       const triggerSiren = isEmergencySms || newRecord.severity === 'emergency';
-      const serverPayload: TriageRecord = isEmergencySms
-        ? newRecord
-        : {...newRecord, syncStatus: 'Synced'};
+      const serverPayload: TriageRecord = {
+        ...newRecord,
+        syncStatus: isEmergencySms ? 'SMS Delivered' : 'Synced',
+      };
       void realtimeRef.current?.publishRecordCreated(serverPayload, triggerSiren, newIncentive);
       if (triggerSiren) {
         setSirenActive(true);
@@ -442,6 +491,7 @@ export function App() {
         userRole={userRole}
         userIdentifier={userIdentifier}
         userDisplayName={authUser?.displayName}
+        isLocalSession={sessionToken === 'OFFLINE_LOCAL_SESSION'}
         networkState={networkState}
         browserOnline={browserOnline}
         pendingOfflineCount={pendingOfflineCount}

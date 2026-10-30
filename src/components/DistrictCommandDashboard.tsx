@@ -32,6 +32,7 @@ import {
   encodeVitalsToSMS,
 } from '../utils/binarySmsCodec';
 import {useIsDesktopViewport, useVirtualWindow} from '../utils/virtualWindow';
+import {safeReadJson} from '../utils/safeFetchJson';
 import {DmoNavTab} from './TopRoleToolbar';
 
 interface ClinicalBriefResult {
@@ -139,8 +140,12 @@ export const DistrictCommandDashboard: React.FC<DistrictCommandDashboardProps> =
     fetch('/api/sms/logs', {
       headers: {Authorization: `Bearer ${sessionToken}`},
     })
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data: {logs?: SmsLogItem[]; gateway?: SmsGatewayInfo} | null) => {
+      .then(async (r) => {
+        if (!r.ok) return null;
+        const parsed = await safeReadJson<{logs?: SmsLogItem[]; gateway?: SmsGatewayInfo}>(r);
+        return parsed.isJson ? parsed.data : null;
+      })
+      .then((data) => {
         if (!cancelled && data) {
           if (Array.isArray(data.logs)) setSmsLogs(data.logs);
           if (data.gateway) setSmsGateway(data.gateway);
@@ -185,11 +190,16 @@ export const DistrictCommandDashboard: React.FC<DistrictCommandDashboardProps> =
           language: 'en',
         }),
       });
-      const data = await resp.json();
-      if (!resp.ok) {
-        throw new Error(data?.error || 'Unable to generate Care Summary right now.');
+      const parsed = await safeReadJson<ClinicalBriefResult & {error?: string}>(resp);
+      if (!parsed.isJson || !parsed.data) {
+        throw new Error(
+          'Care Summary service could not be reached on this deployment. Check clinical readings directly above.'
+        );
       }
-      setBriefsByRecord((prev) => ({...prev, [rec.id]: data as ClinicalBriefResult}));
+      if (!resp.ok) {
+        throw new Error(parsed.data.error || 'Unable to generate Care Summary right now.');
+      }
+      setBriefsByRecord((prev) => ({...prev, [rec.id]: parsed.data!}));
     } catch (err) {
       setBriefErrorByRecord((prev) => ({
         ...prev,
@@ -744,14 +754,21 @@ export const DistrictCommandDashboard: React.FC<DistrictCommandDashboardProps> =
                     </div>
 
                     {/* Simple, meaningful proportion bar */}
-                    <div className="mt-2.5 h-1.5 w-full overflow-hidden rounded-full bg-slate-100">
-                      <div
-                        className={`h-full rounded-full ${
-                          vilStats.urgent > 0 ? 'bg-red-500' : 'bg-teal-600'
-                        }`}
-                        style={{width: `${barPercent}%`}}
+                    <svg
+                      viewBox="0 0 100 6"
+                      preserveAspectRatio="none"
+                      aria-hidden="true"
+                      className="mt-2.5 h-1.5 w-full overflow-hidden rounded-full bg-slate-100"
+                    >
+                      <rect
+                        x={0}
+                        y={0}
+                        width={barPercent}
+                        height={6}
+                        rx={3}
+                        className={vilStats.urgent > 0 ? 'fill-red-500' : 'fill-teal-600'}
                       />
-                    </div>
+                    </svg>
                   </button>
                 );
               })}

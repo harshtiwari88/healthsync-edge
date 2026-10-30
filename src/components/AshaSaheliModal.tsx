@@ -8,6 +8,7 @@ import {
   parseClinicalTranscript,
   speakClinicalGuidance,
 } from '../utils/speechEngine';
+import {safeReadJson} from '../utils/safeFetchJson';
 
 interface ChatTurn {
   id: string;
@@ -179,17 +180,24 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
           language: speechLang === 'hi-IN' ? 'hi' : 'en',
         }),
       });
-      const data = (await resp.json()) as {
+      const parsed = await safeReadJson<{
         error?: string;
         handoffSummary?: string;
         redFlags?: string[];
         stabilizationSteps?: string[];
         hindiGuidance?: string;
         disclaimer?: string;
-      };
+      }>(resp);
 
       if (!isMountedRef.current) return;
 
+      if (!parsed.isJson) {
+        throw new Error(
+          'Care Summary service is unavailable on this connection. Voice readings and local checkup guidance remain active.'
+        );
+      }
+
+      const data = parsed.data || {};
       if (!resp.ok || !data.handoffSummary) {
         throw new Error(data.error || 'Could not generate Care Summary right now.');
       }

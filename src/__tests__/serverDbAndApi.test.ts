@@ -779,6 +779,213 @@ describe('SQLite Persistence, AES-256-GCM At-Rest PHI Encryption & Authenticated
       (globalThis as {window?: unknown}).window = originalWindow;
     }
   });
+
+  it('safely handles non-JSON "The page could not be found" responses, Express /api JSON errors, and Vercel /api/index rewrites', async () => {
+    const {isBackendUnavailableResponse, safeReadJson} = await import(
+      '../utils/safeFetchJson.ts'
+    );
+
+    // 1. Reproduce exact screenshot error payload ("The page could not be found")
+    const vercel404 = new Response('The page could not be found\n\nNOT_FOUND', {
+      status: 404,
+      headers: {'Content-Type': 'text/plain; charset=utf-8'},
+    });
+    const parsed404 = await safeReadJson<{error?: string}>(vercel404);
+    expect(parsed404.isJson).toBe(false);
+    expect(parsed404.data).toBeNull();
+    expect(isBackendUnavailableResponse(vercel404, parsed404)).toBe(true);
+
+    // 2. Reproduce SPA HTML fallback (200 text/html)
+    const htmlFallback = new Response('<!doctype html><html><body>SwasthyaSetu</body></html>', {
+      status: 200,
+      headers: {'Content-Type': 'text/html'},
+    });
+    const parsedHtml = await safeReadJson(htmlFallback);
+    expect(parsedHtml.isJson).toBe(false);
+    expect(isBackendUnavailableResponse(htmlFallback, parsedHtml)).toBe(true);
+
+    // 3. Verify Express /api unknown route and malformed JSON body return valid JSON (never HTML/text)
+    const memDb = new HealthSyncDatabase(':memory:', 'json-safety-key');
+    const {httpServer} = await createHealthSyncServer(memDb);
+    await new Promise<void>((resolve) => httpServer.listen(0, '127.0.0.1', () => resolve()));
+    const port = (httpServer.address() as AddressInfo).port;
+    const baseUrl = `http://127.0.0.1:${port}`;
+
+    try {
+      const unknownApiRes = await fetch(`${baseUrl}/api/non-existent-route`);
+      expect(unknownApiRes.status).toBe(404);
+      const unknownParsed = await safeReadJson<{error?: string}>(unknownApiRes);
+      expect(unknownParsed.isJson).toBe(true);
+      expect(unknownParsed.data?.error).toContain('not found');
+
+      const malformedBodyRes = await fetch(`${baseUrl}/api/auth/register`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: '{invalid-json',
+      });
+      expect(malformedBodyRes.status).toBe(400);
+      const malformedParsed = await safeReadJson<{error?: string}>(malformedBodyRes);
+      expect(malformedParsed.isJson).toBe(true);
+    } finally {
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      memDb.close();
+    }
+
+    // 4. Verify Vercel serverless handler (/api/index.ts) routes rewritten /api/auth/register cleanly
+    const http = await import('http');
+    const {default: vercelHandler} = await import('../../api/index.ts');
+    const vercelServer = http.createServer((req, res) => {
+      void vercelHandler(req, res);
+    });
+    await new Promise<void>((resolve) => vercelServer.listen(0, '127.0.0.1', () => resolve()));
+    const vPort = (vercelServer.address() as AddressInfo).port;
+    try {
+      const uniqueAshaId = `ASHA-234-${Date.now()}`;
+      const regRes = await fetch(
+        `http://127.0.0.1:${vPort}/api/index?__hs_path=auth/register`,
+        {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            identifier: uniqueAshaId,
+            secret: '1234',
+            role: 'ASHA',
+            displayName: 'Sushma devi',
+            villageCode: 'VIL-204',
+          }),
+        }
+      );
+      expect(regRes.status).toBe(201);
+      const regParsed = await safeReadJson<{token?: string; user?: {identifier: string}}>(regRes);
+      expect(regParsed.isJson).toBe(true);
+      expect(regParsed.data?.token).toBeTruthy();
+      expect(regParsed.data?.user?.identifier).toBe(uniqueAshaId.toUpperCase());
+    } finally {
+      await new Promise<void>((resolve) => vercelServer.close(() => resolve()));
+    }
+  });
+
+  it('serves valid PWA PNG icons, reports DMO provisioning status, persists ASHA stipends, and handles Gemini API config cleanly', async () => {
+    const publicDir = path.resolve(process.cwd(), 'public');
+    for (const iconName of [
+      'pwa-192x192.png',
+      'pwa-512x512.png',
+      'pwa-maskable-512x512.png',
+      'apple-touch-icon.png',
+    ]) {
+      const iconBytes = fs.readFileSync(path.join(publicDir, iconName));
+      expect(iconBytes.length).toBeGreaterThan(64);
+      // PNG magic header: 89 50 4E 47
+      expect(iconBytes[0]).toBe(0x89);
+      expect(iconBytes[1]).toBe(0x50);
+      expect(iconBytes[2]).toBe(0x4e);
+      expect(iconBytes[3]).toBe(0x47);
+    }
+
+    const prevGemKey = process.env.GEMINI_API_KEY;
+    const prevDmoSecret = process.env.DMO_PROVISIONING_SECRET;
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.DMO_PROVISIONING_SECRET;
+
+    const memDb = new HealthSyncDatabase(':memory:', 'stipend-gemini-test-key');
+    const {httpServer} = await createHealthSyncServer(memDb);
+    await new Promise<void>((resolve) => httpServer.listen(0, '127.0.0.1', () => resolve()));
+    const port = (httpServer.address() as AddressInfo).port;
+    const baseUrl = `http://127.0.0.1:${port}`;
+
+    try {
+      const statusRes = await fetch(`${baseUrl}/api/auth/status`);
+      expect(statusRes.status).toBe(200);
+      const statusJson = (await statusRes.json()) as {
+        hasRegisteredUsers: boolean;
+        dmoProvisioningEnabled: boolean;
+      };
+      expect(statusJson.dmoProvisioningEnabled).toBe(false);
+
+      const regRes = await fetch(`${baseUrl}/api/auth/register`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          identifier: 'ASHA-7711-UP',
+          secret: '4829',
+          role: 'ASHA',
+          displayName: 'Rekha Devi',
+          villageCode: 'VIL-204',
+        }),
+      });
+      expect(regRes.status).toBe(201);
+      const {token} = (await regRes.json()) as {token: string};
+
+      const rec = makeSampleRecord(501);
+      const saveRes = await fetch(`${baseUrl}/api/records`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          record: rec,
+          incentive: {
+            id: `inc-${rec.id}`,
+            taskTitle: 'Priority Referral & Health Stabilization',
+            programCode: 'NHM-HRP-50',
+            patientRef: `${rec.patientId} · ${rec.patientName}`,
+            amountInr: 150,
+            timestamp: rec.timestamp,
+            abdmVerified: true,
+          },
+        }),
+      });
+      expect(saveRes.status).toBe(201);
+
+      const listRes = await fetch(`${baseUrl}/api/records`, {
+        headers: {Authorization: `Bearer ${token}`},
+      });
+      const listed = (await listRes.json()) as {
+        records: TriageRecord[];
+      };
+      expect(listed.records.some((r) => r.id === rec.id)).toBe(true);
+
+      const incRes = await fetch(`${baseUrl}/api/incentives`, {
+        headers: {Authorization: `Bearer ${token}`},
+      });
+      expect(incRes.status).toBe(200);
+      const incJson = (await incRes.json()) as {
+        incentives: Array<{id: string; amountInr: number}>;
+      };
+      expect(incJson.incentives.some((i) => i.id === `inc-${rec.id}` && i.amountInr === 150)).toBe(
+        true
+      );
+
+      const geminiRes = await fetch(`${baseUrl}/api/gemini/clinical-summary`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          patientName: 'Sita Devi',
+          age: 29,
+          vitals: rec.vitals,
+          symptoms: ['Fever'],
+          transcript: 'Fever for two days',
+        }),
+      });
+      expect(geminiRes.status).toBe(502);
+      const geminiErr = (await geminiRes.json()) as {error?: string};
+      expect(geminiErr.error).toContain('GEMINI_API_KEY');
+    } finally {
+      if (prevGemKey === undefined) delete process.env.GEMINI_API_KEY;
+      else process.env.GEMINI_API_KEY = prevGemKey;
+
+      if (prevDmoSecret === undefined) delete process.env.DMO_PROVISIONING_SECRET;
+      else process.env.DMO_PROVISIONING_SECRET = prevDmoSecret;
+
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      memDb.close();
+    }
+  });
 });
+
 
 

@@ -31,6 +31,11 @@ function resolveWritableDbPath(requestedPath: string): string {
   if (requestedPath === ':memory:') {
     return ':memory:';
   }
+  if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME) {
+    const fallbackDir = path.join(os.tmpdir(), 'healthsync-edge');
+    fs.mkdirSync(fallbackDir, {recursive: true});
+    return path.join(fallbackDir, path.basename(requestedPath) || 'healthsync.sqlite');
+  }
   try {
     const dir = path.dirname(requestedPath);
     fs.mkdirSync(dir, {recursive: true});
@@ -76,9 +81,25 @@ export class HealthSyncDatabase {
   constructor(dbPath = process.env.SQLITE_DB_PATH || './data/healthsync.sqlite', explicitKey?: string) {
     const effectivePath = resolveWritableDbPath(dbPath);
     this.masterKey = resolveMasterKey(effectivePath, explicitKey);
-    this.db = new Database(effectivePath);
-    this.db.pragma('journal_mode = WAL');
-    this.db.pragma('synchronous = NORMAL');
+    try {
+      this.db = new Database(effectivePath);
+    } catch {
+      const tmpFallback =
+        effectivePath === ':memory:'
+          ? ':memory:'
+          : path.join(os.tmpdir(), `healthsync-${process.pid}.sqlite`);
+      try {
+        this.db = new Database(tmpFallback);
+      } catch {
+        this.db = new Database(':memory:');
+      }
+    }
+    try {
+      this.db.pragma('journal_mode = WAL');
+      this.db.pragma('synchronous = NORMAL');
+    } catch {
+      // Ignore WAL pragma unsupported on ephemeral tmpfs mounts
+    }
     this.db.pragma('foreign_keys = ON');
     this.initSchema();
   }
@@ -461,6 +482,15 @@ export class HealthSyncDatabase {
   }
 
   public insertIncentive(entry: IncentiveEntry, userIdentifier: string): IncentiveEntry {
+    const normalized: IncentiveEntry = {
+      id: String(entry.id),
+      taskTitle: String(entry.taskTitle || 'Community Vital Signs Checkup'),
+      programCode: String(entry.programCode || 'NPCDCS-20'),
+      patientRef: String(entry.patientRef || 'PT-RECORD'),
+      amountInr: Number.isFinite(Number(entry.amountInr)) ? Number(entry.amountInr) : 20,
+      timestamp: String(entry.timestamp || 'Just now'),
+      abdmVerified: Boolean(entry.abdmVerified ?? true),
+    };
     this.db
       .prepare(
         `INSERT OR REPLACE INTO incentive_entries (
@@ -468,17 +498,17 @@ export class HealthSyncDatabase {
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
-        entry.id,
+        normalized.id,
         userIdentifier.toUpperCase(),
-        entry.taskTitle,
-        entry.programCode,
-        entry.patientRef,
-        entry.amountInr,
-        entry.timestamp,
-        entry.abdmVerified ? 1 : 0,
+        normalized.taskTitle,
+        normalized.programCode,
+        normalized.patientRef,
+        normalized.amountInr,
+        normalized.timestamp,
+        normalized.abdmVerified ? 1 : 0,
         Date.now()
       );
-    return entry;
+    return normalized;
   }
 
   public listIncentives(userIdentifier?: string): IncentiveEntry[] {

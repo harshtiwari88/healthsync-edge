@@ -230,6 +230,12 @@ export async function saveOfflineLoginVerifier(params: {
   return {vaultKey, salt: existingSalt};
 }
 
+export function hasOfflineLoginVerifier(identifier: string, role: 'ASHA' | 'DMO'): boolean {
+  const map = loadVerifierMap();
+  const normKey = `${role}:${identifier.trim().toUpperCase()}`;
+  return Boolean(map[normKey]);
+}
+
 export async function verifyOfflineLogin(params: {
   identifier: string;
   role: 'ASHA' | 'DMO';

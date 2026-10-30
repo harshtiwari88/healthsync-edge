@@ -13,7 +13,12 @@ import {
   UserPlus,
 } from 'lucide-react';
 import {NetworkState, SUB_CENTER_DIRECTORY} from '../types/triage';
-import {saveOfflineLoginVerifier, verifyOfflineLogin} from '../utils/cryptoVault';
+import {
+  hasOfflineLoginVerifier,
+  saveOfflineLoginVerifier,
+  verifyOfflineLogin,
+} from '../utils/cryptoVault';
+import {isBackendUnavailableResponse, safeReadJson} from '../utils/safeFetchJson';
 import {sirenEngine} from '../utils/sirenAudio';
 
 export interface AuthenticatedSessionPayload {
@@ -46,17 +51,30 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
 
   const [submitting, setSubmitting] = useState<boolean>(false);
   const [firstRunNotice, setFirstRunNotice] = useState<boolean>(false);
+  const [dmoProvisioningEnabled, setDmoProvisioningEnabled] = useState<boolean | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
 
   useEffect(() => {
     if (networkState === 'offline') return;
     let cancelled = false;
     fetch('/api/auth/status')
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data: {hasRegisteredUsers?: boolean} | null) => {
-        if (!cancelled && data && data.hasRegisteredUsers === false) {
-          setFirstRunNotice(true);
-          setAuthMode('REGISTER');
+      .then(async (r) => {
+        if (!r.ok) return null;
+        const parsed = await safeReadJson<{
+          hasRegisteredUsers?: boolean;
+          dmoProvisioningEnabled?: boolean;
+        }>(r);
+        return parsed.isJson ? parsed.data : null;
+      })
+      .then((data) => {
+        if (!cancelled && data) {
+          if (typeof data.dmoProvisioningEnabled === 'boolean') {
+            setDmoProvisioningEnabled(data.dmoProvisioningEnabled);
+          }
+          if (data.hasRegisteredUsers === false) {
+            setFirstRunNotice(true);
+            setAuthMode('REGISTER');
+          }
         }
       })
       .catch(() => {});
@@ -100,10 +118,41 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
     sirenEngine.unlock();
 
     try {
-      if (networkState === 'offline') {
-        if (authMode === 'REGISTER') {
+      const provisionLocalAshaAccount = async () => {
+        const normalizedId = cleanId.toUpperCase();
+        if (hasOfflineLoginVerifier(normalizedId, 'ASHA')) {
           throw new Error(
-            'Creating a new account requires an internet connection. Switch to Online above to register first.'
+            `Account "${normalizedId}" is already created on this device. Switch to "Sign In" above.`
+          );
+        }
+        const effectiveName = displayName.trim() || `ASHA Worker (${normalizedId})`;
+        const effectiveVillage = villageCode.trim() || 'VIL-204';
+        const {vaultKey, salt} = await saveOfflineLoginVerifier({
+          identifier: normalizedId,
+          role: 'ASHA',
+          displayName: effectiveName,
+          villageCode: effectiveVillage,
+          secret,
+        });
+        onAuthenticated({
+          token: 'OFFLINE_LOCAL_SESSION',
+          user: {
+            identifier: normalizedId,
+            role: 'ASHA',
+            displayName: effectiveName,
+            villageCode: effectiveVillage,
+          },
+          vaultKey,
+          salt,
+        });
+      };
+
+      const signInWithLocalVerifier = async () => {
+        if (!hasOfflineLoginVerifier(cleanId, activeRole)) {
+          throw new Error(
+            activeRole === 'ASHA'
+              ? `No saved account found for "${cleanId.toUpperCase()}" on this device while the server is unavailable. Switch to "Create Account" above to set up your Health Worker profile.`
+              : 'Hospital server could not be reached. Please check your connection and try again.'
           );
         }
         const offlineSession = await verifyOfflineLogin({
@@ -117,26 +166,55 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
           vaultKey: offlineSession.vaultKey,
           salt: offlineSession.salt,
         });
+      };
+
+      if (networkState === 'offline') {
+        if (authMode === 'REGISTER') {
+          if (activeRole === 'DMO') {
+            throw new Error(
+              'Medical Officer (DMO) authorization requires an online hospital server connection.'
+            );
+          }
+          await provisionLocalAshaAccount();
+          return;
+        }
+        await signInWithLocalVerifier();
         return;
       }
 
       const endpoint = authMode === 'REGISTER' ? '/api/auth/register' : '/api/auth/login';
-      const resp = await fetch(endpoint, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          identifier: cleanId,
-          secret,
-          role: activeRole,
-          displayName: displayName.trim(),
-          villageCode: villageCode.trim() || 'VIL-204',
-          ...(authMode === 'REGISTER' && activeRole === 'DMO'
-            ? {dmoProvisioningCode: dmoProvisioningCode.trim()}
-            : {}),
-        }),
-      });
+      let resp: Response;
+      try {
+        resp = await fetch(endpoint, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            identifier: cleanId,
+            secret,
+            role: activeRole,
+            displayName: displayName.trim(),
+            villageCode: villageCode.trim() || 'VIL-204',
+            ...(authMode === 'REGISTER' && activeRole === 'DMO'
+              ? {dmoProvisioningCode: dmoProvisioningCode.trim()}
+              : {}),
+          }),
+        });
+      } catch {
+        // Network transport unreachable: fall back to encrypted local device verifier where authorized
+        if (authMode === 'REGISTER') {
+          if (activeRole === 'ASHA') {
+            await provisionLocalAshaAccount();
+            return;
+          }
+          throw new Error(
+            'Hospital server could not be reached to verify your Hospital Authorization Code. Please check your connection.'
+          );
+        }
+        await signInWithLocalVerifier();
+        return;
+      }
 
-      const data = (await resp.json()) as {
+      const parsed = await safeReadJson<{
         error?: string;
         token?: string;
         user?: {
@@ -145,9 +223,75 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
           displayName: string;
           villageCode: string;
         };
-      };
+      }>(resp);
 
+      // Handle static-host 404 ("The page could not be found") or gateway 502/503/504 gracefully without JSON crash
+      if (isBackendUnavailableResponse(resp, parsed)) {
+        if (authMode === 'REGISTER') {
+          if (activeRole === 'ASHA') {
+            await provisionLocalAshaAccount();
+            return;
+          }
+          throw new Error(
+            'Hospital authorization server is unavailable on this deployment. Medical Officer registration requires an active backend server, or select Health Worker (ASHA) to record checkups on this device.'
+          );
+        }
+        await signInWithLocalVerifier();
+        return;
+      }
+
+      const data = parsed.data || {};
       if (!resp.ok || !data.token || !data.user) {
+        // If an ASHA worker created her account offline on this device and is now signing in online
+        // for the first time, verify her local PBKDF2-600K PIN and upgrade her account on the server.
+        if (
+          authMode === 'LOGIN' &&
+          activeRole === 'ASHA' &&
+          resp.status === 401 &&
+          hasOfflineLoginVerifier(cleanId, 'ASHA')
+        ) {
+          const verifiedLocal = await verifyOfflineLogin({
+            identifier: cleanId,
+            role: 'ASHA',
+            secret,
+          });
+          const syncRegResp = await fetch('/api/auth/register', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              identifier: verifiedLocal.user.identifier,
+              secret,
+              role: 'ASHA',
+              displayName: verifiedLocal.user.displayName,
+              villageCode: verifiedLocal.user.villageCode,
+            }),
+          });
+          const syncParsed = await safeReadJson<{
+            token?: string;
+            user?: {
+              identifier: string;
+              role: 'ASHA' | 'DMO';
+              displayName: string;
+              villageCode: string;
+            };
+          }>(syncRegResp);
+          if (syncRegResp.ok && syncParsed.isJson && syncParsed.data?.token && syncParsed.data?.user) {
+            onAuthenticated({
+              token: syncParsed.data.token,
+              user: syncParsed.data.user,
+              vaultKey: verifiedLocal.vaultKey,
+              salt: verifiedLocal.salt,
+            });
+            return;
+          }
+          onAuthenticated({
+            token: 'OFFLINE_LOCAL_SESSION',
+            user: verifiedLocal.user,
+            vaultKey: verifiedLocal.vaultKey,
+            salt: verifiedLocal.salt,
+          });
+          return;
+        }
         throw new Error(data.error || 'Could not sign in. Please check your ID and password.');
       }
 
@@ -181,10 +325,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
             <p className="text-sm font-semibold text-teal-700">
               Community &amp; Hospital Care Coordination
             </p>
-            <h1
-              className="text-2xl font-bold tracking-tight text-slate-900 sm:text-4xl leading-tight"
-              style={{textWrap: 'balance'}}
-            >
+            <h1 className="text-2xl font-bold tracking-tight text-slate-900 sm:text-4xl leading-tight text-balance">
               Simple, reliable health checkups for rural communities and district hospitals.
             </h1>
             <p className="text-base leading-relaxed text-slate-600 max-w-xl">
@@ -449,7 +590,9 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
                     className="min-h-[48px] w-full rounded-xl border border-slate-300 bg-white px-3.5 text-base text-slate-900 placeholder:text-slate-400 focus:border-teal-700 focus:outline-none"
                   />
                   <p className="mt-1 text-xs text-slate-500">
-                    Required to verify official Medical Officer privileges before account creation.
+                    {dmoProvisioningEnabled === false
+                      ? 'Hospital admin note: Set DMO_PROVISIONING_SECRET (12+ chars) in server Secrets to authorize new Medical Officer registrations.'
+                      : 'Required to verify official Medical Officer privileges before account creation.'}
                   </p>
                 </div>
               )}

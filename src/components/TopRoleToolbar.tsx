@@ -13,6 +13,7 @@ interface TopRoleToolbarProps {
   userRole: UserRole;
   userIdentifier: string;
   userDisplayName?: string;
+  isLocalSession?: boolean;
   networkState: NetworkState;
   browserOnline: boolean;
   pendingOfflineCount?: number;
@@ -29,6 +30,7 @@ export const TopRoleToolbar: React.FC<TopRoleToolbarProps> = ({
   userRole,
   userIdentifier,
   userDisplayName,
+  isLocalSession = false,
   networkState,
   browserOnline,
   pendingOfflineCount = 0,
@@ -213,12 +215,23 @@ export const TopRoleToolbar: React.FC<TopRoleToolbarProps> = ({
                   Lightweight data sync is active for weak rural mobile networks.
                 </span>
               </>
+            ) : isLocalSession ? (
+              <>
+                <Signal className="h-4 w-4 shrink-0 text-teal-700" />
+                <span>
+                  <strong className="font-semibold text-slate-900">Saved on Device:</strong>{' '}
+                  Checkups are encrypted locally
+                  {pendingOfflineCount > 0 ? ` (${pendingOfflineCount} waiting to sync)` : ''} —
+                  sign in again when online to sync with the hospital.
+                </span>
+              </>
             ) : (
               <>
                 <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-700" />
                 <span>
                   <strong className="font-semibold text-slate-900">Connected:</strong> Checkups are
-                  encrypted and synced securely with the hospital.
+                  encrypted and synced securely with the hospital
+                  {pendingOfflineCount > 0 ? ` (${pendingOfflineCount} syncing...)` : '.'}
                 </span>
               </>
             )}

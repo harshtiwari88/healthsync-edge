@@ -178,46 +178,67 @@ export async function generateClinicalTriageSummary(
   const ai = getGeminiClient();
   const {prompt} = buildHardenedClinicalPrompt(input);
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-3.8-flash',
-    contents: prompt,
-    config: {
-      systemInstruction: CLINICAL_SYSTEM_INSTRUCTION,
-      temperature: 0.2,
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          handoffSummary: {
-            type: Type.STRING,
-            description: 'Concise SBAR clinical handoff summary in English.',
+  let rawText: string | undefined;
+  try {
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.8-flash',
+      contents: prompt,
+      config: {
+        systemInstruction: CLINICAL_SYSTEM_INSTRUCTION,
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            handoffSummary: {
+              type: Type.STRING,
+              description: 'Concise SBAR clinical handoff summary in English.',
+            },
+            redFlags: {
+              type: Type.ARRAY,
+              items: {type: Type.STRING},
+              description: 'Up to 4 critical physiological or symptom red flags.',
+            },
+            stabilizationSteps: {
+              type: Type.ARRAY,
+              items: {type: Type.STRING},
+              description:
+                'Up to 4 safe pre-referral field stabilization actions for an ASHA worker.',
+            },
+            hindiGuidance: {
+              type: Type.STRING,
+              description: 'Short, empathetic Hindi guidance for the ASHA worker.',
+            },
           },
-          redFlags: {
-            type: Type.ARRAY,
-            items: {type: Type.STRING},
-            description: 'Up to 4 critical physiological or symptom red flags.',
-          },
-          stabilizationSteps: {
-            type: Type.ARRAY,
-            items: {type: Type.STRING},
-            description: 'Up to 4 safe pre-referral field stabilization actions for an ASHA worker.',
-          },
-          hindiGuidance: {
-            type: Type.STRING,
-            description: 'Short, empathetic Hindi guidance for the ASHA worker.',
-          },
+          required: ['handoffSummary', 'redFlags', 'stabilizationSteps', 'hindiGuidance'],
         },
-        required: ['handoffSummary', 'redFlags', 'stabilizationSteps', 'hindiGuidance'],
       },
-    },
-  });
+    });
+    rawText = response.text?.trim();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/API_KEY_INVALID|PERMISSION_DENIED|403/i.test(msg)) {
+      throw new Error(
+        'Gemini API key is invalid or lacks permission. Please check GEMINI_API_KEY in the Settings > Secrets panel.'
+      );
+    }
+    if (/RESOURCE_EXHAUSTED|429/i.test(msg)) {
+      throw new Error(
+        'Gemini API quota limit reached. Please retry shortly or select a billing-enabled API key in the Settings > Secrets panel.'
+      );
+    }
+    throw new Error(msg || 'Failed to generate clinical summary from Gemini.');
+  }
 
-  const rawText = response.text?.trim();
   if (!rawText) {
     throw new Error('Gemini returned an empty clinical summary response.');
   }
 
-  const parsed = JSON.parse(rawText) as {
+  const cleanedJson = rawText
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+
+  const parsed = JSON.parse(cleanedJson) as {
     handoffSummary: string;
     redFlags: string[];
     stabilizationSteps: string[];

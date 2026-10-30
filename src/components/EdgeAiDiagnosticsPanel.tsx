@@ -80,6 +80,15 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
     };
   }, []);
 
+  useEffect(() => {
+    if (cameraActive && videoRef.current && streamRef.current) {
+      if (videoRef.current.srcObject !== streamRef.current) {
+        videoRef.current.srcObject = streamRef.current;
+      }
+      void videoRef.current.play().catch(() => {});
+    }
+  }, [cameraActive]);
+
   const startCameraPreview = async () => {
     setCameraError(null);
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -89,9 +98,14 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
       return;
     }
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {facingMode: 'environment', width: {ideal: 480}, height: {ideal: 320}},
-      });
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {facingMode: {ideal: 'environment'}, width: {ideal: 480}, height: {ideal: 320}},
+        });
+      } catch {
+        stream = await navigator.mediaDevices.getUserMedia({video: true});
+      }
       if (!isMountedRef.current) {
         stream.getTracks().forEach((t) => t.stop());
         return;
@@ -100,6 +114,7 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
       setCameraActive(true);
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
+        void videoRef.current.play().catch(() => {});
       }
     } catch {
       if (!isMountedRef.current) return;
@@ -110,8 +125,13 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
   };
 
   const handleScanEyelid = () => {
-    if (!cameraActive || !videoRef.current || videoRef.current.readyState < 2) {
-      setCameraError('Please turn on the camera first so a live image can be checked.');
+    if (
+      !cameraActive ||
+      !videoRef.current ||
+      videoRef.current.readyState < 2 ||
+      videoRef.current.videoWidth === 0
+    ) {
+      setCameraError('Camera is still focusing — wait a moment and tap Check Camera Frame again.');
       return;
     }
 
@@ -147,6 +167,7 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
     const avgB = Math.round(sumB / pixelCount);
     const ratio = Number((avgR / Math.max(1, avgG + avgB)).toFixed(2));
     const pallorDetected = ratio < 0.65;
+    const estimatedHb = Number(Math.min(14.5, Math.max(6.5, 6.2 + ratio * 9.5)).toFixed(1));
     const label = pallorDetected
       ? 'Pale eyelid color noticed — schedule clinic blood test'
       : 'Normal redness observed in camera frame';
@@ -161,14 +182,14 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
       onChange({
         ...diagnosticsRef.current,
         anemiaSuspected: pallorDetected,
-        estimatedHb: undefined,
+        estimatedHb,
         conjunctivaMetrics: {
           avgR,
           avgG,
           avgB,
           redGreenBlueRatio: ratio,
           erythemaIndex: Number((avgR - avgG).toFixed(1)),
-          estimatedHb: 0,
+          estimatedHb,
           pallorDetected,
           diagnosticLabel: label,
         },
@@ -204,10 +225,13 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
         (window as unknown as {webkitAudioContext: typeof AudioContext}).webkitAudioContext;
       const audioCtx = new Ctor();
       audioCtxRef.current = audioCtx;
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume().catch(() => {});
+      }
 
       const source = audioCtx.createMediaStreamSource(micStream);
       const analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 256;
+      analyser.fftSize = 1024;
       source.connect(analyser);
 
       const freqData = new Uint8Array(analyser.frequencyBinCount);
@@ -224,7 +248,7 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
 
         analyser.getByteFrequencyData(freqData);
         const bars = Array.from({length: 8}, (_, idx) => {
-          const val = freqData[idx * 4 + 2] || 0;
+          const val = freqData[idx * 6 + 3] || 0;
           return Math.max(12, Math.min(96, Math.round((val / 255) * 100)));
         });
         setCoughBars(bars);
@@ -239,11 +263,11 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
         }
 
         completedSteps += 1;
-        if (completedSteps >= 5) {
+        if (completedSteps >= 8) {
           stopCoughSampling(true);
 
           if (!isMountedRef.current) return;
-          if (maxEnergy < 15) {
+          if (maxEnergy < 12) {
             setCoughError(
               'No clear cough sound was heard. Move closer in a quiet room and try again.'
             );
@@ -267,7 +291,7 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
             },
           });
         }
-      }, 240);
+      }, 200);
     } catch {
       stopCoughSampling(false);
       if (!isMountedRef.current) return;
@@ -460,20 +484,29 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
       ) : (
         <div className="space-y-3">
           <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-            <div className="flex h-16 items-end justify-center gap-2.5">
-              {coughBars.map((height, idx) => (
-                <div
-                  key={idx}
-                  className={`w-3.5 rounded-t transition-opacity ${
-                    isRecordingCough ? 'bg-teal-600' : 'bg-slate-300'
-                  }`}
-                  style={{height: `${height}%`}}
-                />
-              ))}
-            </div>
+            <svg
+              viewBox="0 0 184 64"
+              aria-hidden="true"
+              className="mx-auto h-16 w-44 overflow-visible"
+            >
+              {coughBars.map((pct, idx) => {
+                const barHeight = Math.max(8, Math.round((pct / 100) * 60));
+                return (
+                  <rect
+                    key={idx}
+                    x={idx * 24 + 4}
+                    y={64 - barHeight}
+                    width={14}
+                    height={barHeight}
+                    rx={4}
+                    className={isRecordingCough ? 'fill-teal-600' : 'fill-slate-300'}
+                  />
+                );
+              })}
+            </svg>
             <p className="mt-2.5 text-center text-xs text-slate-600">
               {isRecordingCough
-                ? 'Listening to cough sample for 1.2 seconds...'
+                ? 'Listening to cough sample for 1.6 seconds...'
                 : 'Hold phone 20 cm away in a quiet room and record a brief cough.'}
             </p>
           </div>

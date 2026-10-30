@@ -517,6 +517,24 @@ export async function createHealthSyncServer(
     }
   });
 
+  // Ensure any unknown /api/* route or malformed JSON payload always returns valid JSON (never HTML/plain text)
+  app.use('/api', (_req, res) => {
+    res.status(404).json({error: 'Requested API endpoint was not found.'});
+  });
+
+  app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
+    if (req.path.startsWith('/api')) {
+      const status =
+        typeof (err as {status?: number})?.status === 'number'
+          ? (err as {status: number}).status
+          : 500;
+      const msg = err instanceof Error ? err.message : 'Unexpected server error.';
+      res.status(status).json({error: msg});
+      return;
+    }
+    next(err);
+  });
+
   // --- AUTHENTICATED WEBSOCKET SERVER WITH PING/PONG HEARTBEAT & POST-UPGRADE FRAME AUTH ---
   const sendSafeJson = (sock: WebSocket, payload: unknown) => {
     if (sock.readyState === WebSocket.OPEN) {
