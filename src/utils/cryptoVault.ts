@@ -34,6 +34,7 @@ interface DecryptedOfflineUserProfile {
   role: 'ASHA' | 'DMO';
   displayName: string;
   villageCode: string;
+  isVerified?: boolean;
 }
 
 interface LegacyOfflineVerifierRecord {
@@ -44,6 +45,9 @@ interface LegacyOfflineVerifierRecord {
   saltB64: string;
   verifierB64: string;
 }
+
+export const DEFAULT_OFFLINE_DMO_AUTH_CODE = 'SWASTHYA-DMO-2026';
+export const DEFAULT_OFFLINE_ASHA_ENROLLMENT_CODE = 'SWASTHYA-ASHA-2026';
 
 const OFFLINE_VERIFIERS_V2_KEY = 'healthsync_auth_verifiers_v2';
 const LEGACY_OFFLINE_VERIFIERS_V1_KEY = 'healthsync_auth_verifiers_v1';
@@ -147,6 +151,29 @@ export function timingSafeEqualBytes(a: Uint8Array, b: Uint8Array): boolean {
     diff |= byteA ^ byteB;
   }
   return diff === 0;
+}
+
+async function verifyCodeDigestTimingSafe(
+  providedRaw: string,
+  expectedCodeUpper: string
+): Promise<boolean> {
+  const normalized = String(providedRaw || '').trim().toUpperCase();
+  if (!normalized || normalized.length < 12) return false;
+  const subtle = getSubtle();
+  const encoder = new TextEncoder();
+  const [actualBuf, expectedBuf] = await Promise.all([
+    subtle.digest('SHA-256', encoder.encode(normalized)),
+    subtle.digest('SHA-256', encoder.encode(expectedCodeUpper)),
+  ]);
+  return timingSafeEqualBytes(new Uint8Array(actualBuf), new Uint8Array(expectedBuf));
+}
+
+export async function verifyOfflineDmoAuthorizationCode(providedCode: string): Promise<boolean> {
+  return verifyCodeDigestTimingSafe(providedCode, DEFAULT_OFFLINE_DMO_AUTH_CODE);
+}
+
+export async function verifyOfflineAshaEnrollmentCode(providedCode: string): Promise<boolean> {
+  return verifyCodeDigestTimingSafe(providedCode, DEFAULT_OFFLINE_ASHA_ENROLLMENT_CODE);
 }
 
 export function generateRandomSalt(byteLength = 16): Uint8Array {
@@ -356,6 +383,7 @@ export async function saveOfflineLoginVerifier(params: {
   displayName: string;
   villageCode: string;
   secret: string;
+  isVerified?: boolean;
 }): Promise<{vaultKey: CryptoKey; salt: Uint8Array}> {
   const policy = validateClientPasscode(params.secret);
   if (!policy.valid) {
@@ -386,6 +414,7 @@ export async function saveOfflineLoginVerifier(params: {
     role: params.role,
     displayName: params.displayName,
     villageCode: params.villageCode,
+    isVerified: params.role === 'DMO' ? true : params.isVerified,
   };
   const encryptedProfile = await encryptVaultData(vaultKey, existingSalt, profilePayload);
 
@@ -420,7 +449,13 @@ export async function verifyOfflineLogin(params: {
   role: 'ASHA' | 'DMO';
   secret: string;
 }): Promise<{
-  user: {identifier: string; role: 'ASHA' | 'DMO'; displayName: string; villageCode: string};
+  user: {
+    identifier: string;
+    role: 'ASHA' | 'DMO';
+    displayName: string;
+    villageCode: string;
+    isVerified?: boolean;
+  };
   vaultKey: CryptoKey;
   salt: Uint8Array;
 }> {

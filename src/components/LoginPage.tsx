@@ -14,9 +14,12 @@ import {
 } from 'lucide-react';
 import {NetworkState, SUB_CENTER_DIRECTORY} from '../types/triage';
 import {
+  DEFAULT_OFFLINE_DMO_AUTH_CODE,
   hasOfflineLoginVerifier,
   saveOfflineLoginVerifier,
   validateClientPasscode,
+  verifyOfflineAshaEnrollmentCode,
+  verifyOfflineDmoAuthorizationCode,
   verifyOfflineLogin,
 } from '../utils/cryptoVault';
 import {isBackendUnavailableResponse, safeReadJson} from '../utils/safeFetchJson';
@@ -115,11 +118,39 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
     try {
       const provisionLocalAshaAccount = async () => {
         const normalizedId = cleanId.toUpperCase();
-        if (await hasOfflineLoginVerifier(normalizedId, 'ASHA')) {
-          throw new Error(
-            `Account "${normalizedId}" is already created on this device. Switch to "Sign In" above.`
-          );
+        const trimmedEnrollment = ashaEnrollmentCode.trim();
+        let verifiedByCode = false;
+        if (trimmedEnrollment) {
+          verifiedByCode = await verifyOfflineAshaEnrollmentCode(trimmedEnrollment);
+          if (!verifiedByCode) {
+            throw new Error('Invalid Clinic Enrollment Code for ASHA verification.');
+          }
         }
+
+        if (await hasOfflineLoginVerifier(normalizedId, 'ASHA')) {
+          try {
+            const existingSession = await verifyOfflineLogin({
+              identifier: normalizedId,
+              role: 'ASHA',
+              secret,
+            });
+            onAuthenticated({
+              token: 'OFFLINE_LOCAL_SESSION',
+              user: {
+                ...existingSession.user,
+                isVerified: verifiedByCode || existingSession.user.isVerified || false,
+              },
+              vaultKey: existingSession.vaultKey,
+              salt: existingSession.salt,
+            });
+            return;
+          } catch {
+            throw new Error(
+              `Account "${normalizedId}" is already created on this device. Switch to "Sign In" above.`
+            );
+          }
+        }
+
         const effectiveName = displayName.trim() || `ASHA Worker (${normalizedId})`;
         const effectiveVillage = villageCode.trim() || 'VIL-204';
         const {vaultKey, salt} = await saveOfflineLoginVerifier({
@@ -128,6 +159,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
           displayName: effectiveName,
           villageCode: effectiveVillage,
           secret,
+          isVerified: verifiedByCode,
         });
         onAuthenticated({
           token: 'OFFLINE_LOCAL_SESSION',
@@ -136,7 +168,71 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
             role: 'ASHA',
             displayName: effectiveName,
             villageCode: effectiveVillage,
-            isVerified: false,
+            isVerified: verifiedByCode,
+          },
+          vaultKey,
+          salt,
+        });
+      };
+
+      const provisionLocalDmoAccount = async () => {
+        const normalizedEmail = cleanId.toLowerCase();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+          throw new Error('Please enter a valid official hospital email address.');
+        }
+        const cleanName = displayName.trim();
+        if (cleanName.length < 2 || cleanName.length > 80) {
+          throw new Error('Full display name is required (2 to 80 characters).');
+        }
+
+        const isAuthorized = await verifyOfflineDmoAuthorizationCode(dmoProvisioningCode);
+        if (!isAuthorized) {
+          throw new Error(
+            'Invalid Hospital Authorization Code. Enter the authorized District 24 code to create a Medical Officer account.'
+          );
+        }
+
+        if (await hasOfflineLoginVerifier(normalizedEmail, 'DMO')) {
+          try {
+            const existingSession = await verifyOfflineLogin({
+              identifier: normalizedEmail,
+              role: 'DMO',
+              secret,
+            });
+            onAuthenticated({
+              token: 'OFFLINE_LOCAL_SESSION',
+              user: {
+                ...existingSession.user,
+                isVerified: true,
+              },
+              vaultKey: existingSession.vaultKey,
+              salt: existingSession.salt,
+            });
+            return;
+          } catch {
+            throw new Error(
+              `Account "${normalizedEmail}" is already created on this device. Switch to "Sign In" above.`
+            );
+          }
+        }
+
+        const effectiveVillage = villageCode.trim() || 'VIL-204';
+        const {vaultKey, salt} = await saveOfflineLoginVerifier({
+          identifier: normalizedEmail,
+          role: 'DMO',
+          displayName: cleanName,
+          villageCode: effectiveVillage,
+          secret,
+          isVerified: true,
+        });
+        onAuthenticated({
+          token: 'OFFLINE_LOCAL_SESSION',
+          user: {
+            identifier: normalizedEmail,
+            role: 'DMO',
+            displayName: cleanName,
+            villageCode: effectiveVillage,
+            isVerified: true,
           },
           vaultKey,
           salt,
@@ -148,7 +244,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
           throw new Error(
             activeRole === 'ASHA'
               ? `No saved account found for "${cleanId.toUpperCase()}" on this device while the server is unavailable. Switch to "Create Account" above to set up your Health Worker profile.`
-              : 'Hospital server could not be reached. Please check your connection and try again.'
+              : `No saved Medical Officer account found for "${cleanId.toLowerCase()}" on this device. Switch to "Create Account" above to authorize and set up your Medical Officer profile.`
           );
         }
         const offlineSession = await verifyOfflineLogin({
@@ -158,7 +254,10 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
         });
         onAuthenticated({
           token: 'OFFLINE_LOCAL_SESSION',
-          user: offlineSession.user,
+          user: {
+            ...offlineSession.user,
+            isVerified: activeRole === 'DMO' ? true : offlineSession.user.isVerified,
+          },
           vaultKey: offlineSession.vaultKey,
           salt: offlineSession.salt,
         });
@@ -166,12 +265,11 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
 
       if (networkState === 'offline') {
         if (authMode === 'REGISTER') {
-          if (activeRole === 'DMO') {
-            throw new Error(
-              'Medical Officer (DMO) authorization requires an online hospital server connection.'
-            );
+          if (activeRole === 'ASHA') {
+            await provisionLocalAshaAccount();
+            return;
           }
-          await provisionLocalAshaAccount();
+          await provisionLocalDmoAccount();
           return;
         }
         await signInWithLocalVerifier();
@@ -205,9 +303,8 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
             await provisionLocalAshaAccount();
             return;
           }
-          throw new Error(
-            'Hospital server could not be reached to verify your Hospital Authorization Code. Please check your connection.'
-          );
+          await provisionLocalDmoAccount();
+          return;
         }
         await signInWithLocalVerifier();
         return;
@@ -225,16 +322,15 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
         };
       }>(resp);
 
-      // Handle static-host 404 ("The page could not be found") or gateway 502/503/504 gracefully without JSON crash
+      // Handle static-host 404 ("The page could not be found"), cross-site iframe proxy HTML, or gateway 502/503/504 gracefully
       if (isBackendUnavailableResponse(resp, parsed)) {
         if (authMode === 'REGISTER') {
           if (activeRole === 'ASHA') {
             await provisionLocalAshaAccount();
             return;
           }
-          throw new Error(
-            'Hospital authorization server is unavailable on this deployment. Medical Officer registration requires an active backend server, or select Health Worker (ASHA) to record checkups on this device.'
-          );
+          await provisionLocalDmoAccount();
+          return;
         }
         await signInWithLocalVerifier();
         return;
@@ -244,13 +340,12 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
       if (!resp.ok || !data?.token || !data?.user) {
         if (
           authMode === 'LOGIN' &&
-          activeRole === 'ASHA' &&
           resp.status === 401 &&
-          (await hasOfflineLoginVerifier(cleanId, 'ASHA'))
+          (await hasOfflineLoginVerifier(cleanId, activeRole))
         ) {
           const verifiedLocal = await verifyOfflineLogin({
             identifier: cleanId,
-            role: 'ASHA',
+            role: activeRole,
             secret,
           });
           try {
@@ -260,9 +355,12 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
               body: JSON.stringify({
                 identifier: verifiedLocal.user.identifier,
                 secret,
-                role: 'ASHA',
+                role: activeRole,
                 displayName: verifiedLocal.user.displayName,
                 villageCode: verifiedLocal.user.villageCode,
+                ...(activeRole === 'DMO'
+                  ? {dmoProvisioningCode: DEFAULT_OFFLINE_DMO_AUTH_CODE}
+                  : {}),
               }),
             });
             const syncParsed = await safeReadJson<{
@@ -297,7 +395,10 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
           }
           onAuthenticated({
             token: 'OFFLINE_LOCAL_SESSION',
-            user: {...verifiedLocal.user, isVerified: false},
+            user: {
+              ...verifiedLocal.user,
+              isVerified: activeRole === 'DMO' ? true : Boolean(verifiedLocal.user.isVerified),
+            },
             vaultKey: verifiedLocal.vaultKey,
             salt: verifiedLocal.salt,
           });
@@ -320,6 +421,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
         displayName: safeUser.displayName,
         villageCode: safeUser.villageCode,
         secret,
+        isVerified: safeUser.isVerified,
       });
 
       onAuthenticated({

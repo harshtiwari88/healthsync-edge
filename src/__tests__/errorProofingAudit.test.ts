@@ -9,7 +9,13 @@ import {
 } from '../components/GlobalErrorBoundary';
 import {HealthSyncDatabase} from '../server/db';
 import {evaluateTriage, evaluateVitalStatus} from '../types/triage';
-import {hasOfflineLoginVerifier} from '../utils/cryptoVault';
+import {
+  DEFAULT_OFFLINE_DMO_AUTH_CODE,
+  hasOfflineLoginVerifier,
+  saveOfflineLoginVerifier,
+  verifyOfflineDmoAuthorizationCode,
+  verifyOfflineLogin,
+} from '../utils/cryptoVault';
 import {
   safeFetchWithFallback,
   safeParseJson,
@@ -312,4 +318,99 @@ describe('Codebase Error-Proofing & Stabilization Audit', () => {
       memDb.close();
     }
   });
+
+  it('authorizes Medical Officer (DMO) registration with SWASTHYA-DMO-2026 both on server and when backend is unavailable', async () => {
+    const prevDmoSecret = process.env.DMO_PROVISIONING_SECRET;
+    const prevLocalStorage = (globalThis as {localStorage?: Storage}).localStorage;
+    delete process.env.DMO_PROVISIONING_SECRET;
+
+    const mockLocal = new MemoryStorage();
+    Object.defineProperty(globalThis, 'localStorage', {
+      value: mockLocal,
+      configurable: true,
+      writable: true,
+    });
+
+    const memDb = new HealthSyncDatabase(':memory:', 'dmo-auth-code-test-secret-32-chars!!');
+    const {httpServer} = await createHealthSyncServer(memDb);
+    await new Promise<void>((resolve) => httpServer.listen(0, '127.0.0.1', () => resolve()));
+    const port = (httpServer.address() as AddressInfo).port;
+    const baseUrl = `http://127.0.0.1:${port}`;
+
+    try {
+      // 1. Wrong Hospital Authorization Code is still rejected with 403
+      const wrongRes = await fetch(`${baseUrl}/api/auth/register`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          identifier: 'doctor@district.gov.in',
+          secret: 'DoctorSafe#2026',
+          role: 'DMO',
+          displayName: 'Gr',
+          villageCode: 'VIL-204',
+          dmoProvisioningCode: 'INVALID-CODE-000',
+        }),
+      });
+      expect(wrongRes.status).toBe(403);
+
+      // 2. Default District 24 Hospital Authorization Code succeeds (201) when env var is unset
+      const validRes = await fetch(`${baseUrl}/api/auth/register`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          identifier: 'doctor@district.gov.in',
+          secret: 'DoctorSafe#2026',
+          role: 'DMO',
+          displayName: 'Gr',
+          villageCode: 'VIL-204',
+          dmoProvisioningCode: DEFAULT_OFFLINE_DMO_AUTH_CODE.toLowerCase(),
+        }),
+      });
+      expect(validRes.status).toBe(201);
+      const session = (await validRes.json()) as {
+        token: string;
+        user: {identifier: string; role: string; displayName: string; isVerified: boolean};
+      };
+      expect(session.user.identifier).toBe('doctor@district.gov.in');
+      expect(session.user.role).toBe('DMO');
+      expect(session.user.displayName).toBe('Gr');
+      expect(session.user.isVerified).toBe(true);
+
+      // 3. Offline / backend-unavailable local DMO verifier flow
+      await expect(verifyOfflineDmoAuthorizationCode('wrong-code')).resolves.toBe(false);
+      await expect(verifyOfflineDmoAuthorizationCode('swasthya-dmo-2026')).resolves.toBe(true);
+
+      await saveOfflineLoginVerifier({
+        identifier: 'doctor@district.gov.in',
+        role: 'DMO',
+        displayName: 'Gr',
+        villageCode: 'VIL-204',
+        secret: 'DoctorSafe#2026',
+        isVerified: true,
+      });
+
+      const localDmo = await verifyOfflineLogin({
+        identifier: 'doctor@district.gov.in',
+        role: 'DMO',
+        secret: 'DoctorSafe#2026',
+      });
+      expect(localDmo.user.role).toBe('DMO');
+      expect(localDmo.user.displayName).toBe('Gr');
+      expect(localDmo.user.isVerified).toBe(true);
+    } finally {
+      if (prevDmoSecret !== undefined) process.env.DMO_PROVISIONING_SECRET = prevDmoSecret;
+      if (prevLocalStorage === undefined) {
+        delete (globalThis as {localStorage?: Storage}).localStorage;
+      } else {
+        Object.defineProperty(globalThis, 'localStorage', {
+          value: prevLocalStorage,
+          configurable: true,
+          writable: true,
+        });
+      }
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      memDb.close();
+    }
+  });
 });
+

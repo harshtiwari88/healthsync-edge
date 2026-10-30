@@ -498,7 +498,11 @@ export function App() {
   };
 
   const handleDeleteRecord = async (recordId: string) => {
-    if (!sessionToken || sessionToken === 'OFFLINE_LOCAL_SESSION' || userRole !== 'DMO') return;
+    if (!sessionToken || userRole !== 'DMO') return;
+    if (sessionToken === 'OFFLINE_LOCAL_SESSION') {
+      setRecords((prev) => prev.filter((r) => r.id !== recordId));
+      return;
+    }
     try {
       const resp = await fetch(`/api/records/${encodeURIComponent(recordId)}`, {
         method: 'DELETE',
