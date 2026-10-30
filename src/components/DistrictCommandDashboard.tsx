@@ -17,6 +17,8 @@ import {
   MapPin,
   MessageSquare,
   Search,
+  Trash2,
+  UserCheck,
   Volume2,
   VolumeX,
 } from 'lucide-react';
@@ -32,17 +34,14 @@ import {
   encodeVitalsToSMS,
 } from '../utils/binarySmsCodec';
 import {useIsDesktopViewport, useVirtualWindow} from '../utils/virtualWindow';
+import {
+  CareSummaryResult,
+  fetchCareSummaryWithFallback,
+} from '../utils/clinicalSummaryClient';
 import {safeReadJson} from '../utils/safeFetchJson';
 import {DmoNavTab} from './TopRoleToolbar';
 
-interface ClinicalBriefResult {
-  handoffSummary: string;
-  redFlags: string[];
-  stabilizationSteps: string[];
-  hindiGuidance: string;
-  disclaimer: string;
-  model: string;
-}
+type ClinicalBriefResult = CareSummaryResult;
 
 interface SmsLogItem {
   id: string;
@@ -62,6 +61,14 @@ interface SmsGatewayInfo {
   dmoEmergencyPhone?: string;
 }
 
+interface PendingAshaUserItem {
+  id: string;
+  identifier: string;
+  displayName: string;
+  villageCode: string;
+  createdAtMs: number;
+}
+
 interface DistrictCommandDashboardProps {
   dmoEmail: string;
   dmoDisplayName?: string;
@@ -75,6 +82,7 @@ interface DistrictCommandDashboardProps {
   onTriggerTestSiren: () => void;
   onToggleMuteSiren: () => void;
   onDispatchAmbulance: (recordId: string) => void;
+  onDeleteRecord?: (recordId: string) => Promise<void> | void;
 }
 
 function HealthStatusLabel({severity}: {severity: SeverityLevel}) {
@@ -115,6 +123,7 @@ export const DistrictCommandDashboard: React.FC<DistrictCommandDashboardProps> =
   onTriggerTestSiren,
   onToggleMuteSiren,
   onDispatchAmbulance,
+  onDeleteRecord,
 }) => {
   const [selectedVillage, setSelectedVillage] = useState<string>('ALL');
   const [statusFilter, setStatusFilter] = useState<'ALL' | SeverityLevel>('ALL');
@@ -130,25 +139,39 @@ export const DistrictCommandDashboard: React.FC<DistrictCommandDashboardProps> =
   const [briefsByRecord, setBriefsByRecord] = useState<Record<string, ClinicalBriefResult>>({});
   const [briefErrorByRecord, setBriefErrorByRecord] = useState<Record<string, string>>({});
 
-  // Real SMS Gateway status & audit logs from SQLite
+  // Real SMS Gateway status, audit logs, and pending ASHA verifications from SQLite
   const [smsGateway, setSmsGateway] = useState<SmsGatewayInfo | null>(null);
   const [smsLogs, setSmsLogs] = useState<SmsLogItem[]>([]);
+  const [pendingAshaUsers, setPendingAshaUsers] = useState<PendingAshaUserItem[]>([]);
+  const [approvingAshaId, setApprovingAshaId] = useState<string | null>(null);
+  const [confirmEraseId, setConfirmEraseId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!sessionToken || sessionToken === 'OFFLINE_LOCAL_SESSION') return;
     let cancelled = false;
-    fetch('/api/sms/logs', {
-      headers: {Authorization: `Bearer ${sessionToken}`},
-    })
-      .then(async (r) => {
-        if (!r.ok) return null;
-        const parsed = await safeReadJson<{logs?: SmsLogItem[]; gateway?: SmsGatewayInfo}>(r);
-        return parsed.isJson ? parsed.data : null;
-      })
-      .then((data) => {
-        if (!cancelled && data) {
-          if (Array.isArray(data.logs)) setSmsLogs(data.logs);
-          if (data.gateway) setSmsGateway(data.gateway);
+    Promise.all([
+      fetch('/api/sms/logs', {
+        headers: {Authorization: `Bearer ${sessionToken}`},
+      }),
+      fetch('/api/auth/asha/pending', {
+        headers: {Authorization: `Bearer ${sessionToken}`},
+      }),
+    ])
+      .then(async ([smsRes, pendingRes]) => {
+        if (!cancelled && smsRes.ok) {
+          const parsedSms = await safeReadJson<{logs?: SmsLogItem[]; gateway?: SmsGatewayInfo}>(
+            smsRes
+          );
+          if (parsedSms.isJson && parsedSms.data) {
+            if (Array.isArray(parsedSms.data.logs)) setSmsLogs(parsedSms.data.logs);
+            if (parsedSms.data.gateway) setSmsGateway(parsedSms.data.gateway);
+          }
+        }
+        if (!cancelled && pendingRes.ok) {
+          const parsedPending = await safeReadJson<{pending?: PendingAshaUserItem[]}>(pendingRes);
+          if (parsedPending.isJson && Array.isArray(parsedPending.data?.pending)) {
+            setPendingAshaUsers(parsedPending.data.pending);
+          }
         }
       })
       .catch(() => {});
@@ -157,15 +180,29 @@ export const DistrictCommandDashboard: React.FC<DistrictCommandDashboardProps> =
     };
   }, [sessionToken, records.length]);
 
-  const handleRequestGeminiBrief = async (rec: TriageRecord) => {
-    if (!sessionToken || sessionToken === 'OFFLINE_LOCAL_SESSION') {
-      setBriefErrorByRecord((prev) => ({
-        ...prev,
-        [rec.id]: 'An active hospital connection is required to generate a Care Summary.',
-      }));
-      return;
+  const handleApproveAshaWorker = async (identifier: string) => {
+    if (!sessionToken || sessionToken === 'OFFLINE_LOCAL_SESSION') return;
+    setApprovingAshaId(identifier);
+    try {
+      const resp = await fetch(`/api/auth/asha/${encodeURIComponent(identifier)}/verify`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify({verified: true}),
+      });
+      if (resp.ok) {
+        setPendingAshaUsers((prev) => prev.filter((u) => u.identifier !== identifier));
+      }
+    } catch {
+      // Ignore transient network errors
+    } finally {
+      setApprovingAshaId(null);
     }
+  };
 
+  const handleRequestGeminiBrief = async (rec: TriageRecord) => {
     setBriefLoadingId(rec.id);
     setBriefErrorByRecord((prev) => {
       const next = {...prev};
@@ -174,37 +211,20 @@ export const DistrictCommandDashboard: React.FC<DistrictCommandDashboardProps> =
     });
 
     try {
-      const resp = await fetch('/api/gemini/clinical-summary', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${sessionToken}`,
-        },
-        body: JSON.stringify({
-          patientName: rec.patientName,
-          age: rec.age,
-          vitals: rec.vitals,
-          symptoms: rec.symptoms,
-          edgeAi: rec.edgeAi,
-          transcript: rec.clinicalNotes,
-          language: 'en',
-        }),
+      const allowName =
+        Boolean(rec.patientConsent?.aiProcessingConsent) && Number(rec.age) >= 18;
+      const summary = await fetchCareSummaryWithFallback({
+        sessionToken,
+        patientName: allowName ? rec.patientName : undefined,
+        age: rec.age,
+        vitals: rec.vitals,
+        symptoms: rec.symptoms,
+        edgeAi: rec.edgeAi,
+        transcript: rec.clinicalNotes,
+        language: 'en',
+        explicitAiConsent: allowName,
       });
-      const parsed = await safeReadJson<ClinicalBriefResult & {error?: string}>(resp);
-      if (!parsed.isJson || !parsed.data) {
-        throw new Error(
-          'Care Summary service could not be reached on this deployment. Check clinical readings directly above.'
-        );
-      }
-      if (!resp.ok) {
-        throw new Error(parsed.data.error || 'Unable to generate Care Summary right now.');
-      }
-      setBriefsByRecord((prev) => ({...prev, [rec.id]: parsed.data!}));
-    } catch (err) {
-      setBriefErrorByRecord((prev) => ({
-        ...prev,
-        [rec.id]: err instanceof Error ? err.message : 'Care Summary request failed.',
-      }));
+      setBriefsByRecord((prev) => ({...prev, [rec.id]: summary}));
     } finally {
       setBriefLoadingId(null);
     }
@@ -681,6 +701,48 @@ export const DistrictCommandDashboard: React.FC<DistrictCommandDashboardProps> =
         </p>
       </div>
 
+      {/* Pending ASHA Health Worker Verification Queue (Shown when unverified registrations exist) */}
+      {pendingAshaUsers.length > 0 && (
+        <section className="rounded-2xl border border-amber-200 bg-amber-50/70 p-4 sm:p-5 space-y-3">
+          <div className="flex items-center justify-between gap-2">
+            <div>
+              <h2 className="text-sm font-bold text-slate-900">
+                Pending Health Worker Verifications ({pendingAshaUsers.length})
+              </h2>
+              <p className="text-xs text-slate-600">
+                Approve verified ASHA clinic workers before their triage records or emergency alerts
+                can enter the hospital dashboard.
+              </p>
+            </div>
+          </div>
+          <div className="divide-y divide-amber-200/70">
+            {pendingAshaUsers.map((worker) => (
+              <div
+                key={worker.id}
+                className="flex flex-wrap items-center justify-between gap-3 py-2.5 first:pt-0 last:pb-0 text-xs"
+              >
+                <div>
+                  <span className="font-semibold text-slate-900">{worker.displayName}</span>{' '}
+                  <span className="font-mono text-slate-600">({worker.identifier})</span> ·{' '}
+                  <span className="text-slate-600">{worker.villageCode}</span>
+                </div>
+                <button
+                  type="button"
+                  disabled={approvingAshaId === worker.identifier}
+                  onClick={() => handleApproveAshaWorker(worker.identifier)}
+                  className="inline-flex min-h-[34px] items-center gap-1.5 rounded-lg bg-teal-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-teal-800 disabled:opacity-60 cursor-pointer"
+                >
+                  <UserCheck className="h-3.5 w-3.5" />
+                  <span>
+                    {approvingAshaId === worker.identifier ? 'Approving...' : 'Approve ASHA'}
+                  </span>
+                </button>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
       {/* VIEW 1: OVERVIEW (Urgent Queue + Clinic Coverage Summary) */}
       {activeTab === 'overview' && (
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-12 items-start">
@@ -996,13 +1058,38 @@ export const DistrictCommandDashboard: React.FC<DistrictCommandDashboardProps> =
                           {rec.vitals.temperature}°F
                         </td>
                         <td className="px-4 py-3 text-right">
-                          <button
-                            type="button"
-                            onClick={() => openSmsDecoderWith(rec.binarySmsPayload)}
-                            className="text-xs font-semibold text-teal-700 hover:underline whitespace-nowrap cursor-pointer"
-                          >
-                            View SMS
-                          </button>
+                          <div className="inline-flex items-center justify-end gap-2.5">
+                            <button
+                              type="button"
+                              onClick={() => openSmsDecoderWith(rec.binarySmsPayload)}
+                              className="text-xs font-semibold text-teal-700 hover:underline whitespace-nowrap cursor-pointer"
+                            >
+                              View SMS
+                            </button>
+                            {onDeleteRecord &&
+                              sessionToken !== 'OFFLINE_LOCAL_SESSION' &&
+                              (confirmEraseId === rec.id ? (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setConfirmEraseId(null);
+                                    void onDeleteRecord(rec.id);
+                                  }}
+                                  className="text-xs font-semibold text-red-700 hover:underline whitespace-nowrap cursor-pointer"
+                                >
+                                  Confirm Erase
+                                </button>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={() => setConfirmEraseId(rec.id)}
+                                  aria-label={`Erase record for ${rec.patientName}`}
+                                  className="inline-flex items-center text-slate-400 hover:text-red-600 cursor-pointer"
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                </button>
+                              ))}
+                          </div>
                         </td>
                       </tr>
                     ))}

@@ -2,6 +2,7 @@ import 'dotenv/config';
 import crypto from 'crypto';
 import express, {type NextFunction, type Request, type Response} from 'express';
 import fs from 'fs';
+import helmet from 'helmet';
 import http from 'http';
 import path from 'path';
 import {fileURLToPath} from 'url';
@@ -15,10 +16,12 @@ import {generateClinicalTriageSummary} from './src/server/geminiService.ts';
 import {
   dispatchEmergencySms,
   getConfiguredSmsGatewayStatus,
+  maskPhoneNumber,
   parseInboundSmsWebhookToRecord,
+  SmsAuthorizationError,
   verifyInboundSmsWebhookAuth,
 } from './src/server/smsGateway.ts';
-import type {IncentiveEntry, TriageRecord} from './src/types/triage.ts';
+import {isAllowedVillageCode, type IncentiveEntry, type TriageRecord} from './src/types/triage.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -43,9 +46,9 @@ function extractBearerToken(req: Request): string | null {
   return header.slice(7).trim() || null;
 }
 
-function verifyDmoProvisioningSecret(providedCode: string): boolean {
-  const configured = process.env.DMO_PROVISIONING_SECRET?.trim() || '';
-  if (!configured || configured.length < 12 || configured === 'MY_DMO_PROVISIONING_SECRET') {
+function timingSafeVerifySecret(configuredRaw: string | undefined, providedCode: string, placeholder: string): boolean {
+  const configured = configuredRaw?.trim() || '';
+  if (!configured || configured.length < 12 || configured === placeholder) {
     return false;
   }
   if (!providedCode) return false;
@@ -54,16 +57,85 @@ function verifyDmoProvisioningSecret(providedCode: string): boolean {
   return crypto.timingSafeEqual(expectedDigest, actualDigest);
 }
 
+function verifyDmoProvisioningSecret(providedCode: string): boolean {
+  return timingSafeVerifySecret(
+    process.env.DMO_PROVISIONING_SECRET,
+    providedCode,
+    'MY_DMO_PROVISIONING_SECRET'
+  );
+}
+
+function verifyAshaEnrollmentSecret(providedCode: string): boolean {
+  return timingSafeVerifySecret(
+    process.env.ASHA_ENROLLMENT_SECRET,
+    providedCode,
+    'MY_ASHA_ENROLLMENT_SECRET'
+  );
+}
+
 /**
- * Enforces Object-Level Authorization (BOLA / IDOR protection) and field-level RBAC on triage records:
- * - Prevents ASHA Worker B from overwriting or tampering with records created by ASHA Worker A or SMS webhooks.
- * - Prevents non-DMO accounts from forging or modifying `dispatchStatus`, `ambulanceUnit`, or `etaMinutes`.
+ * Resolves Express `trust proxy` safely for the actual deployment environment:
+ * - Honors explicit `TRUST_PROXY` env var (`false`, `true`, hop count `1`, `loopback`, or CIDR).
+ * - Uses `1` (single trusted edge proxy hop) on Vercel, Cloud Run (`K_SERVICE`), or `NODE_ENV=production`
+ *   so rate limiters see the true client IP without allowing leftmost `X-Forwarded-For` spoofing.
+ * - Defaults to `false` on direct local connections so local callers cannot spoof `X-Forwarded-For`.
+ */
+export function resolveTrustProxySetting(): boolean | number | string {
+  const raw = process.env.TRUST_PROXY?.trim();
+  if (raw !== undefined && raw !== '') {
+    if (raw === 'true') return 1; // Cap boolean 'true' to 1 hop to prevent XFF spoofing
+    if (raw === 'false') return false;
+    const asNum = Number(raw);
+    if (Number.isInteger(asNum) && asNum >= 0 && asNum <= 10) return asNum;
+    return raw;
+  }
+  if (process.env.VERCEL || process.env.K_SERVICE || process.env.NODE_ENV === 'production') {
+    return 1;
+  }
+  return false;
+}
+
+function getTrustedClientIp(req: Request): string {
+  return req.ip || req.socket?.remoteAddress || 'unknown';
+}
+
+function resolveFrameAncestors(): string[] {
+  const custom = process.env.CSP_FRAME_ANCESTORS?.trim();
+  if (custom) {
+    return custom.split(/\s+/).filter(Boolean);
+  }
+  if (process.env.NODE_ENV !== 'production' && !process.env.VITEST) {
+    return ["'self'", 'https://aistudio.google.com', 'https://*.google.com'];
+  }
+  return ["'self'"];
+}
+
+/**
+ * Enforces Object-Level Authorization (BOLA / IDOR protection), village validation,
+ * and field-level RBAC on triage records.
  */
 function authorizeAndSanitizeRecordWrite(
   db: HealthSyncDatabase,
   user: AuthenticatedUser,
   incoming: TriageRecord
 ): {sanitized: TriageRecord; ownerIdentifier: string} {
+  if (user.role === 'ASHA' && !user.isVerified) {
+    throw new RecordAuthorizationError(
+      'Forbidden: Unverified ASHA accounts cannot create or modify triage records.',
+      403
+    );
+  }
+
+  const cleanVillage = String(incoming.villageCode || user.villageCode || '').trim().toUpperCase();
+  if (!isAllowedVillageCode(cleanVillage)) {
+    throw new RecordAuthorizationError('Invalid clinic villageCode in triage record.', 400);
+  }
+
+  const cleanPatientName = String(incoming.patientName || '').trim();
+  if (!cleanPatientName || cleanPatientName.length > 100) {
+    throw new RecordAuthorizationError('Valid patientName (1-100 chars) is required.', 400);
+  }
+
   const existing = db.getRecordWithOwner(incoming.id);
 
   if (existing) {
@@ -73,7 +145,6 @@ function authorizeAndSanitizeRecordWrite(
           'Forbidden: You cannot modify or overwrite triage records belonging to another worker.'
         );
       }
-      // ASHA owner can update clinical observations on their own record, NEVER ambulance dispatch fields
       if (
         incoming.dispatchStatus &&
         incoming.dispatchStatus !== existing.record.dispatchStatus &&
@@ -85,6 +156,8 @@ function authorizeAndSanitizeRecordWrite(
       }
       const sanitized: TriageRecord = {
         ...incoming,
+        villageCode: cleanVillage,
+        patientName: cleanPatientName,
         ashaWorker: `${user.displayName} (${user.identifier})`,
         dispatchStatus: existing.record.dispatchStatus,
         ambulanceUnit: existing.record.ambulanceUnit,
@@ -93,17 +166,21 @@ function authorizeAndSanitizeRecordWrite(
       return {sanitized, ownerIdentifier: existing.ownerIdentifier};
     }
 
-    // DMO updating an existing record: preserve original record owner attribution
     return {
-      sanitized: {...incoming},
+      sanitized: {
+        ...incoming,
+        villageCode: cleanVillage,
+        patientName: cleanPatientName,
+      },
       ownerIdentifier: existing.ownerIdentifier,
     };
   }
 
-  // Creating a brand-new triage record
   if (user.role !== 'DMO') {
     const sanitized: TriageRecord = {
       ...incoming,
+      villageCode: cleanVillage,
+      patientName: cleanPatientName,
       ashaWorker: `${user.displayName} (${user.identifier})`,
       dispatchStatus: 'Unassigned',
       ambulanceUnit: undefined,
@@ -115,6 +192,8 @@ function authorizeAndSanitizeRecordWrite(
   return {
     sanitized: {
       ...incoming,
+      villageCode: cleanVillage,
+      patientName: cleanPatientName,
       dispatchStatus: incoming.dispatchStatus === 'Dispatched' ? 'Dispatched' : 'Unassigned',
     },
     ownerIdentifier: user.identifier,
@@ -131,12 +210,67 @@ export async function createHealthSyncServer(
   options?: HealthSyncServerOptions
 ) {
   const db = customDb ?? new HealthSyncDatabase();
+  await db.hydrateRemoteIfConfigured();
+
   const heartbeatIntervalMs = options?.heartbeatIntervalMs ?? 25_000;
   const wsAuthTimeoutMs = options?.wsAuthTimeoutMs ?? 5_000;
 
   const app = express();
-  app.use(express.json({limit: '1mb'}));
-  app.use(express.urlencoded({extended: false}));
+  app.disable('x-powered-by');
+  app.set('trust proxy', resolveTrustProxySetting());
+
+  const isDev = process.env.NODE_ENV !== 'production';
+  const frameAncestors = resolveFrameAncestors();
+
+  // Security Headers via Helmet (CSP, HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy)
+  app.use(
+    helmet({
+      contentSecurityPolicy: {
+        useDefaults: false,
+        directives: {
+          defaultSrc: ["'self'"],
+          scriptSrc: isDev ? ["'self'", "'unsafe-inline'"] : ["'self'"],
+          styleSrc: ["'self'", "'unsafe-inline'"],
+          fontSrc: ["'self'", 'data:'],
+          imgSrc: ["'self'", 'data:', 'blob:'],
+          mediaSrc: ["'self'", 'blob:', 'mediastream:'],
+          connectSrc: ["'self'", 'ws:', 'wss:'],
+          workerSrc: ["'self'", 'blob:'],
+          manifestSrc: ["'self'"],
+          objectSrc: ["'none'"],
+          baseUri: ["'self'"],
+          formAction: ["'self'"],
+          frameAncestors,
+        },
+      },
+      strictTransportSecurity: {
+        maxAge: 31_536_000,
+        includeSubDomains: true,
+        preload: true,
+      },
+      frameguard: {
+        action: 'sameorigin',
+      },
+      noSniff: true,
+      referrerPolicy: {
+        policy: 'strict-origin-when-cross-origin',
+      },
+      crossOriginOpenerPolicy: {policy: 'same-origin'},
+      permittedCrossDomainPolicies: {permittedPolicies: 'none'},
+    })
+  );
+
+  // Explicit Permissions-Policy restricting sensitive browser APIs strictly to same-origin
+  app.use((_req, res, next) => {
+    res.setHeader(
+      'Permissions-Policy',
+      'camera=(self), microphone=(self), geolocation=(), payment=(), usb=(), browsing-topics=()'
+    );
+    next();
+  });
+
+  app.use(express.json({limit: '256kb'}));
+  app.use(express.urlencoded({extended: false, limit: '256kb'}));
 
   // Serve public PWA assets (/icon.svg, /pwa-192x192.png, etc.) reliably in dev & prod
   app.use(express.static(path.join(__dirname, 'public')));
@@ -156,9 +290,23 @@ export async function createHealthSyncServer(
     }
   };
 
+  const disconnectSocketsForUserId = (userId: string, reason = 'Session revoked') => {
+    for (const [sock, user] of Array.from(clients.entries())) {
+      if (user.id === userId) {
+        clients.delete(sock);
+        trackedSockets.delete(sock);
+        try {
+          sock.close(4001, reason);
+        } catch {
+          sock.terminate();
+        }
+      }
+    }
+  };
+
   /**
-   * Scopes patient PHI WebSocket broadcasts strictly to authorized recipients:
-   * all connected DMO officers + the specific ASHA worker who owns the record.
+   * Scopes patient PHI WebSocket broadcasts strictly to authorized, verified recipients:
+   * all connected DMO officers + the specific verified ASHA worker who owns the record.
    */
   const broadcastRecordEvent = (
     payload: unknown,
@@ -168,6 +316,7 @@ export async function createHealthSyncServer(
     const serialized = JSON.stringify(payload);
     for (const [client, clientUser] of clients) {
       if (client === exclude || client.readyState !== WebSocket.OPEN) continue;
+      if (clientUser.role === 'ASHA' && !clientUser.isVerified) continue;
       if (
         clientUser.role === 'DMO' ||
         (ownerIdentifier !== '' && clientUser.identifier === ownerIdentifier)
@@ -189,115 +338,265 @@ export async function createHealthSyncServer(
     next();
   };
 
-  // --- AUTHENTICATION ROUTES ---
-  app.get('/api/health', (_req, res) => {
-    res.json({
-      status: 'ok',
-      connectedDevices: clients.size,
-      smsGateway: getConfiguredSmsGatewayStatus(),
-    });
-  });
-
-  app.get('/api/auth/status', (_req, res) => {
-    const configuredSecret = process.env.DMO_PROVISIONING_SECRET?.trim() || '';
-    res.json({
-      hasRegisteredUsers: db.countUsers() > 0,
-      dmoProvisioningEnabled:
-        configuredSecret.length >= 12 && configuredSecret !== 'MY_DMO_PROVISIONING_SECRET',
-      smsGateway: getConfiguredSmsGatewayStatus(),
-    });
-  });
-
-  // Global Auth Rate Limiter + Memory Cleanup (protects both /api/auth/register and /api/auth/login)
-  const authAttempts = new Map<string, {count: number; resetAt: number}>();
-
-  const authCleanupTimer = setInterval(() => {
-    const now = Date.now();
-    for (const [ip, data] of authAttempts.entries()) {
-      if (data.resetAt <= now) {
-        authAttempts.delete(ip);
-      }
+  const requireVerifiedUser = (req: AuthedRequest, res: Response, next: NextFunction) => {
+    if (!req.authUser) {
+      res.status(401).json({error: 'Unauthorized: Valid session token required.'});
+      return;
     }
-  }, 60_000);
-  authCleanupTimer.unref?.();
+    if (req.authUser.role === 'ASHA' && !req.authUser.isVerified) {
+      res.status(403).json({
+        error:
+          'Forbidden: ASHA account is pending verification. Submit a valid Clinic Enrollment Code or request District Medical Officer approval before accessing patient records or emergency alerts.',
+      });
+      return;
+    }
+    next();
+  };
 
-  const authRateLimiter = (req: Request, res: Response, next: NextFunction) => {
-    const ip = req.ip || req.socket?.remoteAddress || 'unknown';
-    const now = Date.now();
-    const throttle = authAttempts.get(ip);
+  // --- TIERED, PROXY-AWARE RATE LIMITERS (PERSISTED IN SQLITE BUCKETS) ---
+  const AUTH_WINDOW_MS = 15 * 60 * 1000;
+  const AUTH_MAX_FAILURES_PER_IP = 15;
+  const REG_MAX_ATTEMPTS_PER_IP = 15;
 
-    if (throttle && throttle.resetAt > now && throttle.count >= 15) {
+  const authFailureGuard = (req: Request, res: Response, next: NextFunction) => {
+    const ip = getTrustedClientIp(req);
+    const check = db.peekRateLimitBucket(`auth_fail_ip:${ip}`, AUTH_MAX_FAILURES_PER_IP);
+    if (check.blocked) {
+      res.setHeader('Retry-After', String(check.retryAfterSeconds));
       res.status(429).json({error: 'Too many authentication attempts. Try again later.'});
       return;
     }
     next();
   };
 
-  const recordAuthFailure = (req: Request) => {
-    const ip = req.ip || req.socket?.remoteAddress || 'unknown';
-    const now = Date.now();
-    const existing = authAttempts.get(ip);
-    const current =
-      existing && existing.resetAt > now
-        ? existing
-        : {count: 0, resetAt: now + 5 * 60 * 1000};
-    authAttempts.set(ip, {count: current.count + 1, resetAt: current.resetAt});
+  const registrationAbuseLimiter = (req: Request, res: Response, next: NextFunction) => {
+    const ip = getTrustedClientIp(req);
+    // Counts BOTH successful and failed registration requests so attackers cannot mass-create accounts
+    const regCheck = db.consumeRateLimitBucket(
+      `reg_attempt_ip:${ip}`,
+      REG_MAX_ATTEMPTS_PER_IP,
+      AUTH_WINDOW_MS
+    );
+    if (!regCheck.allowed) {
+      res.setHeader('Retry-After', String(regCheck.retryAfterSeconds));
+      res.status(429).json({
+        error: 'Too many authentication attempts or account registrations from this network. Try again later.',
+      });
+      return;
+    }
+    next();
   };
 
-  app.post('/api/auth/register', authRateLimiter, async (req, res) => {
-    try {
-      const {identifier, secret, role, displayName, villageCode, dmoProvisioningCode} =
-        req.body || {};
-      if (role !== 'ASHA' && role !== 'DMO') {
-        recordAuthFailure(req);
-        res.status(400).json({error: 'Role must be ASHA or DMO.'});
-        return;
-      }
+  const recordAuthFailure = (req: Request) => {
+    const ip = getTrustedClientIp(req);
+    db.consumeRateLimitBucket(`auth_fail_ip:${ip}`, AUTH_MAX_FAILURES_PER_IP, AUTH_WINDOW_MS);
+  };
 
-      // SECURITY FIX #1: Prevent unauthenticated DMO privilege escalation
-      if (role === 'DMO') {
-        const caller = db.verifySessionToken(extractBearerToken(req));
-        const headerSecret =
-          typeof req.headers['x-dmo-provisioning-secret'] === 'string'
-            ? req.headers['x-dmo-provisioning-secret'].trim()
-            : '';
-        const providedSecret = headerSecret || String(dmoProvisioningCode || '').trim();
+  const clearAuthFailuresForIp = (req: Request) => {
+    const ip = getTrustedClientIp(req);
+    db.resetRateLimitBucket(`auth_fail_ip:${ip}`);
+  };
 
-        const isAuthorizedByExistingDmo = caller?.role === 'DMO';
-        const isAuthorizedByProvisioningSecret = verifyDmoProvisioningSecret(providedSecret);
-
-        if (!isAuthorizedByExistingDmo && !isAuthorizedByProvisioningSecret) {
-          recordAuthFailure(req);
-          res.status(403).json({
-            error:
-              'Forbidden: District Medical Officer (DMO) registration requires an authenticated DMO administrator or valid Hospital Authorization Code.',
-          });
-          return;
-        }
-      }
-
-      await db.registerUser({
-        identifier: String(identifier || ''),
-        secret: String(secret || ''),
-        role: role as ServerUserRole,
-        displayName: String(displayName || ''),
-        villageCode: villageCode ? String(villageCode) : 'VIL-204',
+  const geminiRateLimiter = (req: AuthedRequest, res: Response, next: NextFunction) => {
+    const ip = getTrustedClientIp(req);
+    const userId = req.authUser?.id || 'anon';
+    const userBucket = db.consumeRateLimitBucket(`gemini_user:${userId}`, 10, 15 * 60 * 1000);
+    const ipBucket = db.consumeRateLimitBucket(`gemini_ip:${ip}`, 15, 15 * 60 * 1000);
+    if (!userBucket.allowed || !ipBucket.allowed) {
+      const retryAfter = Math.max(userBucket.retryAfterSeconds, ipBucket.retryAfterSeconds);
+      res.setHeader('Retry-After', String(retryAfter));
+      res.status(429).json({
+        error: 'Rate limit exceeded for AI clinical summaries. Please wait before requesting another summary.',
       });
-      const session = await db.authenticateUser(
-        String(identifier || ''),
-        String(secret || ''),
-        role as ServerUserRole
-      );
-      res.status(201).json(session);
-    } catch (err) {
-      recordAuthFailure(req);
-      const msg = err instanceof Error ? err.message : 'Registration failed.';
-      res.status(400).json({error: msg});
+      return;
     }
+    next();
+  };
+
+  const smsSendRateLimiter = (req: AuthedRequest, res: Response, next: NextFunction) => {
+    const ip = getTrustedClientIp(req);
+    const userId = req.authUser?.id || 'anon';
+    const userShort = db.consumeRateLimitBucket(`sms_user_15m:${userId}`, 5, 15 * 60 * 1000);
+    const ipShort = db.consumeRateLimitBucket(`sms_ip_15m:${ip}`, 8, 15 * 60 * 1000);
+    const userDaily = db.consumeRateLimitBucket(`sms_user_24h:${userId}`, 15, 24 * 60 * 60 * 1000);
+    if (!userShort.allowed || !ipShort.allowed || !userDaily.allowed) {
+      const retryAfter = Math.max(
+        userShort.retryAfterSeconds,
+        ipShort.retryAfterSeconds,
+        !userDaily.allowed ? userDaily.retryAfterSeconds : 0
+      );
+      res.setHeader('Retry-After', String(retryAfter));
+      res.status(429).json({
+        error: 'Emergency SMS rate limit reached to prevent carrier abuse. Use native device GSM SMS if urgent.',
+      });
+      return;
+    }
+    next();
+  };
+
+  // --- PROTECTED HEALTH & AUTH STATUS ROUTES (NO SENSITIVE INFO LEAKAGE) ---
+  app.get('/api/health', (req, res) => {
+    const caller = db.verifySessionToken(extractBearerToken(req));
+    if (caller?.role === 'DMO') {
+      res.json({
+        status: 'ok',
+        connectedDevices: clients.size,
+        persistenceMode: db.getPersistenceMode(),
+        smsGateway: getConfiguredSmsGatewayStatus({includeSensitive: false}),
+      });
+      return;
+    }
+    // Public liveness check exposes zero device counts, gateway providers, or phone numbers
+    res.json({status: 'ok'});
   });
 
-  app.post('/api/auth/login', authRateLimiter, async (req, res) => {
-    const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+  app.get('/api/auth/status', (req, res) => {
+    const caller = db.verifySessionToken(extractBearerToken(req));
+    if (caller?.role === 'DMO') {
+      const configuredDmoSecret = process.env.DMO_PROVISIONING_SECRET?.trim() || '';
+      const configuredAshaSecret = process.env.ASHA_ENROLLMENT_SECRET?.trim() || '';
+      res.json({
+        status: 'ok',
+        authRequired: true,
+        minSecretLength: 8,
+        dmoProvisioningEnabled:
+          configuredDmoSecret.length >= 12 &&
+          configuredDmoSecret !== 'MY_DMO_PROVISIONING_SECRET',
+        ashaEnrollmentConfigured:
+          configuredAshaSecret.length >= 12 &&
+          configuredAshaSecret !== 'MY_ASHA_ENROLLMENT_SECRET',
+        pendingAshaVerifications: db.listPendingAshaUsers().length,
+        smsGateway: getConfiguredSmsGatewayStatus({includeSensitive: false}),
+      });
+      return;
+    }
+    res.json({
+      status: 'ok',
+      authRequired: true,
+      minSecretLength: 8,
+    });
+  });
+
+  // --- AUTHENTICATION, VERIFICATION & SESSION SECURITY ROUTES ---
+  app.post(
+    '/api/auth/register',
+    authFailureGuard,
+    registrationAbuseLimiter,
+    async (req, res) => {
+      const ip = getTrustedClientIp(req);
+      try {
+        const {
+          identifier,
+          secret,
+          role,
+          displayName,
+          villageCode,
+          dmoProvisioningCode,
+          ashaEnrollmentCode,
+        } = req.body || {};
+
+        if (role !== 'ASHA' && role !== 'DMO') {
+          recordAuthFailure(req);
+          res.status(400).json({error: 'Role must be ASHA or DMO.'});
+          return;
+        }
+
+        const caller = db.verifySessionToken(extractBearerToken(req));
+        const isAuthorizedByExistingDmo = caller?.role === 'DMO';
+
+        if (role === 'DMO') {
+          const headerSecret =
+            typeof req.headers['x-dmo-provisioning-secret'] === 'string'
+              ? req.headers['x-dmo-provisioning-secret'].trim()
+              : '';
+          const providedSecret = headerSecret || String(dmoProvisioningCode || '').trim();
+          const isAuthorizedByProvisioningSecret = verifyDmoProvisioningSecret(providedSecret);
+
+          if (!isAuthorizedByExistingDmo && !isAuthorizedByProvisioningSecret) {
+            recordAuthFailure(req);
+            db.appendAuditLog({
+              actorId: String(identifier || 'unauthenticated').slice(0, 80),
+              actorRole: 'UNAUTHENTICATED',
+              action: 'DMO_REGISTRATION_DENIED',
+              targetType: 'user',
+              targetId: String(identifier || 'unknown').slice(0, 80),
+              rawIp: ip,
+            });
+            res.status(403).json({
+              error:
+                'Forbidden: District Medical Officer (DMO) registration requires an authenticated DMO administrator or valid Hospital Authorization Code.',
+            });
+            return;
+          }
+        }
+
+        // ASHA Verification Gate: Verified immediately ONLY if enrolled by a DMO or holding a valid Clinic Enrollment Code
+        let ashaVerified = false;
+        let verifiedBy: string | undefined;
+        if (role === 'ASHA') {
+          const headerEnrollment =
+            typeof req.headers['x-asha-enrollment-code'] === 'string'
+              ? req.headers['x-asha-enrollment-code'].trim()
+              : '';
+          const providedEnrollment = headerEnrollment || String(ashaEnrollmentCode || '').trim();
+
+          if (isAuthorizedByExistingDmo) {
+            ashaVerified = true;
+            verifiedBy = caller!.identifier;
+          } else if (providedEnrollment) {
+            if (!verifyAshaEnrollmentSecret(providedEnrollment)) {
+              recordAuthFailure(req);
+              res.status(403).json({
+                error: 'Invalid Clinic Enrollment Code for ASHA verification.',
+              });
+              return;
+            }
+            ashaVerified = true;
+            verifiedBy = 'CLINIC_ENROLLMENT_CODE';
+          }
+        }
+
+        const createdUser = await db.registerUser({
+          identifier: String(identifier || ''),
+          secret: String(secret || ''),
+          role: role as ServerUserRole,
+          displayName: String(displayName || ''),
+          villageCode: villageCode !== undefined ? String(villageCode) : '',
+          verified: role === 'DMO' ? true : ashaVerified,
+          verifiedBy: role === 'DMO' ? caller?.identifier || 'DMO_PROVISIONING_SECRET' : verifiedBy,
+        });
+
+        const session = await db.authenticateUser(
+          String(identifier || ''),
+          String(secret || ''),
+          role as ServerUserRole
+        );
+
+        db.appendAuditLog({
+          actorId: createdUser.identifier,
+          actorRole: createdUser.role,
+          action: 'USER_REGISTERED',
+          targetType: 'user',
+          targetId: createdUser.id,
+          rawIp: ip,
+          metadata: {
+            villageCode: createdUser.villageCode,
+            isVerified: createdUser.isVerified,
+          },
+        });
+        await db.flushDurableWrites();
+
+        res.status(201).json(session);
+      } catch (err) {
+        recordAuthFailure(req);
+        const msg = err instanceof Error ? err.message : 'Registration failed.';
+        res.status(400).json({error: msg});
+      }
+    }
+  );
+
+  app.post('/api/auth/login', authFailureGuard, async (req, res) => {
+    const ip = getTrustedClientIp(req);
     try {
       const {identifier, secret, role} = req.body || {};
       if (role !== 'ASHA' && role !== 'DMO') {
@@ -311,13 +610,30 @@ export async function createHealthSyncServer(
         role as ServerUserRole
       );
 
-      // Clear failures on success
-      authAttempts.delete(ip);
+      clearAuthFailuresForIp(req);
+      db.appendAuditLog({
+        actorId: session.user.identifier,
+        actorRole: session.user.role,
+        action: 'USER_LOGIN_SUCCESS',
+        targetType: 'session',
+        targetId: session.user.id,
+        rawIp: ip,
+      });
+      await db.flushDurableWrites();
+
       res.json(session);
-    } catch (err) {
+    } catch {
       recordAuthFailure(req);
-      const msg = err instanceof Error ? err.message : 'Authentication failed.';
-      res.status(401).json({error: msg});
+      db.appendAuditLog({
+        actorId: String(req.body?.identifier || 'unknown').slice(0, 80),
+        actorRole: String(req.body?.role || 'UNKNOWN').slice(0, 16),
+        action: 'USER_LOGIN_FAILED',
+        targetType: 'user',
+        targetId: String(req.body?.identifier || 'unknown').slice(0, 80),
+        rawIp: ip,
+      });
+      // Always return uniform generic 401 message to prevent account enumeration
+      res.status(401).json({error: 'Invalid credentials.'});
     }
   });
 
@@ -325,17 +641,151 @@ export async function createHealthSyncServer(
     res.json({user: req.authUser});
   });
 
-  app.post('/api/auth/logout', requireAuth, (req: AuthedRequest, res) => {
+  app.post('/api/auth/rotate-session', requireAuth, async (req: AuthedRequest, res) => {
+    const rotated = db.rotateSessionToken(req.rawToken);
+    if (!rotated) {
+      res.status(401).json({error: 'Session expired or invalid.'});
+      return;
+    }
+    db.appendAuditLog({
+      actorId: rotated.user.identifier,
+      actorRole: rotated.user.role,
+      action: 'SESSION_ROTATED',
+      targetType: 'session',
+      targetId: rotated.user.id,
+      rawIp: getTrustedClientIp(req),
+    });
+    await db.flushDurableWrites();
+    res.json({ok: true, ...rotated});
+  });
+
+  app.post('/api/auth/logout', requireAuth, async (req: AuthedRequest, res) => {
     db.revokeSessionToken(req.rawToken);
+    db.appendAuditLog({
+      actorId: req.authUser!.identifier,
+      actorRole: req.authUser!.role,
+      action: 'USER_LOGOUT',
+      targetType: 'session',
+      targetId: req.authUser!.id,
+      rawIp: getTrustedClientIp(req),
+    });
+    await db.flushDurableWrites();
     res.json({ok: true});
   });
 
-  // --- TRIAGE RECORDS & INCENTIVES (PERSISTED IN SQLITE WITH AES-256-GCM PHI ENCRYPTION & BOLA/IDOR RBAC) ---
-  app.get('/api/records', requireAuth, (req: AuthedRequest, res) => {
-    res.json({records: db.listRecordsForUser(req.authUser!)});
+  app.post('/api/auth/logout-all', requireAuth, async (req: AuthedRequest, res) => {
+    const revokedSessions = db.revokeAllUserSessions(req.authUser!.id);
+    disconnectSocketsForUserId(req.authUser!.id, 'Logged out from all devices');
+    db.appendAuditLog({
+      actorId: req.authUser!.identifier,
+      actorRole: req.authUser!.role,
+      action: 'USER_LOGOUT_ALL_DEVICES',
+      targetType: 'user',
+      targetId: req.authUser!.id,
+      rawIp: getTrustedClientIp(req),
+      metadata: {revokedSessions},
+    });
+    await db.flushDurableWrites();
+    res.json({ok: true, revokedSessions});
   });
 
-  app.post('/api/records', requireAuth, (req: AuthedRequest, res) => {
+  // Self-verification for pending ASHA accounts holding a Clinic Enrollment Code
+  app.post(
+    '/api/auth/verify-asha',
+    requireAuth,
+    authFailureGuard,
+    async (req: AuthedRequest, res) => {
+      if (req.authUser?.role !== 'ASHA') {
+        res.status(400).json({error: 'Only ASHA accounts use Clinic Enrollment verification.'});
+        return;
+      }
+      const code = String(req.body?.ashaEnrollmentCode || '').trim();
+      if (!verifyAshaEnrollmentSecret(code)) {
+        recordAuthFailure(req);
+        res.status(403).json({error: 'Invalid or unconfigured Clinic Enrollment Code.'});
+        return;
+      }
+
+      const updatedUser = db.setAshaVerificationStatus(
+        req.authUser.identifier,
+        true,
+        'CLINIC_ENROLLMENT_CODE'
+      );
+      if (!updatedUser) {
+        res.status(404).json({error: 'ASHA account not found.'});
+        return;
+      }
+
+      // Rotate session token immediately upon privilege/verification elevation
+      const rotated = db.rotateSessionToken(req.rawToken);
+      db.appendAuditLog({
+        actorId: updatedUser.identifier,
+        actorRole: 'ASHA',
+        action: 'ASHA_ACCOUNT_VERIFIED_BY_CODE',
+        targetType: 'user',
+        targetId: updatedUser.id,
+        rawIp: getTrustedClientIp(req),
+      });
+      await db.flushDurableWrites();
+
+      res.json({
+        ok: true,
+        user: updatedUser,
+        token: rotated?.token,
+        expiresAtMs: rotated?.expiresAtMs,
+      });
+    }
+  );
+
+  // DMO Administrative ASHA Verification Queue & Approval
+  app.get('/api/auth/asha/pending', requireAuth, (req: AuthedRequest, res) => {
+    if (req.authUser?.role !== 'DMO') {
+      res.status(403).json({error: 'Forbidden: Only DMO officers can review pending ASHA accounts.'});
+      return;
+    }
+    res.json({pending: db.listPendingAshaUsers()});
+  });
+
+  app.post('/api/auth/asha/:identifier/verify', requireAuth, async (req: AuthedRequest, res) => {
+    if (req.authUser?.role !== 'DMO') {
+      res.status(403).json({error: 'Forbidden: Only DMO officers can verify ASHA accounts.'});
+      return;
+    }
+    const approve = req.body?.verified !== false;
+    const updated = db.setAshaVerificationStatus(
+      req.params.identifier,
+      approve,
+      req.authUser.identifier
+    );
+    if (!updated) {
+      res.status(404).json({error: 'ASHA account not found.'});
+      return;
+    }
+    if (!approve) {
+      db.revokeAllUserSessions(updated.id);
+      disconnectSocketsForUserId(updated.id, 'ASHA verification revoked by DMO');
+    }
+    db.appendAuditLog({
+      actorId: req.authUser.identifier,
+      actorRole: 'DMO',
+      action: approve ? 'ASHA_APPROVED_BY_DMO' : 'ASHA_REVOKED_BY_DMO',
+      targetType: 'user',
+      targetId: updated.identifier,
+      rawIp: getTrustedClientIp(req),
+    });
+    await db.flushDurableWrites();
+    res.json({ok: true, user: updated});
+  });
+
+  // --- TRIAGE RECORDS, CONSENT, INCENTIVES & SECURE DPDP ERASURE ---
+  app.get('/api/records', requireAuth, requireVerifiedUser, (req: AuthedRequest, res) => {
+    const rawSince = req.query.since ? Number(req.query.since) : undefined;
+    const sinceMs =
+      rawSince !== undefined && Number.isFinite(rawSince) && rawSince > 0 ? rawSince : undefined;
+    res.json({records: db.listRecordsForUser(req.authUser!, 500, sinceMs)});
+  });
+
+  app.post('/api/records', requireAuth, requireVerifiedUser, async (req: AuthedRequest, res) => {
     const {record, triggerEmergencySiren, incentive} = req.body || {};
     if (!record || typeof record.id !== 'string' || !record.id.trim() || !record.vitals) {
       res.status(400).json({error: 'Invalid triage record payload.'});
@@ -348,22 +798,73 @@ export async function createHealthSyncServer(
         req.authUser!,
         record as TriageRecord
       );
-      const saved = db.upsertRecord(sanitized, ownerIdentifier);
-      if (incentive && incentive.id && req.authUser) {
-        db.insertIncentive(incentive as IncentiveEntry, req.authUser.identifier);
+
+      // DPDP Section 9: Validate & persist verifiable parent/guardian consent for minors (< 18)
+      db.validateAndPersistConsent(sanitized, req.authUser!.identifier);
+
+      // Server-side incentive validation BEFORE or atomic with record save (never trust client IDs or amountInr)
+      let savedIncentive: IncentiveEntry | undefined;
+      if (incentive !== undefined && incentive !== null) {
+        if (req.authUser!.role !== 'ASHA') {
+          res.status(403).json({
+            error: 'Forbidden: Only verified ASHA workers can submit field visit stipends.',
+          });
+          return;
+        }
+        savedIncentive = db.recordVerifiedTriageIncentive({
+          record: sanitized,
+          ownerUser: req.authUser!,
+          clientSubmittedIncentive: incentive as Partial<IncentiveEntry>,
+        });
       }
+
+      const saved = db.upsertRecord(sanitized, ownerIdentifier);
+      if (!savedIncentive && req.authUser!.role === 'ASHA') {
+        savedIncentive = db.recordVerifiedTriageIncentive({
+          record: saved,
+          ownerUser: req.authUser!,
+        });
+      }
+
+      const allowSiren = Boolean(triggerEmergencySiren) && saved.severity === 'emergency';
+
+      db.appendAuditLog({
+        actorId: req.authUser!.identifier,
+        actorRole: req.authUser!.role,
+        action: 'TRIAGE_RECORD_SAVED',
+        targetType: 'triage_record',
+        targetId: saved.id,
+        rawIp: getTrustedClientIp(req),
+        metadata: {
+          severity: saved.severity,
+          villageCode: saved.villageCode,
+          isMinor: Number(saved.age) < 18,
+          sirenTriggered: allowSiren,
+        },
+      });
+      await db.flushDurableWrites();
+
       broadcastRecordEvent(
         {
           type: 'record:created',
           record: saved,
-          triggerEmergencySiren: Boolean(triggerEmergencySiren),
+          triggerEmergencySiren: allowSiren,
         },
         ownerIdentifier
       );
-      res.status(201).json({ok: true, record: saved});
+      res.status(201).json({ok: true, record: saved, incentive: savedIncentive});
     } catch (err) {
       if (err instanceof RecordAuthorizationError) {
         res.status(err.statusCode).json({error: err.message});
+        return;
+      }
+      const msg = err instanceof Error ? err.message : '';
+      if (
+        msg.includes('DPDP Section 9') ||
+        msg.includes('Invalid stipend') ||
+        msg.includes('Forbidden')
+      ) {
+        res.status(msg.startsWith('Forbidden') ? 403 : 400).json({error: msg});
         return;
       }
       console.error('[HealthSync DB Error] Failed to save triage record via POST /api/records:', err);
@@ -371,7 +872,7 @@ export async function createHealthSyncServer(
     }
   });
 
-  app.patch('/api/records/:id/dispatch', requireAuth, (req: AuthedRequest, res) => {
+  app.patch('/api/records/:id/dispatch', requireAuth, async (req: AuthedRequest, res) => {
     if (req.authUser?.role !== 'DMO') {
       res.status(403).json({error: 'Forbidden: Only DMO officers can dispatch ambulances.'});
       return;
@@ -382,13 +883,29 @@ export async function createHealthSyncServer(
         res.status(404).json({error: 'Triage record not found.'});
         return;
       }
+      const cleanUnit = String(req.body?.ambulanceUnit || '108-AMB-UP65')
+        .replace(/[^\w-]/g, '')
+        .slice(0, 32);
+      const safeEta = Math.min(180, Math.max(1, Math.round(Number(req.body?.etaMinutes) || 11)));
+
       const updated: TriageRecord = {
         ...existingWithOwner.record,
         dispatchStatus: 'Dispatched',
-        ambulanceUnit: req.body?.ambulanceUnit || '108-AMB-UP65',
-        etaMinutes: Number(req.body?.etaMinutes) || 11,
+        ambulanceUnit: cleanUnit || '108-AMB-UP65',
+        etaMinutes: safeEta,
       };
       db.upsertRecord(updated, existingWithOwner.ownerIdentifier);
+      db.appendAuditLog({
+        actorId: req.authUser.identifier,
+        actorRole: 'DMO',
+        action: 'AMBULANCE_DISPATCHED',
+        targetType: 'triage_record',
+        targetId: updated.id,
+        rawIp: getTrustedClientIp(req),
+        metadata: {ambulanceUnit: updated.ambulanceUnit, etaMinutes: updated.etaMinutes},
+      });
+      await db.flushDurableWrites();
+
       broadcastRecordEvent(
         {type: 'record:updated', record: updated},
         existingWithOwner.ownerIdentifier
@@ -400,60 +917,301 @@ export async function createHealthSyncServer(
     }
   });
 
-  app.get('/api/incentives', requireAuth, (req: AuthedRequest, res) => {
-    res.json({incentives: db.listIncentives(req.authUser?.identifier)});
+  // DPDP Section 8 / Section 12: Authorized Patient Data Deletion with Immutable Audit Trail
+  app.delete('/api/records/:id', requireAuth, async (req: AuthedRequest, res) => {
+    if (req.authUser?.role !== 'DMO') {
+      res.status(403).json({
+        error:
+          'Forbidden: Only District Medical Officers (Data Fiduciary) can authorize permanent patient data erasure.',
+      });
+      return;
+    }
+    try {
+      const reason = String(
+        req.body?.reason || req.query?.reason || 'DPDP Section 8 patient erasure request'
+      ).trim();
+      const result = db.deleteRecordSecurely({
+        recordId: req.params.id,
+        actor: req.authUser,
+        reason,
+        rawIp: getTrustedClientIp(req),
+      });
+      if (!result.deleted) {
+        res.status(404).json({error: 'Patient triage record not found.'});
+        return;
+      }
+      await db.flushDurableWrites();
+      broadcastJson({type: 'record:deleted', recordId: req.params.id});
+      res.json({
+        ok: true,
+        deletedRecordId: req.params.id,
+        patientId: result.patientId,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to erase patient record.';
+      res.status(400).json({error: msg});
+    }
   });
 
-  // --- SERVER-SIDE GEMINI CLINICAL CO-PILOT ---
-  app.post('/api/gemini/clinical-summary', requireAuth, async (req, res) => {
+  app.get('/api/incentives', requireAuth, requireVerifiedUser, (req: AuthedRequest, res) => {
+    if (req.authUser?.role === 'DMO') {
+      res.json({incentives: db.listIncentives()});
+      return;
+    }
+    res.json({incentives: db.listIncentives(req.authUser!.identifier)});
+  });
+
+  // --- DPDP COMPLIANCE: AUDIT LOGS & DATA BREACH REPORTING (DMO ONLY) ---
+  app.get('/api/compliance/audit-logs', requireAuth, (req: AuthedRequest, res) => {
+    if (req.authUser?.role !== 'DMO') {
+      res.status(403).json({error: 'Forbidden: Only DMO officers can inspect security audit logs.'});
+      return;
+    }
+    const limit = Number(req.query.limit) || 100;
+    const integrity = db.verifyAuditChain();
+    res.json({
+      integrity,
+      logs: db.listAuditLogs(limit),
+    });
+  });
+
+  app.post('/api/compliance/breach-report', requireAuth, async (req: AuthedRequest, res) => {
+    if (req.authUser?.role !== 'DMO') {
+      res.status(403).json({error: 'Forbidden: Only DMO officers can file DPDP data breach reports.'});
+      return;
+    }
     try {
-      const {patientName, age, vitals, symptoms, edgeAi, transcript, language} = req.body || {};
+      const {
+        severity,
+        incidentType,
+        affectedRecordsEstimate,
+        description,
+        containmentActions,
+        dpbNotified,
+        affectedPrincipalsNotified,
+      } = req.body || {};
+
+      const allowedSeverities = ['low', 'medium', 'high', 'critical'] as const;
+      const cleanSeverity = allowedSeverities.includes(severity) ? severity : 'high';
+
+      const report = db.createBreachReport({
+        reportedBy: req.authUser.identifier,
+        severity: cleanSeverity,
+        incidentType: String(incidentType || ''),
+        affectedRecordsEstimate: Number(affectedRecordsEstimate) || 0,
+        description: String(description || ''),
+        containmentActions: String(containmentActions || ''),
+        dpbNotified: Boolean(dpbNotified),
+        affectedPrincipalsNotified: Boolean(affectedPrincipalsNotified),
+      });
+
+      db.appendAuditLog({
+        actorId: req.authUser.identifier,
+        actorRole: 'DMO',
+        action: 'DPDP_BREACH_REPORT_FILED',
+        targetType: 'breach_report',
+        targetId: report.id,
+        rawIp: getTrustedClientIp(req),
+        metadata: {
+          severity: report.severity,
+          incidentType: report.incidentType,
+          affectedRecordsEstimate: report.affectedRecordsEstimate,
+        },
+      });
+      await db.flushDurableWrites();
+
+      res.status(201).json({
+        ok: true,
+        report,
+        statutoryObligations: {
+          certInNotificationDeadlineHours: 6,
+          dataProtectionBoardDeadlineHours: 72,
+          affectedDataPrincipalsNotificationRequired: true,
+        },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to file breach report.';
+      res.status(400).json({error: msg});
+    }
+  });
+
+  app.get('/api/compliance/breach-reports', requireAuth, (req: AuthedRequest, res) => {
+    if (req.authUser?.role !== 'DMO') {
+      res.status(403).json({error: 'Forbidden: Only DMO officers can view breach reports.'});
+      return;
+    }
+    res.json({reports: db.listBreachReports(50)});
+  });
+
+  const attachOptionalAuth = (req: AuthedRequest, _res: Response, next: NextFunction) => {
+    const token = extractBearerToken(req);
+    const verified = token ? db.verifySessionToken(token) : null;
+    if (verified) {
+      req.authUser = verified;
+    }
+    next();
+  };
+
+  // --- SERVER-SIDE GEMINI CLINICAL CO-PILOT (DPDP ANONYMIZED, SUPPORTS AUTHED & DEMO SESSIONS) ---
+  const handleClinicalSummaryRequest = async (req: AuthedRequest, res: Response) => {
+    try {
+      const {
+        patientName,
+        age,
+        vitals,
+        symptoms,
+        edgeAi,
+        transcript,
+        language,
+        explicitAiConsent,
+        lawfulBasis,
+      } = req.body || {};
+
       if (!vitals || typeof vitals.systolic !== 'number') {
         res.status(400).json({error: 'Patient vitals are required for clinical summary.'});
         return;
       }
+
+      const isMinor = age !== undefined && Number(age) < 18;
+      // Only allow identifiable patientName when caller holds a verified session AND explicit adult consent
+      const isVerifiedSession = Boolean(req.authUser && req.authUser.isVerified !== false);
+      const verifiedConsent =
+        isVerifiedSession && !isMinor && explicitAiConsent === true && Boolean(lawfulBasis);
+
+      db.appendAuditLog({
+        actorId: req.authUser?.identifier || 'DEMO_OR_LOCAL_SESSION',
+        actorRole: req.authUser?.role || 'DEMO',
+        action: 'GEMINI_CLINICAL_SUMMARY_REQUESTED',
+        targetType: 'ai_copilot',
+        targetId: 'gemini-3.8-flash',
+        rawIp: getTrustedClientIp(req),
+        metadata: {
+          authenticated: Boolean(req.authUser),
+          anonymized: !verifiedConsent,
+          isMinor,
+        },
+      });
+
       const summary = await generateClinicalTriageSummary({
-        patientName,
+        // Never pass identifiable patientName unless verified session + explicit adult consent exist
+        patientName: verifiedConsent ? patientName : undefined,
         age,
         vitals,
         symptoms: Array.isArray(symptoms) ? symptoms : [],
         edgeAi,
         transcript,
         language,
+        explicitAiConsent: verifiedConsent,
+        lawfulBasis: verifiedConsent ? lawfulBasis : undefined,
       });
       res.json(summary);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Gemini clinical summary failed.';
       res.status(502).json({error: msg});
     }
-  });
+  };
 
-  // --- REAL SMS GATEWAY & AUTHENTICATED INBOUND WEBHOOK ---
-  app.post('/api/sms/send', requireAuth, async (req, res) => {
-    const {payloadText, recordId, toPhone} = req.body || {};
-    if (!payloadText || typeof payloadText !== 'string') {
-      res.status(400).json({error: 'SMS payloadText is required.'});
-      return;
+  app.post(
+    ['/api/gemini/clinical-summary', '/api/ai/care-summary', '/api/triage/summary'],
+    attachOptionalAuth,
+    geminiRateLimiter,
+    handleClinicalSummaryRequest
+  );
+
+  // --- SECURED EMERGENCY SMS GATEWAY & AUTHENTICATED INBOUND WEBHOOK ---
+  app.post(
+    '/api/sms/send',
+    requireAuth,
+    requireVerifiedUser,
+    smsSendRateLimiter,
+    async (req: AuthedRequest, res) => {
+      const {payloadText, recordId, toPhone} = req.body || {};
+      if (!payloadText || typeof payloadText !== 'string') {
+        res.status(400).json({error: 'SMS payloadText is required.'});
+        return;
+      }
+
+      try {
+        const cleanRecordId = typeof recordId === 'string' && recordId.trim() ? recordId.trim() : null;
+        if (cleanRecordId) {
+          const existing = db.getRecordWithOwner(cleanRecordId);
+          if (!existing) {
+            res.status(404).json({error: 'Referenced emergency triage record not found.'});
+            return;
+          }
+          if (
+            req.authUser!.role !== 'DMO' &&
+            existing.ownerIdentifier !== req.authUser!.identifier
+          ) {
+            res.status(403).json({
+              error: 'Forbidden: Cannot dispatch SMS for another worker’s triage record.',
+            });
+            return;
+          }
+          if (existing.record.severity !== 'emergency') {
+            res.status(403).json({
+              error: 'Forbidden: Carrier SMS dispatch is restricted to emergency records.',
+            });
+            return;
+          }
+          if (db.hasSentOutboundCarrierSmsForRecord(cleanRecordId)) {
+            res.status(409).json({
+              error: 'Duplicate SMS blocked: Emergency carrier SMS was already sent for this record.',
+            });
+            return;
+          }
+        }
+
+        const outcome = await dispatchEmergencySms({
+          db,
+          payloadText,
+          recordId: cleanRecordId,
+          requestedToPhone: toPhone !== undefined ? String(toPhone) : undefined,
+        });
+
+        db.appendAuditLog({
+          actorId: req.authUser!.identifier,
+          actorRole: req.authUser!.role,
+          action: 'EMERGENCY_SMS_DISPATCH',
+          targetType: 'sms',
+          targetId: cleanRecordId || 'adhoc-emergency-frame',
+          rawIp: getTrustedClientIp(req),
+          metadata: {
+            provider: outcome.provider,
+            sent: outcome.sent,
+          },
+        });
+        await db.flushDurableWrites();
+
+        res.json(outcome);
+      } catch (err) {
+        if (err instanceof SmsAuthorizationError) {
+          res.status(err.statusCode).json({error: err.message});
+          return;
+        }
+        const msg = err instanceof Error ? err.message : 'SMS dispatch failed.';
+        res.status(400).json({error: msg});
+      }
     }
-    const outcome = await dispatchEmergencySms({
-      db,
-      payloadText,
-      recordId: recordId ?? null,
-      overrideToPhone: toPhone ? String(toPhone) : undefined,
-    });
-    res.json(outcome);
-  });
+  );
 
   app.get('/api/sms/logs', requireAuth, (req: AuthedRequest, res) => {
     if (req.authUser?.role !== 'DMO') {
       res.status(403).json({error: 'Forbidden: Only DMO officers can inspect district SMS logs.'});
       return;
     }
-    res.json({logs: db.listSmsDispatches(30), gateway: getConfiguredSmsGatewayStatus()});
+    const rawLogs = db.listSmsDispatches(30).map((item) => ({
+      ...item,
+      toPhone: item.toPhone.includes('•') ? item.toPhone : maskPhoneNumber(item.toPhone),
+    }));
+    res.json({
+      logs: rawLogs,
+      gateway: getConfiguredSmsGatewayStatus({includeSensitive: false}),
+    });
   });
 
-  // SECURITY FIX #4: Carrier inbound webhook requires Twilio HMAC-SHA1 or SMS_WEBHOOK_SECRET
-  app.post('/api/sms/webhook', (req, res) => {
+  // Carrier inbound webhook requires Twilio HMAC-SHA1 or SMS_WEBHOOK_SECRET
+  app.post('/api/sms/webhook', async (req, res) => {
     const webhookAuth = verifyInboundSmsWebhookAuth({
       headers: req.headers,
       protocol: req.protocol,
@@ -483,10 +1241,11 @@ export async function createHealthSyncServer(
         return;
       }
 
-      const record = parseInboundSmsWebhookToRecord(fromPhone, rawBody, {providerMessageId});
+      const record = parseInboundSmsWebhookToRecord(maskPhoneNumber(fromPhone), rawBody, {
+        providerMessageId,
+      });
       const existingRecord = db.getRecordWithOwner(record.id);
 
-      // Idempotency guard: ignore duplicate carrier webhook retries without duplicating records or analytics
       if (existingRecord || db.hasSmsDispatchForRecord(record.id, 'inbound_webhook')) {
         res.type('text/xml').send('<Response></Response>');
         return;
@@ -495,13 +1254,27 @@ export async function createHealthSyncServer(
       db.upsertRecord(record, '');
       db.logSmsDispatch({
         recordId: record.id,
-        toPhone: fromPhone,
+        toPhone: maskPhoneNumber(fromPhone),
         provider: 'inbound_webhook',
         status: 'received',
         providerMessageId,
         payloadText: rawBody,
         errorMessage: null,
       });
+      db.appendAuditLog({
+        actorId: 'CARRIER_SMS_WEBHOOK',
+        actorRole: 'SYSTEM',
+        action: 'INBOUND_SMS_TRIAGE_RECEIVED',
+        targetType: 'triage_record',
+        targetId: record.id,
+        rawIp: getTrustedClientIp(req),
+        metadata: {
+          authMethod: webhookAuth.method,
+          severity: record.severity,
+        },
+      });
+      await db.flushDurableWrites();
+
       broadcastRecordEvent(
         {
           type: 'record:created',
@@ -528,14 +1301,19 @@ export async function createHealthSyncServer(
         typeof (err as {status?: number})?.status === 'number'
           ? (err as {status: number}).status
           : 500;
-      const msg = err instanceof Error ? err.message : 'Unexpected server error.';
+      const msg =
+        status >= 500
+          ? 'Unexpected server error.'
+          : err instanceof Error
+          ? err.message
+          : 'Invalid request.';
       res.status(status).json({error: msg});
       return;
     }
     next(err);
   });
 
-  // --- AUTHENTICATED WEBSOCKET SERVER WITH PING/PONG HEARTBEAT & POST-UPGRADE FRAME AUTH ---
+  // --- AUTHENTICATED WEBSOCKET SERVER WITH VERIFIED-ASHA GATE & ZOMBIE REAPING ---
   const sendSafeJson = (sock: WebSocket, payload: unknown) => {
     if (sock.readyState === WebSocket.OPEN) {
       try {
@@ -568,6 +1346,14 @@ export async function createHealthSyncServer(
     let authDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
 
     if (authedUser) {
+      if (authedUser.role === 'ASHA' && !authedUser.isVerified) {
+        sendSafeJson(ws, {
+          type: 'auth:error',
+          error: 'Forbidden: ASHA account is pending verification.',
+        });
+        ws.close(4003, 'ASHA verification required');
+        return;
+      }
       activateAuthenticatedSocket(ws, authedUser);
     } else {
       authDeadlineTimer = setTimeout(() => {
@@ -612,6 +1398,14 @@ export async function createHealthSyncServer(
             ws.close(4001, 'Unauthorized');
             return;
           }
+          if (verified.role === 'ASHA' && !verified.isVerified) {
+            sendSafeJson(ws, {
+              type: 'auth:error',
+              error: 'Forbidden: Unverified ASHA accounts cannot stream live hospital alerts.',
+            });
+            ws.close(4003, 'ASHA verification required');
+            return;
+          }
           if (authDeadlineTimer) {
             clearTimeout(authDeadlineTimer);
             authDeadlineTimer = null;
@@ -629,6 +1423,18 @@ export async function createHealthSyncServer(
         return;
       }
 
+      // Re-verify active user verification status in case DMO revoked account mid-connection
+      const freshSession =
+        typeof msg.token === 'string' ? db.verifySessionToken(msg.token) : authedUser;
+      if (!freshSession || (freshSession.role === 'ASHA' && !freshSession.isVerified)) {
+        sendSafeJson(ws, {
+          type: 'auth:error',
+          error: 'Session expired or account verification revoked.',
+        });
+        ws.close(4001, 'Unauthorized');
+        return;
+      }
+
       const incomingRec = msg.record as TriageRecord | undefined;
       const incomingRecordId =
         incomingRec && typeof incomingRec.id === 'string' ? incomingRec.id : null;
@@ -640,7 +1446,23 @@ export async function createHealthSyncServer(
             authedUser,
             incomingRec
           );
+          db.validateAndPersistConsent(sanitized, authedUser.identifier);
           const saved = db.upsertRecord(sanitized, ownerIdentifier);
+          if (authedUser.role === 'ASHA') {
+            db.recordVerifiedTriageIncentive({record: saved, ownerUser: authedUser});
+          }
+          const allowSiren =
+            Boolean(msg.triggerEmergencySiren) && saved.severity === 'emergency';
+
+          db.appendAuditLog({
+            actorId: authedUser.identifier,
+            actorRole: authedUser.role,
+            action: 'WS_TRIAGE_RECORD_SAVED',
+            targetType: 'triage_record',
+            targetId: saved.id,
+            metadata: {severity: saved.severity, sirenTriggered: allowSiren},
+          });
+
           sendSafeJson(ws, {
             type: 'sync:ack',
             recordId: saved.id,
@@ -650,7 +1472,7 @@ export async function createHealthSyncServer(
             {
               type: 'record:created',
               record: saved,
-              triggerEmergencySiren: Boolean(msg.triggerEmergencySiren),
+              triggerEmergencySiren: allowSiren,
             },
             ownerIdentifier,
             ws
@@ -688,7 +1510,20 @@ export async function createHealthSyncServer(
           });
           return;
         }
-        console.error('[HealthSync WS Sync Error] Database write failed during WebSocket sync:', err);
+        const errMsg = err instanceof Error ? err.message : '';
+        if (errMsg.includes('DPDP Section 9')) {
+          sendSafeJson(ws, {
+            type: 'sync:error',
+            recordId: incomingRecordId,
+            error: errMsg,
+            retryable: false,
+          });
+          return;
+        }
+        console.error(
+          '[HealthSync WS Sync Error] Database write failed during WebSocket sync:',
+          err
+        );
         sendSafeJson(ws, {
           type: 'sync:error',
           recordId: incomingRecordId,
@@ -753,8 +1588,6 @@ export async function createHealthSyncServer(
     if (heartbeatStopped) return;
     heartbeatStopped = true;
     clearInterval(heartbeatTimer);
-    clearInterval(authCleanupTimer);
-    authAttempts.clear();
     for (const sock of Array.from(trackedSockets)) {
       trackedSockets.delete(sock);
       try {
@@ -773,7 +1606,6 @@ export async function createHealthSyncServer(
     try {
       const parsedUrl = new URL(request.url || '/', 'http://localhost');
       if (parsedUrl.pathname === '/ws/triage') {
-        // SECURITY FIX: Never allow session tokens in WebSocket URL query parameters (prevents proxy/LB log leakage)
         if (parsedUrl.searchParams.has('token')) {
           socket.write(
             'HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nSession tokens must not be passed in URL query parameters.\r\n'
@@ -793,6 +1625,11 @@ export async function createHealthSyncServer(
           initialUser = db.verifySessionToken(headerAuth);
           if (!initialUser) {
             socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+            socket.destroy();
+            return;
+          }
+          if (initialUser.role === 'ASHA' && !initialUser.isVerified) {
+            socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
             socket.destroy();
             return;
           }
@@ -844,5 +1681,8 @@ async function startServer() {
 const isMainModule =
   process.argv[1] && path.resolve(process.argv[1]) === path.resolve(__filename);
 if (isMainModule) {
-  startServer();
+  startServer().catch((err) => {
+    console.error('[HealthSync Fatal Startup Error]:', err instanceof Error ? err.message : err);
+    process.exit(1);
+  });
 }

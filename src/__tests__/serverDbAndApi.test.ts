@@ -81,14 +81,16 @@ describe('SQLite Persistence, AES-256-GCM At-Rest PHI Encryption & Authenticated
 
   it('enforces DMO registration auth, BOLA/IDOR record ownership, SMS webhook auth, and /icon.svg', async () => {
     const prevDmoSecret = process.env.DMO_PROVISIONING_SECRET;
+    const prevAshaSecret = process.env.ASHA_ENROLLMENT_SECRET;
     const prevWebhookSecret = process.env.SMS_WEBHOOK_SECRET;
     const prevTwilioToken = process.env.TWILIO_AUTH_TOKEN;
 
     process.env.DMO_PROVISIONING_SECRET = 'District24-Admin-Provision-2026!';
+    process.env.ASHA_ENROLLMENT_SECRET = 'Clinic24-ASHA-Enrollment-2026!';
     process.env.SMS_WEBHOOK_SECRET = 'Fast2SMS-Carrier-Webhook-Secret-99!';
     delete process.env.TWILIO_AUTH_TOKEN;
 
-    const memDb = new HealthSyncDatabase(':memory:', 'api-test-key');
+    const memDb = new HealthSyncDatabase(':memory:', 'api-test-key-32-chars-minimum-012345');
     const {httpServer} = await createHealthSyncServer(memDb);
 
     await new Promise<void>((resolve) => httpServer.listen(0, '127.0.0.1', () => resolve()));
@@ -133,16 +135,17 @@ describe('SQLite Persistence, AES-256-GCM At-Rest PHI Encryption & Authenticated
       });
       expect(wrongCodeDmoRes.status).toBe(403);
 
-      // 4. Register ASHA Worker A and ASHA Worker B, and verify wrong PIN fails login
+      // 4. Register verified ASHA Worker A and ASHA Worker B, and verify wrong passcode fails login
       const regAshaARes = await fetch(`${baseUrl}/api/auth/register`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
           identifier: 'ASHA-9001-UP',
-          secret: '7391',
+          secret: 'MeeraPass#7391',
           role: 'ASHA',
           displayName: 'Meera Devi',
           villageCode: 'VIL-204',
+          ashaEnrollmentCode: 'Clinic24-ASHA-Enrollment-2026!',
         }),
       });
       expect(regAshaARes.status).toBe(201);
@@ -154,10 +157,11 @@ describe('SQLite Persistence, AES-256-GCM At-Rest PHI Encryption & Authenticated
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
           identifier: 'ASHA-9002-UP',
-          secret: '8462',
+          secret: 'KavitaPass#8462',
           role: 'ASHA',
           displayName: 'Kavita Verma',
           villageCode: 'VIL-108',
+          ashaEnrollmentCode: 'Clinic24-ASHA-Enrollment-2026!',
         }),
       });
       expect(regAshaBRes.status).toBe(201);
@@ -184,7 +188,7 @@ describe('SQLite Persistence, AES-256-GCM At-Rest PHI Encryption & Authenticated
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
           identifier: 'ASHA-9001-UP',
-          secret: '1234',
+          secret: 'WrongPass#1234',
           role: 'ASHA',
         }),
       });
@@ -366,6 +370,9 @@ describe('SQLite Persistence, AES-256-GCM At-Rest PHI Encryption & Authenticated
       if (prevDmoSecret === undefined) delete process.env.DMO_PROVISIONING_SECRET;
       else process.env.DMO_PROVISIONING_SECRET = prevDmoSecret;
 
+      if (prevAshaSecret === undefined) delete process.env.ASHA_ENROLLMENT_SECRET;
+      else process.env.ASHA_ENROLLMENT_SECRET = prevAshaSecret;
+
       if (prevWebhookSecret === undefined) delete process.env.SMS_WEBHOOK_SECRET;
       else process.env.SMS_WEBHOOK_SECRET = prevWebhookSecret;
 
@@ -405,16 +412,31 @@ describe('SQLite Persistence, AES-256-GCM At-Rest PHI Encryption & Authenticated
       const authPromises = Array.from({length: 6}, (_, idx) =>
         memDb.registerUser({
           identifier: `ASHA-ASYNC-${idx}`,
-          secret: `Pin#${1000 + idx}`,
+          secret: `StrongPin#${1000 + idx}`,
           role: 'ASHA',
-          displayName: `Worker ${idx}`,
+          displayName: `Worker ${String.fromCharCode(65 + idx)}`,
+          verified: true,
+          verifiedBy: 'UNIT_TEST',
         })
       );
       await Promise.all(authPromises);
       clearInterval(tickTimer);
       expect(eventLoopTicksDuringAuth).toBeGreaterThan(0);
 
-      const sessionA = await memDb.authenticateUser('ASHA-ASYNC-0', 'Pin#1000', 'ASHA');
+      await memDb.registerUser({
+        identifier: 'dmo.health@district24.gov.in',
+        secret: 'DmoHealth#2026',
+        role: 'DMO',
+        displayName: 'Dr. Health Check',
+        verified: true,
+      });
+      const dmoHealthSession = await memDb.authenticateUser(
+        'dmo.health@district24.gov.in',
+        'DmoHealth#2026',
+        'DMO'
+      );
+
+      const sessionA = await memDb.authenticateUser('ASHA-ASYNC-0', 'StrongPin#1000', 'ASHA');
       expect(sessionA.token.length).toBeGreaterThan(20);
 
       // 2. SESSION CREDENTIAL LEAKAGE FIX: Query-string ?token= MUST be rejected on upgrade
@@ -507,7 +529,15 @@ describe('SQLite Persistence, AES-256-GCM At-Rest PHI Encryption & Authenticated
         zombieWs.on('error', reject);
       });
 
-      const healthDuringZombie = await (await fetch(`${baseUrl}/api/health`)).json();
+      // Unauthenticated /api/health hides connectedDevices; DMO-authenticated /api/health sees live count
+      const publicHealth = await (await fetch(`${baseUrl}/api/health`)).json();
+      expect(publicHealth.connectedDevices).toBeUndefined();
+
+      const healthDuringZombie = await (
+        await fetch(`${baseUrl}/api/health`, {
+          headers: {Authorization: `Bearer ${dmoHealthSession.token}`},
+        })
+      ).json();
       expect(healthDuringZombie.connectedDevices).toBe(1);
 
       // Wait ~2.5 heartbeat intervals (70ms * 3 = 210ms) for server ping + zombie termination
@@ -516,7 +546,11 @@ describe('SQLite Persistence, AES-256-GCM At-Rest PHI Encryption & Authenticated
         setTimeout(() => resolve(), 400);
       });
 
-      const healthAfterSweep = await (await fetch(`${baseUrl}/api/health`)).json();
+      const healthAfterSweep = await (
+        await fetch(`${baseUrl}/api/health`, {
+          headers: {Authorization: `Bearer ${dmoHealthSession.token}`},
+        })
+      ).json();
       expect(healthAfterSweep.connectedDevices).toBe(0);
 
       // 5. SMS WEBHOOK IDEMPOTENCY: Replaying carrier retries MUST NOT create duplicate records
@@ -638,14 +672,16 @@ describe('SQLite Persistence, AES-256-GCM At-Rest PHI Encryption & Authenticated
 
       const ashaUser = await memDb.registerUser({
         identifier: 'ASHA-LIMIT-1',
-        secret: '5839',
+        secret: 'SitaPass#5839',
         role: 'ASHA',
         displayName: 'Sita Devi',
+        verified: true,
+        verifiedBy: 'UNIT_TEST',
       });
       expect(memDb.listRecordsForUser(ashaUser).length).toBe(500);
       expect(memDb.listRecordsForUser(ashaUser, 10).length).toBe(10);
 
-      // 2. Mix 8 wrong DMO_PROVISIONING_SECRET registration attempts + 7 wrong PIN login attempts = 15 failures
+      // 2. Mix 8 wrong DMO_PROVISIONING_SECRET registration attempts + 7 wrong passcode login attempts = 15 failures
       for (let attempt = 0; attempt < 8; attempt++) {
         const regRes = await fetch(`${baseUrl}/api/auth/register`, {
           method: 'POST',
@@ -667,7 +703,7 @@ describe('SQLite Persistence, AES-256-GCM At-Rest PHI Encryption & Authenticated
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({
             identifier: 'ASHA-LIMIT-1',
-            secret: `000${attempt}`,
+            secret: `WrongGuess#0${attempt}`,
             role: 'ASHA',
           }),
         });
@@ -693,7 +729,7 @@ describe('SQLite Persistence, AES-256-GCM At-Rest PHI Encryption & Authenticated
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
           identifier: 'ASHA-LIMIT-1',
-          secret: '5839',
+          secret: 'SitaPass#5839',
           role: 'ASHA',
         }),
       });
@@ -833,7 +869,10 @@ describe('SQLite Persistence, AES-256-GCM At-Rest PHI Encryption & Authenticated
 
     // 4. Verify Vercel serverless handler (/api/index.ts) routes rewritten /api/auth/register cleanly
     const http = await import('http');
-    const {default: vercelHandler} = await import('../../api/index.ts');
+    const {default: vercelHandler, resetServerlessInstanceForTests} = await import(
+      '../../api/index.ts'
+    );
+    resetServerlessInstanceForTests();
     const vercelServer = http.createServer((req, res) => {
       void vercelHandler(req, res);
     });
@@ -848,7 +887,7 @@ describe('SQLite Persistence, AES-256-GCM At-Rest PHI Encryption & Authenticated
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({
             identifier: uniqueAshaId,
-            secret: '1234',
+            secret: 'Sushma#2026',
             role: 'ASHA',
             displayName: 'Sushma devi',
             villageCode: 'VIL-204',
@@ -865,7 +904,7 @@ describe('SQLite Persistence, AES-256-GCM At-Rest PHI Encryption & Authenticated
     }
   });
 
-  it('serves valid PWA PNG icons, reports DMO provisioning status, persists ASHA stipends, and handles Gemini API config cleanly', async () => {
+  it('serves valid PWA PNG icons, protects unauthenticated /api/auth/status, enforces NHM stipend tariffs, and handles Gemini API config cleanly', async () => {
     const publicDir = path.resolve(process.cwd(), 'public');
     for (const iconName of [
       'pwa-192x192.png',
@@ -884,10 +923,12 @@ describe('SQLite Persistence, AES-256-GCM At-Rest PHI Encryption & Authenticated
 
     const prevGemKey = process.env.GEMINI_API_KEY;
     const prevDmoSecret = process.env.DMO_PROVISIONING_SECRET;
+    const prevAshaSecret = process.env.ASHA_ENROLLMENT_SECRET;
     delete process.env.GEMINI_API_KEY;
     delete process.env.DMO_PROVISIONING_SECRET;
+    process.env.ASHA_ENROLLMENT_SECRET = 'Clinic24-Verified-ASHA-2026!';
 
-    const memDb = new HealthSyncDatabase(':memory:', 'stipend-gemini-test-key');
+    const memDb = new HealthSyncDatabase(':memory:', 'stipend-gemini-test-key-32-chars-012');
     const {httpServer} = await createHealthSyncServer(memDb);
     await new Promise<void>((resolve) => httpServer.listen(0, '127.0.0.1', () => resolve()));
     const port = (httpServer.address() as AddressInfo).port;
@@ -897,26 +938,50 @@ describe('SQLite Persistence, AES-256-GCM At-Rest PHI Encryption & Authenticated
       const statusRes = await fetch(`${baseUrl}/api/auth/status`);
       expect(statusRes.status).toBe(200);
       const statusJson = (await statusRes.json()) as {
-        hasRegisteredUsers: boolean;
-        dmoProvisioningEnabled: boolean;
+        status: string;
+        authRequired: boolean;
+        minSecretLength: number;
+        dmoProvisioningEnabled?: boolean;
       };
-      expect(statusJson.dmoProvisioningEnabled).toBe(false);
+      expect(statusJson.authRequired).toBe(true);
+      expect(statusJson.minSecretLength).toBe(8);
+      // Unauthenticated callers do NOT receive internal provisioning flags
+      expect(statusJson.dmoProvisioningEnabled).toBeUndefined();
 
       const regRes = await fetch(`${baseUrl}/api/auth/register`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
           identifier: 'ASHA-7711-UP',
-          secret: '4829',
+          secret: 'RekhaPass#4829',
           role: 'ASHA',
           displayName: 'Rekha Devi',
           villageCode: 'VIL-204',
+          ashaEnrollmentCode: 'Clinic24-Verified-ASHA-2026!',
         }),
       });
       expect(regRes.status).toBe(201);
       const {token} = (await regRes.json()) as {token: string};
 
       const rec = makeSampleRecord(501);
+      // Forged amountInr: 150 MUST be rejected with 400
+      const tamperedSaveRes = await fetch(`${baseUrl}/api/records`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          record: rec,
+          incentive: {
+            id: 'forged-client-id-999',
+            amountInr: 150,
+          },
+        }),
+      });
+      expect(tamperedSaveRes.status).toBe(400);
+
+      // Legitimate routine checkup (₹20 NHM tariff) succeeds with server-generated canonical ID
       const saveRes = await fetch(`${baseUrl}/api/records`, {
         method: 'POST',
         headers: {
@@ -926,13 +991,8 @@ describe('SQLite Persistence, AES-256-GCM At-Rest PHI Encryption & Authenticated
         body: JSON.stringify({
           record: rec,
           incentive: {
-            id: `inc-${rec.id}`,
-            taskTitle: 'Priority Referral & Health Stabilization',
-            programCode: 'NHM-HRP-50',
-            patientRef: `${rec.patientId} · ${rec.patientName}`,
-            amountInr: 150,
-            timestamp: rec.timestamp,
-            abdmVerified: true,
+            id: 'ignored-client-id',
+            amountInr: 20,
           },
         }),
       });
@@ -953,9 +1013,9 @@ describe('SQLite Persistence, AES-256-GCM At-Rest PHI Encryption & Authenticated
       const incJson = (await incRes.json()) as {
         incentives: Array<{id: string; amountInr: number}>;
       };
-      expect(incJson.incentives.some((i) => i.id === `inc-${rec.id}` && i.amountInr === 150)).toBe(
-        true
-      );
+      expect(incJson.incentives.length).toBe(1);
+      expect(incJson.incentives[0].id).not.toBe('ignored-client-id');
+      expect(incJson.incentives[0].amountInr).toBe(20);
 
       const geminiRes = await fetch(`${baseUrl}/api/gemini/clinical-summary`, {
         method: 'POST',
@@ -964,7 +1024,6 @@ describe('SQLite Persistence, AES-256-GCM At-Rest PHI Encryption & Authenticated
           Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({
-          patientName: 'Sita Devi',
           age: 29,
           vitals: rec.vitals,
           symptoms: ['Fever'],
@@ -980,6 +1039,9 @@ describe('SQLite Persistence, AES-256-GCM At-Rest PHI Encryption & Authenticated
 
       if (prevDmoSecret === undefined) delete process.env.DMO_PROVISIONING_SECRET;
       else process.env.DMO_PROVISIONING_SECRET = prevDmoSecret;
+
+      if (prevAshaSecret === undefined) delete process.env.ASHA_ENROLLMENT_SECRET;
+      else process.env.ASHA_ENROLLMENT_SECRET = prevAshaSecret;
 
       await new Promise<void>((resolve) => httpServer.close(() => resolve()));
       memDb.close();

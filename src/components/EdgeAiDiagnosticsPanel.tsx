@@ -1,11 +1,39 @@
 import React, {useEffect, useRef, useState} from 'react';
-import {AlertCircle, AlertTriangle, Camera, CheckCircle2, Eye, Info, Mic, RotateCcw} from 'lucide-react';
+import {
+  AlertCircle,
+  AlertTriangle,
+  Camera,
+  CheckCircle2,
+  Eye,
+  Image as ImageIcon,
+  Info,
+  Mic,
+  RotateCcw,
+  Upload,
+  Zap,
+} from 'lucide-react';
 import {EdgeAiDiagnostics} from '../types/triage';
+import {
+  analyzeConjunctivaRoiPixels,
+  buildQuickDemoScanMetrics,
+  drawSampleConjunctivaOnCanvas,
+  EYE_SCAN_CANVAS_HEIGHT,
+  EYE_SCAN_CANVAS_WIDTH,
+  getConjunctivaRoiBounds,
+} from '../utils/anemiaEyeScanner';
 
 interface EdgeAiDiagnosticsPanelProps {
   diagnostics: EdgeAiDiagnostics;
   onChange: (next: EdgeAiDiagnostics) => void;
 }
+
+const DEMO_PROGRESS_WIDTH_CLASS: Record<number, string> = {
+  0: 'w-0',
+  1: 'w-1/4',
+  2: 'w-2/4',
+  3: 'w-3/4',
+  4: 'w-full',
+};
 
 export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
   diagnostics,
@@ -13,12 +41,19 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
 }) => {
   const [activeTab, setActiveTab] = useState<'anemia' | 'cough'>('anemia');
 
-  // Real Camera Check State (never fabricates readings without active camera)
+  // Eye Scanner / Hemoglobin Estimator State
   const [cameraActive, setCameraActive] = useState(false);
+  const [cameraReady, setCameraReady] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [isScanningEye, setIsScanningEye] = useState(false);
+  const [isDemoScanning, setIsDemoScanning] = useState(false);
+  const [demoStep, setDemoStep] = useState<number>(0);
+  const [previewImageUrl, setPreviewImageUrl] = useState<string | null>(
+    diagnostics.conjunctivaMetrics?.capturedDataUrl ?? null
+  );
+  const [sampleVariant, setSampleVariant] = useState<'anemic' | 'normal'>('anemic');
 
-  // Real Microphone Check State (never fabricates readings without active microphone)
+  // Cough Audio Check State
   const [isRecordingCough, setIsRecordingCough] = useState(false);
   const [coughError, setCoughError] = useState<string | null>(null);
   const [coughBars, setCoughBars] = useState<number[]>([16, 16, 16, 16, 16, 16, 16, 16]);
@@ -26,8 +61,12 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const objectUrlRef = useRef<string | null>(null);
   const isMountedRef = useRef<boolean>(true);
+  const scanSessionIdRef = useRef<number>(0);
   const scanTimerRef = useRef<number | null>(null);
+  const demoIntervalRef = useRef<number | null>(null);
   const coughPollIntervalRef = useRef<number | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -35,7 +74,28 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
 
   useEffect(() => {
     diagnosticsRef.current = diagnostics;
+    if (diagnostics.conjunctivaMetrics?.capturedDataUrl) {
+      setPreviewImageUrl(diagnostics.conjunctivaMetrics.capturedDataUrl);
+    }
   }, [diagnostics]);
+
+  const revokeActiveObjectUrl = () => {
+    if (objectUrlRef.current) {
+      URL.revokeObjectURL(objectUrlRef.current);
+      objectUrlRef.current = null;
+    }
+  };
+
+  const clearEyeScanTimers = () => {
+    if (scanTimerRef.current !== null) {
+      window.clearTimeout(scanTimerRef.current);
+      scanTimerRef.current = null;
+    }
+    if (demoIntervalRef.current !== null) {
+      window.clearInterval(demoIntervalRef.current);
+      demoIntervalRef.current = null;
+    }
+  };
 
   const stopCoughSampling = (resetUiState = false) => {
     if (coughPollIntervalRef.current !== null) {
@@ -57,16 +117,20 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
   };
 
   const stopCamera = (updateState = true) => {
-    if (scanTimerRef.current !== null) {
-      window.clearTimeout(scanTimerRef.current);
-      scanTimerRef.current = null;
-    }
+    scanSessionIdRef.current += 1;
+    clearEyeScanTimers();
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
     }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
     if (updateState && isMountedRef.current) {
       setIsScanningEye(false);
+      setIsDemoScanning(false);
+      setDemoStep(0);
+      setCameraReady(false);
       setCameraActive(false);
     }
   };
@@ -77,6 +141,7 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
       isMountedRef.current = false;
       stopCamera(false);
       stopCoughSampling(false);
+      revokeActiveObjectUrl();
     };
   }, []);
 
@@ -90,118 +155,244 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
   }, [cameraActive]);
 
   const startCameraPreview = async () => {
+    stopCamera(false);
     setCameraError(null);
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    setIsDemoScanning(false);
+    setDemoStep(0);
+    const sessionId = ++scanSessionIdRef.current;
+
+    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
       setCameraError(
-        'Camera access is not supported in this browser. Check lower-eyelid paleness visually and refer to the clinic for a blood hemoglobin test.'
+        'Live camera access is unavailable in this browser. Use "Upload Photo", "Use Sample Image", or "Quick Demo Scan" below.'
       );
       return;
     }
+
     try {
       let stream: MediaStream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          video: {facingMode: {ideal: 'environment'}, width: {ideal: 480}, height: {ideal: 320}},
+          video: {facingMode: 'environment'},
         });
       } catch {
         stream = await navigator.mediaDevices.getUserMedia({video: true});
       }
-      if (!isMountedRef.current) {
+
+      if (!isMountedRef.current || sessionId !== scanSessionIdRef.current) {
         stream.getTracks().forEach((t) => t.stop());
         return;
       }
+
       streamRef.current = stream;
+      setPreviewImageUrl(null);
+      setCameraReady(false);
       setCameraActive(true);
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        void videoRef.current.play().catch(() => {});
-      }
     } catch {
-      if (!isMountedRef.current) return;
+      if (!isMountedRef.current || sessionId !== scanSessionIdRef.current) return;
+      setCameraActive(false);
+      setCameraReady(false);
       setCameraError(
-        'Camera permission was declined or no camera was found. Please check the patient visually and use a clinic blood test if paleness is suspected.'
+        'Camera permission was declined or no camera hardware was detected. You can upload an eyelid photo, test with a sample image, or run Quick Demo Scan below.'
       );
     }
   };
 
-  const handleScanEyelid = () => {
-    if (
-      !cameraActive ||
-      !videoRef.current ||
-      videoRef.current.readyState < 2 ||
-      videoRef.current.videoWidth === 0
-    ) {
-      setCameraError('Camera is still focusing — wait a moment and tap Check Camera Frame again.');
+  const runCanvasRgbAnalysis = (
+    drawSourceOntoCanvas: (ctx: CanvasRenderingContext2D, width: number, height: number) => void
+  ) => {
+    const canvas = canvasRef.current ?? document.createElement('canvas');
+    canvas.width = EYE_SCAN_CANVAS_WIDTH;
+    canvas.height = EYE_SCAN_CANVAS_HEIGHT;
+    const ctx = canvas.getContext('2d', {willReadFrequently: true});
+
+    if (!ctx) {
+      setIsScanningEye(false);
+      setCameraError('HTML5 Canvas color analysis is unavailable in this browser.');
+      return;
+    }
+
+    try {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      drawSourceOntoCanvas(ctx, canvas.width, canvas.height);
+
+      const roiBounds = getConjunctivaRoiBounds(canvas.width, canvas.height);
+      const imageData = ctx.getImageData(
+        roiBounds.x,
+        roiBounds.y,
+        roiBounds.width,
+        roiBounds.height
+      );
+
+      let snapshotUrl: string | undefined;
+      try {
+        snapshotUrl = canvas.toDataURL('image/jpeg', 0.85);
+      } catch {
+        snapshotUrl = undefined;
+      }
+
+      const outcome = analyzeConjunctivaRoiPixels(imageData.data, snapshotUrl);
+      if (!outcome.ok || !outcome.metrics) {
+        setIsScanningEye(false);
+        setCameraError(outcome.error || 'Could not analyze eyelid region. Please try again.');
+        return;
+      }
+
+      if (snapshotUrl) {
+        setPreviewImageUrl(snapshotUrl);
+      }
+      setIsScanningEye(false);
+      setCameraError(null);
+
+      onChange({
+        ...diagnosticsRef.current,
+        anemiaSuspected: outcome.anemiaRisk,
+        estimatedHb: outcome.metrics.estimatedHb,
+        conjunctivaMetrics: outcome.metrics,
+      });
+    } catch {
+      setIsScanningEye(false);
+      setCameraError(
+        'Could not read image pixels on this device. Try another photo or tap Quick Demo Scan.'
+      );
+    }
+  };
+
+  const handleScanLiveCamera = () => {
+    if (isScanningEye || isDemoScanning) return;
+    const videoEl = videoRef.current;
+    if (!cameraActive || !videoEl || videoEl.readyState < 2 || videoEl.videoWidth === 0) {
+      setCameraError(
+        'Camera is still focusing — wait a second and tap Capture & Estimate Hb again, or use Upload Photo / Quick Demo Scan.'
+      );
       return;
     }
 
     setIsScanningEye(true);
     setCameraError(null);
 
-    const canvas = canvasRef.current ?? document.createElement('canvas');
-    canvas.width = 240;
-    canvas.height = 160;
-    const ctx = canvas.getContext('2d');
+    // Capture current frame immediately before stopping preview so there is zero frame freeze
+    runCanvasRgbAnalysis((ctx, width, height) => {
+      ctx.drawImage(videoEl, 0, 0, width, height);
+    });
+    stopCamera(true);
+  };
 
-    if (!ctx) {
-      setIsScanningEye(false);
-      setCameraError('Unable to read camera frame on this device.');
+  const handlePhotoUploadChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+
+    if (!file.type.startsWith('image/')) {
+      setCameraError('Please select a valid image file (JPG, PNG, or WebP).');
+      return;
+    }
+    if (file.size > 15 * 1024 * 1024) {
+      setCameraError('Image file is too large (max 15 MB). Please choose a smaller photo.');
       return;
     }
 
-    ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
-    const roi = ctx.getImageData(60, 45, 120, 70).data;
+    stopCamera(true);
+    setCameraError(null);
+    setIsScanningEye(true);
+    const sessionId = ++scanSessionIdRef.current;
 
-    let sumR = 0;
-    let sumG = 0;
-    let sumB = 0;
-    const pixelCount = roi.length / 4;
-    for (let i = 0; i < roi.length; i += 4) {
-      sumR += roi[i];
-      sumG += roi[i + 1];
-      sumB += roi[i + 2];
-    }
+    revokeActiveObjectUrl();
+    const objectUrl = URL.createObjectURL(file);
+    objectUrlRef.current = objectUrl;
 
-    const avgR = Math.round(sumR / pixelCount);
-    const avgG = Math.round(sumG / pixelCount);
-    const avgB = Math.round(sumB / pixelCount);
-    const ratio = Number((avgR / Math.max(1, avgG + avgB)).toFixed(2));
-    const pallorDetected = ratio < 0.65;
-    const estimatedHb = Number(Math.min(14.5, Math.max(6.5, 6.2 + ratio * 9.5)).toFixed(1));
-    const label = pallorDetected
-      ? 'Pale eyelid color noticed — schedule clinic blood test'
-      : 'Normal redness observed in camera frame';
+    const img = new Image();
+    img.onload = () => {
+      revokeActiveObjectUrl();
+      if (!isMountedRef.current || sessionId !== scanSessionIdRef.current) return;
+      if (img.naturalWidth === 0 || img.naturalHeight === 0) {
+        setIsScanningEye(false);
+        setCameraError('Uploaded photo could not be decoded. Please try a different image.');
+        return;
+      }
 
-    if (scanTimerRef.current !== null) {
-      window.clearTimeout(scanTimerRef.current);
-    }
-    scanTimerRef.current = window.setTimeout(() => {
-      scanTimerRef.current = null;
-      if (!isMountedRef.current) return;
+      runCanvasRgbAnalysis((ctx, width, height) => {
+        // Center-crop aspect-fill onto analysis canvas so conjunctiva stays centered
+        const scale = Math.max(width / img.naturalWidth, height / img.naturalHeight);
+        const drawWidth = img.naturalWidth * scale;
+        const drawHeight = img.naturalHeight * scale;
+        const offsetX = (width - drawWidth) / 2;
+        const offsetY = (height - drawHeight) / 2;
+        ctx.drawImage(img, offsetX, offsetY, drawWidth, drawHeight);
+      });
+    };
+    img.onerror = () => {
+      revokeActiveObjectUrl();
+      if (!isMountedRef.current || sessionId !== scanSessionIdRef.current) return;
       setIsScanningEye(false);
+      setCameraError('Could not load the selected photo. Please try another image file.');
+    };
+    img.src = objectUrl;
+  };
+
+  const handleUseSampleImage = () => {
+    if (isScanningEye || isDemoScanning) return;
+    stopCamera(true);
+    setCameraError(null);
+    setIsScanningEye(true);
+
+    const variantToRun = sampleVariant;
+    setSampleVariant((prev) => (prev === 'anemic' ? 'normal' : 'anemic'));
+
+    const tempCanvas = document.createElement('canvas');
+    drawSampleConjunctivaOnCanvas(tempCanvas, variantToRun);
+
+    runCanvasRgbAnalysis((ctx, width, height) => {
+      ctx.drawImage(tempCanvas, 0, 0, width, height);
+    });
+  };
+
+  const handleQuickDemoScan = () => {
+    if (isDemoScanning) return;
+    stopCamera(true);
+    setCameraError(null);
+
+    const sessionId = ++scanSessionIdRef.current;
+    const sampleCanvas = canvasRef.current ?? document.createElement('canvas');
+    const sampleUrl = drawSampleConjunctivaOnCanvas(sampleCanvas, 'anemic');
+    if (sampleUrl) {
+      setPreviewImageUrl(sampleUrl);
+    }
+
+    setIsDemoScanning(true);
+    setIsScanningEye(true);
+    setDemoStep(1);
+
+    demoIntervalRef.current = window.setInterval(() => {
+      if (!isMountedRef.current || sessionId !== scanSessionIdRef.current) {
+        clearEyeScanTimers();
+        return;
+      }
+      setDemoStep((prev) => Math.min(4, prev + 1));
+    }, 500);
+
+    scanTimerRef.current = window.setTimeout(() => {
+      clearEyeScanTimers();
+      if (!isMountedRef.current || sessionId !== scanSessionIdRef.current) return;
+
+      const demoMetrics = buildQuickDemoScanMetrics(sampleUrl);
+      setIsDemoScanning(false);
+      setIsScanningEye(false);
+      setDemoStep(0);
+
       onChange({
         ...diagnosticsRef.current,
-        anemiaSuspected: pallorDetected,
-        estimatedHb,
-        conjunctivaMetrics: {
-          avgR,
-          avgG,
-          avgB,
-          redGreenBlueRatio: ratio,
-          erythemaIndex: Number((avgR - avgG).toFixed(1)),
-          estimatedHb,
-          pallorDetected,
-          diagnosticLabel: label,
-        },
+        anemiaSuspected: true,
+        estimatedHb: demoMetrics.estimatedHb,
+        conjunctivaMetrics: demoMetrics,
       });
-    }, 250);
+    }, 2000);
   };
 
   const handleRecordCough = async () => {
     if (isRecordingCough) return;
     setCoughError(null);
 
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
       setCoughError(
         'Microphone access is not supported in this browser. Listen to breathing manually and mark "Cough" in symptoms if present.'
       );
@@ -305,6 +496,8 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
   const handleClearChecks = () => {
     stopCamera();
     stopCoughSampling(true);
+    revokeActiveObjectUrl();
+    setPreviewImageUrl(null);
     setCameraError(null);
     setCoughError(null);
     setCoughBars([16, 16, 16, 16, 16, 16, 16, 16]);
@@ -314,19 +507,25 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
     });
   };
 
+  const currentHb = diagnostics.estimatedHb ?? diagnostics.conjunctivaMetrics?.estimatedHb;
+  const isAnemiaFlagged =
+    (typeof currentHb === 'number' && currentHb < 10.0) || diagnostics.anemiaSuspected;
+  const isSevereAnemia = typeof currentHb === 'number' && currentHb < 7.0;
+
   return (
     <div className="space-y-4">
       <div className="flex items-start justify-between gap-3">
         <div>
           <h3 className="text-base font-semibold text-slate-900">
-            Optional Camera &amp; Cough Observation
+            Anemia Eye Scanner &amp; Cough Check
           </h3>
           <p className="mt-0.5 text-sm text-slate-600">
-            Supportive visual redness and microphone check when laboratory tools are not nearby.
+            Client-side eyelid RGB hemoglobin estimator and cough pitch check — runs 100% on-device.
           </p>
         </div>
 
         {(diagnostics.anemiaSuspected ||
+          diagnostics.estimatedHb !== undefined ||
           diagnostics.respiratoryRiskHigh ||
           diagnostics.conjunctivaMetrics ||
           diagnostics.coughMetrics) && (
@@ -349,9 +548,9 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
       >
         <Info className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
         <p>
-          <strong>Important Notice:</strong> Phone cameras and microphones cannot diagnose anemia or
-          lung disease and depend on room lighting and background noise. Always confirm suspected
-          findings with a standard clinic blood test and a doctor&apos;s examination.
+          <strong>Important Notice:</strong> Optical eyelid RGB hemoglobin estimation is a rapid
+          screening aid and depends on ambient lighting. Always confirm suspected anemia (&lt; 10.0
+          g/dL) with a clinic laboratory blood hemoglobin test.
         </p>
       </div>
 
@@ -370,7 +569,7 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
           }`}
         >
           <Eye className="h-4 w-4 shrink-0 text-teal-700" />
-          <span>Eyelid Color Check</span>
+          <span>Anemia Eye Scanner</span>
         </button>
         <button
           type="button"
@@ -391,7 +590,19 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
 
       {activeTab === 'anemia' ? (
         <div className="space-y-3">
-          <div className="relative h-44 w-full overflow-hidden rounded-xl border border-slate-200 bg-slate-100">
+          {/* Hidden File Input & Offscreen Analysis Canvas */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            onChange={handlePhotoUploadChange}
+            className="hidden"
+            aria-label="Upload lower eyelid photo for hemoglobin estimation"
+          />
+          <canvas ref={canvasRef} className="hidden" />
+
+          {/* Viewport: Live Camera, Captured/Sample Snapshot, or Ready Prompt */}
+          <div className="relative h-48 w-full overflow-hidden rounded-xl border border-slate-200 bg-slate-100">
             {cameraActive ? (
               <>
                 <video
@@ -399,42 +610,107 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
                   autoPlay
                   playsInline
                   muted
+                  onLoadedMetadata={() => setCameraReady(true)}
+                  onCanPlay={() => setCameraReady(true)}
                   className="h-full w-full object-cover"
                 />
-                <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
-                  <div className="h-16 w-36 rounded-xl border-2 border-dashed border-white/90 shadow-xs" />
+                <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">
+                  <div className="h-20 w-40 rounded-xl border-2 border-dashed border-white/95 shadow-xs" />
+                  <span className="mt-1.5 rounded-md bg-slate-900/65 px-2 py-0.5 text-[11px] font-medium text-white">
+                    Center inner lower eyelid in ROI box
+                  </span>
+                </div>
+              </>
+            ) : previewImageUrl ? (
+              <>
+                <img
+                  src={previewImageUrl}
+                  alt="Captured lower eyelid conjunctiva region"
+                  className="h-full w-full object-cover"
+                />
+                <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center bg-slate-900/15">
+                  <div
+                    className={`h-20 w-40 rounded-xl border-2 border-dashed transition-colors ${
+                      isDemoScanning
+                        ? 'animate-pulse border-teal-300 bg-teal-500/15'
+                        : 'border-white/95'
+                    }`}
+                  />
+                  <span className="mt-1.5 rounded-md bg-slate-900/75 px-2.5 py-0.5 text-[11px] font-medium text-white">
+                    {isDemoScanning
+                      ? 'Scanning palpebral conjunctiva RGB channels...'
+                      : 'Analyzed Conjunctiva ROI'}
+                  </span>
                 </div>
               </>
             ) : (
               <div className="flex h-full flex-col items-center justify-center px-4 text-center">
                 <Camera className="mb-2 h-6 w-6 text-slate-400" />
-                <p className="text-sm font-medium text-slate-700">
-                  Use natural daylight and center the inner lower eyelid in the frame.
+                <p className="max-w-sm text-sm font-medium text-slate-700">
+                  Gently pull down the lower eyelid in natural daylight, or upload/select a photo.
                 </p>
-                <button
-                  type="button"
-                  onClick={startCameraPreview}
-                  className="mt-3 inline-flex min-h-[42px] items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-800 hover:bg-slate-50 cursor-pointer"
-                >
-                  <Camera className="h-4 w-4 text-teal-700" />
-                  <span>Turn On Camera</span>
-                </button>
+                <div className="mt-3 flex flex-wrap items-center justify-center gap-2">
+                  <button
+                    type="button"
+                    onClick={startCameraPreview}
+                    disabled={isDemoScanning}
+                    className="inline-flex min-h-[40px] items-center gap-1.5 rounded-xl bg-teal-700 px-3.5 py-2 text-xs font-semibold text-white hover:bg-teal-800 disabled:opacity-60 cursor-pointer"
+                  >
+                    <Camera className="h-4 w-4" />
+                    <span>Turn On Camera</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={isDemoScanning}
+                    className="inline-flex min-h-[40px] items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-xs font-semibold text-slate-800 hover:bg-slate-50 disabled:opacity-60 cursor-pointer"
+                  >
+                    <Upload className="h-4 w-4 text-teal-700" />
+                    <span>Upload Photo</span>
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Smooth 2-Second Scan Progress Bar (Pure Tailwind classes, zero inline styles) */}
+            {isDemoScanning && (
+              <div
+                role="status"
+                aria-live="polite"
+                className="absolute inset-x-0 bottom-0 bg-slate-900/80 px-4 py-2 text-white"
+              >
+                <div className="mb-1 flex items-center justify-between text-[11px] font-medium">
+                  <span>Analyzing Conjunctiva R/G/B Ratio...</span>
+                  <span className="font-mono tabular-nums">{demoStep * 25}%</span>
+                </div>
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-700">
+                  <div
+                    className={`h-full rounded-full bg-teal-400 transition-all duration-500 ${
+                      DEMO_PROGRESS_WIDTH_CLASS[demoStep] ?? 'w-2/4'
+                    }`}
+                  />
+                </div>
               </div>
             )}
           </div>
 
-          <canvas ref={canvasRef} className="hidden" />
-
+          {/* Live Camera Action Bar */}
           {cameraActive && (
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               <button
                 type="button"
-                onClick={handleScanEyelid}
-                disabled={isScanningEye}
+                onClick={handleScanLiveCamera}
+                disabled={isScanningEye || !cameraReady}
                 className="flex min-h-[44px] flex-1 items-center justify-center gap-2 rounded-xl bg-teal-700 px-4 py-2 text-sm font-semibold text-white hover:bg-teal-800 disabled:opacity-60 cursor-pointer"
               >
                 <Camera className="h-4 w-4" />
-                <span>{isScanningEye ? 'Checking Image...' : 'Check Camera Frame'}</span>
+                <span>
+                  {!cameraReady
+                    ? 'Starting Camera...'
+                    : isScanningEye
+                    ? 'Analyzing RGB...'
+                    : 'Capture & Estimate Hb'}
+                </span>
               </button>
               <button
                 type="button"
@@ -446,38 +722,129 @@ export const EdgeAiDiagnosticsPanel: React.FC<EdgeAiDiagnosticsPanelProps> = ({
             </div>
           )}
 
+          {/* Always-Available Fallback & Hackathon Demo Controls */}
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isDemoScanning}
+              className="flex min-h-[42px] items-center justify-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-800 hover:bg-slate-50 disabled:opacity-60 cursor-pointer"
+            >
+              <Upload className="h-3.5 w-3.5 shrink-0 text-teal-700" />
+              <span>Upload Photo</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={handleUseSampleImage}
+              disabled={isDemoScanning}
+              className="flex min-h-[42px] items-center justify-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-800 hover:bg-slate-50 disabled:opacity-60 cursor-pointer"
+            >
+              <ImageIcon className="h-3.5 w-3.5 shrink-0 text-teal-700" />
+              <span>
+                Use Sample ({sampleVariant === 'anemic' ? 'Pale Eyelid' : 'Healthy Eyelid'})
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={handleQuickDemoScan}
+              disabled={isDemoScanning}
+              className="flex min-h-[42px] items-center justify-center gap-1.5 rounded-xl border border-teal-200 bg-teal-50 px-3 py-2 text-xs font-semibold text-teal-900 hover:bg-teal-100 disabled:opacity-60 cursor-pointer"
+            >
+              <Zap className="h-3.5 w-3.5 shrink-0 text-teal-700" />
+              <span>{isDemoScanning ? 'Scanning (2s)...' : '⚡ Quick Demo Scan'}</span>
+            </button>
+          </div>
+
+          {/* Graceful Camera / Upload Fallback Notice */}
           {cameraError && (
             <div
               role="alert"
-              className="flex items-start gap-2.5 rounded-xl border border-slate-200 bg-slate-50 p-3.5 text-xs leading-relaxed text-slate-700"
+              className="flex items-start gap-2.5 rounded-xl border border-amber-200 bg-amber-50/70 p-3.5 text-xs leading-relaxed text-amber-950"
             >
-              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-slate-500" />
-              <span>{cameraError}</span>
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
+              <div className="space-y-2">
+                <p>{cameraError}</p>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="inline-flex min-h-[34px] items-center gap-1.5 rounded-lg border border-amber-300 bg-white px-2.5 py-1 text-xs font-semibold text-slate-800 hover:bg-slate-50 cursor-pointer"
+                  >
+                    <Upload className="h-3.5 w-3.5 text-teal-700" />
+                    <span>Upload Photo</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleUseSampleImage}
+                    className="inline-flex min-h-[34px] items-center gap-1.5 rounded-lg border border-amber-300 bg-white px-2.5 py-1 text-xs font-semibold text-slate-800 hover:bg-slate-50 cursor-pointer"
+                  >
+                    <ImageIcon className="h-3.5 w-3.5 text-teal-700" />
+                    <span>Use Sample Image</span>
+                  </button>
+                </div>
+              </div>
             </div>
           )}
 
-          {diagnostics.conjunctivaMetrics && (
+          {/* Hemoglobin & RGB Analysis Result Card */}
+          {(diagnostics.conjunctivaMetrics || currentHb !== undefined) && !isDemoScanning && (
             <div
-              className={`flex items-start gap-2.5 rounded-xl border p-3.5 text-sm ${
-                diagnostics.anemiaSuspected
+              className={`rounded-xl border p-4 text-sm space-y-2.5 ${
+                isSevereAnemia
+                  ? 'border-red-200 bg-red-50/80 text-red-950'
+                  : isAnemiaFlagged
                   ? 'border-amber-200 bg-amber-50/80 text-amber-950'
                   : 'border-emerald-200 bg-emerald-50/70 text-emerald-950'
               }`}
             >
-              {diagnostics.anemiaSuspected ? (
-                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
-              ) : (
-                <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-700" />
-              )}
-              <div>
-                <p className="font-semibold">
-                  {diagnostics.conjunctivaMetrics.diagnosticLabel}
-                </p>
-                <p className="mt-0.5 text-xs text-slate-600 tabular-nums">
-                  Camera redness ratio: {diagnostics.conjunctivaMetrics.redGreenBlueRatio} · Confirm
-                  with clinic blood hemoglobin test.
-                </p>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  {isSevereAnemia ? (
+                    <AlertCircle className="h-4 w-4 shrink-0 text-red-600" />
+                  ) : isAnemiaFlagged ? (
+                    <AlertTriangle className="h-4 w-4 shrink-0 text-amber-700" />
+                  ) : (
+                    <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-700" />
+                  )}
+                  <span className="font-semibold">
+                    {diagnostics.conjunctivaMetrics?.diagnosticLabel ??
+                      (isAnemiaFlagged
+                        ? 'Anemia Risk Flagged (< 10.0 g/dL)'
+                        : 'Hemoglobin Within Normal Range')}
+                  </span>
+                </div>
+
+                {currentHb !== undefined && (
+                  <span
+                    className={`inline-flex items-center rounded-lg px-2.5 py-1 font-mono text-xs font-bold tabular-nums ${
+                      isSevereAnemia
+                        ? 'bg-red-100 text-red-900'
+                        : isAnemiaFlagged
+                        ? 'bg-amber-100 text-amber-950'
+                        : 'bg-emerald-100 text-emerald-900'
+                    }`}
+                  >
+                    Est. Hb: {currentHb.toFixed(1)} g/dL
+                  </span>
+                )}
               </div>
+
+              {diagnostics.conjunctivaMetrics && (
+                <p className="text-xs text-slate-700 tabular-nums">
+                  Conjunctiva ROI Avg RGB: R {diagnostics.conjunctivaMetrics.avgR} · G{' '}
+                  {diagnostics.conjunctivaMetrics.avgG} · B {diagnostics.conjunctivaMetrics.avgB} ·
+                  Redness Ratio {diagnostics.conjunctivaMetrics.redGreenBlueRatio}
+                </p>
+              )}
+
+              <p className="text-xs text-slate-600">
+                Auto-populated into the Patient Screening Form above.{' '}
+                {isAnemiaFlagged
+                  ? 'Anemia Risk (< 10.0 g/dL) has updated the patient triage status.'
+                  : 'Continue routine checkup and confirm with clinic blood test if needed.'}
+              </p>
             </div>
           )}
         </div>

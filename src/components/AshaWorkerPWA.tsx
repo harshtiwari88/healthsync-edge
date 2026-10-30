@@ -47,6 +47,8 @@ interface AshaWorkerPWAProps {
   ashaDisplayName: string;
   villageCode: string;
   sessionToken: string;
+  isAshaVerified?: boolean;
+  onAshaVerified?: (newToken?: string) => void;
   networkState: NetworkState;
   records: TriageRecord[];
   incentives: IncentiveEntry[];
@@ -96,6 +98,8 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
   ashaDisplayName,
   villageCode,
   sessionToken,
+  isAshaVerified = true,
+  onAshaVerified,
   networkState,
   records,
   incentives,
@@ -112,6 +116,19 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
   const [abhaNumber, setAbhaNumber] = useState<string>('');
   const [clinicalNoteInput, setClinicalNoteInput] = useState<string>('');
 
+  // DPDP Section 9 Guardian Consent (for minor patients age < 18) & Adult AI Consent
+  const [guardianName, setGuardianName] = useState<string>('');
+  const [guardianRelationship, setGuardianRelationship] = useState<
+    'Mother' | 'Father' | 'Legal Guardian'
+  >('Mother');
+  const [guardianConsentConfirmed, setGuardianConsentConfirmed] = useState<boolean>(false);
+  const [explicitAiConsent, setExplicitAiConsent] = useState<boolean>(false);
+
+  // ASHA Clinic Enrollment Verification state (when account is pending verification)
+  const [enrollmentCodeInput, setEnrollmentCodeInput] = useState<string>('');
+  const [verifyingCode, setVerifyingCode] = useState<boolean>(false);
+  const [verifyError, setVerifyError] = useState<string | null>(null);
+
   // Standard baseline starting values for convenient adjustment
   const [vitals, setVitals] = useState<VitalsSnapshot>({
     systolic: 120,
@@ -121,6 +138,7 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
     heartRate: 76,
   });
   const [vitalDrafts, setVitalDrafts] = useState<Partial<Record<keyof VitalsSnapshot, string>>>({});
+  const [hbDraft, setHbDraft] = useState<string>('');
   const [symptoms, setSymptoms] = useState<SymptomKey[]>([]);
   const [edgeAi, setEdgeAi] = useState<EdgeAiDiagnostics>({
     anemiaSuspected: false,
@@ -128,6 +146,7 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
   });
 
   const [showOptionalScreening, setShowOptionalScreening] = useState(false);
+  const [eyeScannerModalOpen, setEyeScannerModalOpen] = useState(false);
   const [lastVoiceTranscript, setLastVoiceTranscript] = useState('');
   const [saheliModalOpen, setSaheliModalOpen] = useState(false);
   const [smsModalOpen, setSmsModalOpen] = useState(false);
@@ -171,6 +190,14 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (typeof edgeAi.estimatedHb === 'number' && Number.isFinite(edgeAi.estimatedHb)) {
+      setHbDraft(edgeAi.estimatedHb.toFixed(1));
+    } else if (edgeAi.estimatedHb === undefined) {
+      setHbDraft('');
+    }
+  }, [edgeAi.estimatedHb]);
 
   const clinicMeta = useMemo(
     () =>
@@ -338,13 +365,103 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
     });
   };
 
+  const handleHbInputChange = (raw: string) => {
+    setHbDraft(raw);
+    const trimmed = raw.trim();
+    if (!trimmed) {
+      setEdgeAi((prev) => ({
+        ...prev,
+        anemiaSuspected: false,
+        estimatedHb: undefined,
+        conjunctivaMetrics: undefined,
+      }));
+      return;
+    }
+    const parsed = Number(trimmed);
+    if (!Number.isFinite(parsed)) return;
+    if (parsed >= 3.0 && parsed <= 20.0) {
+      const rounded = Number(parsed.toFixed(1));
+      setEdgeAi((prev) => ({
+        ...prev,
+        estimatedHb: rounded,
+        anemiaSuspected: rounded < 10.0,
+      }));
+    }
+  };
+
+  const handleHbInputBlur = () => {
+    const trimmed = hbDraft.trim();
+    if (!trimmed) {
+      setHbDraft('');
+      return;
+    }
+    const parsed = Number(trimmed);
+    if (!Number.isFinite(parsed)) {
+      setHbDraft(
+        typeof edgeAi.estimatedHb === 'number' ? edgeAi.estimatedHb.toFixed(1) : ''
+      );
+      return;
+    }
+    const clamped = Number(Math.min(20.0, Math.max(3.5, parsed)).toFixed(1));
+    setHbDraft(clamped.toFixed(1));
+    setEdgeAi((prev) => ({
+      ...prev,
+      estimatedHb: clamped,
+      anemiaSuspected: clamped < 10.0,
+    }));
+  };
+
+  const isMinorPatient = useMemo(() => {
+    const num = Number(patientAge);
+    return Number.isFinite(num) && num > 0 && num < 18;
+  }, [patientAge]);
+
+  const handleSubmitEnrollmentCode = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setVerifyError(null);
+    if (!enrollmentCodeInput.trim()) {
+      setVerifyError('Please enter your Clinic Enrollment Code.');
+      return;
+    }
+    setVerifyingCode(true);
+    try {
+      const resp = await fetch('/api/auth/verify-asha', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify({ashaEnrollmentCode: enrollmentCodeInput.trim()}),
+      });
+      const parsed = await safeReadJson<{ok?: boolean; token?: string; error?: string}>(resp);
+      if (!resp.ok || !parsed.isJson || !parsed.data?.ok) {
+        setVerifyError(parsed.data?.error || 'Could not verify Clinic Enrollment Code.');
+        return;
+      }
+      setEnrollmentCodeInput('');
+      setFeedbackNotice('Your Health Worker account is now verified for hospital sync and emergency alerts.');
+      onAshaVerified?.(parsed.data.token);
+    } catch {
+      setVerifyError('Could not reach the hospital server to verify your enrollment code.');
+    } finally {
+      if (isMountedRef.current) {
+        setVerifyingCode(false);
+      }
+    }
+  };
+
   const resetFormForNextPatient = () => {
     setPatientName('');
     setPatientAge('35');
     setPatientGender('F');
     setAbhaNumber('');
     setClinicalNoteInput('');
+    setGuardianName('');
+    setGuardianRelationship('Mother');
+    setGuardianConsentConfirmed(false);
+    setExplicitAiConsent(false);
     setVitalDrafts({});
+    setHbDraft('');
     setVitals({
       systolic: 120,
       diastolic: 80,
@@ -358,10 +475,38 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
     setFormError(null);
   };
 
+  const validatePatientAndConsent = (): boolean => {
+    if (!patientName.trim()) {
+      setFormError('Please enter the patient’s name before saving this checkup.');
+      return false;
+    }
+    const parsedAge = Number(patientAge);
+    if (!Number.isFinite(parsedAge) || parsedAge < 0 || parsedAge > 120) {
+      setFormError('Please enter a valid patient age between 0 and 120.');
+      return false;
+    }
+    if (parsedAge < 18) {
+      if (!guardianName.trim() || guardianName.trim().length < 2) {
+        setFormError(
+          'DPDP Section 9 Requirement: For patients under 18 years old, please enter the Parent or Legal Guardian’s full name.'
+        );
+        return false;
+      }
+      if (!guardianConsentConfirmed) {
+        setFormError(
+          'DPDP Section 9 Requirement: Please confirm verifiable Parent or Legal Guardian consent before saving a minor’s health record.'
+        );
+        return false;
+      }
+    }
+    return true;
+  };
+
   const buildRecord = (isEmergencySms: boolean): TriageRecord => {
     const now = new Date();
     const timeStr = now.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
-    const parsedAge = Math.min(115, Math.max(1, Math.round(Number(patientAge) || 35)));
+    const parsedAge = Math.min(115, Math.max(0, Math.round(Number(patientAge) || 35)));
+    const isMinor = parsedAge < 18;
     const safeVitals: VitalsSnapshot = {
       systolic: Math.min(260, Math.max(50, Math.round(Number(vitals.systolic) || 120))),
       diastolic: Math.min(170, Math.max(35, Math.round(Number(vitals.diastolic) || 80))),
@@ -396,20 +541,32 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
       channel: isEmergencySms ? 'Emergency SMS' : 'Data',
       syncStatus: isEmergencySms
         ? 'SMS Delivered'
-        : networkState === 'offline'
+        : networkState === 'offline' || !isAshaVerified
         ? 'Queued Offline'
         : 'Synced',
       binarySmsPayload: bitPacked28CharSms,
       timestamp: timeStr,
       createdAtMs: Date.now(),
       dispatchStatus: 'Unassigned',
+      patientConsent: {
+        isMinor,
+        guardianName: isMinor ? guardianName.trim() : undefined,
+        guardianRelationship: isMinor ? guardianRelationship : undefined,
+        verifiableGuardianConsent: isMinor ? guardianConsentConfirmed : true,
+        consentGranted: isMinor ? guardianConsentConfirmed : true,
+        consentTimestampMs: Date.now(),
+        lawfulBasis:
+          triage.severity === 'emergency'
+            ? 'medical_emergency_vital_interest'
+            : 'explicit_consent',
+        aiProcessingConsent: !isMinor && explicitAiConsent,
+      },
     };
   };
 
   const openEmergencySmsModal = () => {
     setFormError(null);
-    if (!patientName.trim()) {
-      setFormError('Please enter the patient’s name before preparing an urgent SMS alert.');
+    if (!validatePatientAndConsent()) {
       return;
     }
     const snapshotRecord = buildRecord(true);
@@ -437,8 +594,7 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
 
   const handlePrimarySaveClick = () => {
     setFormError(null);
-    if (!patientName.trim()) {
-      setFormError('Please enter the patient’s name before saving this checkup.');
+    if (!validatePatientAndConsent()) {
       return;
     }
 
@@ -453,6 +609,10 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
     if (networkState === 'offline' || sessionToken === 'OFFLINE_LOCAL_SESSION') {
       setFeedbackNotice(
         `Saved privately on this device for ${record.patientName}. It will sync automatically when connected to the hospital server.`
+      );
+    } else if (!isAshaVerified) {
+      setFeedbackNotice(
+        `Saved privately on this device for ${record.patientName}. Verify your account above to sync with the hospital dashboard.`
       );
     } else if (triage.severity === 'emergency') {
       setFeedbackNotice(
@@ -589,6 +749,44 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
         </div>
       </div>
 
+      {/* Pending ASHA Account Verification Banner */}
+      {!isAshaVerified && sessionToken !== 'OFFLINE_LOCAL_SESSION' && (
+        <div
+          role="status"
+          className="mb-6 rounded-xl border border-amber-200 bg-amber-50/80 p-4 text-sm text-amber-950 space-y-3"
+        >
+          <div className="flex items-start gap-2.5">
+            <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-700" />
+            <div>
+              <p className="font-semibold">Account Pending Hospital Verification</p>
+              <p className="mt-0.5 text-xs text-amber-900">
+                Your checkups are encrypted safely on this device, but hospital sync, stipend
+                credits, and emergency SMS alerts remain paused until a District Medical Officer
+                approves your ID or you enter a valid Clinic Enrollment Code below.
+              </p>
+            </div>
+          </div>
+
+          <form onSubmit={handleSubmitEnrollmentCode} className="flex flex-wrap items-center gap-2">
+            <input
+              type="password"
+              value={enrollmentCodeInput}
+              onChange={(e) => setEnrollmentCodeInput(e.target.value)}
+              placeholder="Enter Clinic Enrollment Code"
+              className="min-h-[40px] flex-1 min-w-[200px] rounded-xl border border-amber-300 bg-white px-3 text-xs text-slate-900 placeholder:text-slate-400 focus:border-teal-700 focus:outline-none"
+            />
+            <button
+              type="submit"
+              disabled={verifyingCode}
+              className="min-h-[40px] rounded-xl bg-teal-700 px-4 py-2 text-xs font-semibold text-white hover:bg-teal-800 disabled:opacity-60 cursor-pointer"
+            >
+              {verifyingCode ? 'Verifying...' : 'Verify Account'}
+            </button>
+          </form>
+          {verifyError && <p className="text-xs font-medium text-red-700">{verifyError}</p>}
+        </div>
+      )}
+
       {/* Feedback Banner */}
       {feedbackNotice && (
         <div
@@ -724,6 +922,95 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
                   className="min-h-[44px] w-full rounded-xl border border-slate-300 bg-white px-3.5 font-mono text-sm text-slate-900 placeholder:font-sans placeholder:text-slate-400 focus:border-teal-700 focus:outline-none"
                 />
               </div>
+
+              {isMinorPatient ? (
+                <div className="space-y-3 rounded-xl border border-amber-200 bg-amber-50/60 p-4">
+                  <div>
+                    <p className="text-xs font-semibold text-amber-950">
+                      Parent / Legal Guardian Consent Required (DPDP Act Section 9)
+                    </p>
+                    <p className="mt-0.5 text-xs text-amber-900">
+                      Patients under 18 years require verifiable parent or legal guardian consent
+                      before health data is stored. AI summaries always anonymize minor identifiers.
+                    </p>
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-12">
+                    <div className="sm:col-span-8">
+                      <label
+                        htmlFor="guardian-name-input"
+                        className="mb-1 block text-xs font-medium text-slate-800"
+                      >
+                        Parent / Guardian Full Name <span className="text-red-600">*</span>
+                      </label>
+                      <input
+                        id="guardian-name-input"
+                        type="text"
+                        value={guardianName}
+                        onChange={(e) => {
+                          setGuardianName(e.target.value);
+                          if (formError) setFormError(null);
+                        }}
+                        placeholder="e.g. Ramesh Kumar"
+                        className="min-h-[42px] w-full rounded-xl border border-slate-300 bg-white px-3 text-sm text-slate-900 placeholder:text-slate-400 focus:border-teal-700 focus:outline-none"
+                      />
+                    </div>
+
+                    <div className="sm:col-span-4">
+                      <label
+                        htmlFor="guardian-rel-select"
+                        className="mb-1 block text-xs font-medium text-slate-800"
+                      >
+                        Relationship
+                      </label>
+                      <select
+                        id="guardian-rel-select"
+                        value={guardianRelationship}
+                        onChange={(e) =>
+                          setGuardianRelationship(
+                            e.target.value as 'Mother' | 'Father' | 'Legal Guardian'
+                          )
+                        }
+                        className="min-h-[42px] w-full rounded-xl border border-slate-300 bg-white px-2.5 text-sm text-slate-900 focus:border-teal-700 focus:outline-none"
+                      >
+                        <option value="Mother">Mother</option>
+                        <option value="Father">Father</option>
+                        <option value="Legal Guardian">Legal Guardian</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <label className="flex cursor-pointer items-start gap-2.5 pt-1 text-xs text-slate-800">
+                    <input
+                      type="checkbox"
+                      checked={guardianConsentConfirmed}
+                      onChange={(e) => {
+                        setGuardianConsentConfirmed(e.target.checked);
+                        if (formError) setFormError(null);
+                      }}
+                      className="mt-0.5 h-4 w-4 shrink-0 accent-teal-700"
+                    />
+                    <span>
+                      I have verified the parent/legal guardian&apos;s identity and obtained
+                      explicit consent to record and share this minor&apos;s checkup with the
+                      hospital doctor.
+                    </span>
+                  </label>
+                </div>
+              ) : (
+                <label className="flex cursor-pointer items-start gap-2.5 rounded-xl border border-slate-200 bg-slate-50/60 p-3 text-xs text-slate-700">
+                  <input
+                    type="checkbox"
+                    checked={explicitAiConsent}
+                    onChange={(e) => setExplicitAiConsent(e.target.checked)}
+                    className="mt-0.5 h-4 w-4 shrink-0 accent-teal-700"
+                  />
+                  <span>
+                    Patient explicitly consents to include their name if an optional AI Care Summary
+                    is requested (otherwise AI summaries use anonymized vitals only).
+                  </span>
+                </label>
+              )}
             </section>
 
             {/* Section 2: Vital Signs in Plain Language */}
@@ -949,6 +1236,63 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
                   </button>
                 </div>
               </div>
+
+              {/* Estimated Hemoglobin (g/dL) — Auto-populated from Anemia Eye Scanner or manual entry */}
+              <div className="flex flex-col gap-3 border-t border-slate-100 pt-4 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <label htmlFor="vital-hb" className="text-sm font-semibold text-slate-900">
+                      Estimated Hemoglobin (g/dL)
+                    </label>
+                    {edgeAi.estimatedHb !== undefined && edgeAi.estimatedHb < 7.0 ? (
+                      <span className="inline-flex items-center gap-1 rounded-md bg-red-100 px-2 py-0.5 text-xs font-semibold text-red-800">
+                        <AlertCircle className="h-3.5 w-3.5 shrink-0 text-red-600" />
+                        <span>Severe Anemia Risk</span>
+                      </span>
+                    ) : (edgeAi.estimatedHb !== undefined && edgeAi.estimatedHb < 10.0) ||
+                      edgeAi.anemiaSuspected ? (
+                      <span className="inline-flex items-center gap-1 rounded-md bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-900">
+                        <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-amber-700" />
+                        <span>Anemia Risk</span>
+                      </span>
+                    ) : edgeAi.estimatedHb !== undefined ? (
+                      <span className="inline-flex items-center gap-1 rounded-md bg-emerald-100 px-2 py-0.5 text-xs font-semibold text-emerald-800">
+                        <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-700" />
+                        <span>Normal</span>
+                      </span>
+                    ) : (
+                      <span className="text-xs font-normal text-slate-500">(Optional / Eye Scan)</span>
+                    )}
+                  </div>
+                  <p className="text-xs text-slate-500">
+                    Normal: &ge; 10.0 g/dL · Auto-fills from Anemia Eye Scanner
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <input
+                    id="vital-hb"
+                    type="number"
+                    step="0.1"
+                    min={3.5}
+                    max={20}
+                    value={hbDraft}
+                    onChange={(e) => handleHbInputChange(e.target.value)}
+                    onBlur={handleHbInputBlur}
+                    placeholder="—"
+                    aria-label="Estimated Hemoglobin in g/dL"
+                    className="min-h-[44px] w-24 rounded-xl border border-slate-300 bg-white px-3 text-center font-mono text-base font-semibold text-slate-900 tabular-nums placeholder:text-slate-400 focus:border-teal-700 focus:outline-none"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setEyeScannerModalOpen(true)}
+                    className="inline-flex min-h-[44px] items-center gap-1.5 rounded-xl border border-teal-200 bg-teal-50 px-3.5 py-2 text-xs font-semibold text-teal-900 hover:bg-teal-100 whitespace-nowrap cursor-pointer"
+                  >
+                    <Eye className="h-4 w-4 shrink-0 text-teal-700" />
+                    <span>Scan Eyelid</span>
+                  </button>
+                </div>
+              </div>
             </section>
 
             {/* Section 3: Symptoms */}
@@ -1005,7 +1349,7 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
               </div>
             </section>
 
-            {/* Section 4: Optional Camera & Cough Observation (Collapsible to prevent clutter) */}
+            {/* Section 4: Anemia Eye Scanner & Cough Check */}
             <section className="rounded-2xl border border-slate-200 bg-white p-5 sm:p-6">
               <button
                 type="button"
@@ -1015,12 +1359,16 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
               >
                 <div>
                   <h2 className="text-base font-bold text-slate-900">
-                    4. Optional Camera &amp; Cough Check
+                    4. Anemia Eye Scanner &amp; Cough Check
                   </h2>
                   <p className="text-xs text-slate-600">
-                    {edgeAi.anemiaSuspected || edgeAi.respiratoryRiskHigh
+                    {edgeAi.estimatedHb !== undefined
+                      ? `Est. Hb ${edgeAi.estimatedHb.toFixed(1)} g/dL (${
+                          edgeAi.estimatedHb < 10.0 ? 'Anemia Risk Flagged' : 'Normal Range'
+                        }) — tap to review or rescan`
+                      : edgeAi.anemiaSuspected || edgeAi.respiratoryRiskHigh
                       ? 'Observation recorded — tap to review or reset'
-                      : 'Open only if you want to check eyelid paleness or cough sound'}
+                      : 'Open to estimate Hemoglobin (g/dL) from lower eyelid or check cough pitch'}
                   </p>
                 </div>
                 {showOptionalScreening ? (
@@ -1072,9 +1420,25 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
                   </div>
                 </div>
 
-                <span className="font-mono text-xs text-slate-600 tabular-nums">
-                  {vitals.systolic}/{vitals.diastolic} · {vitals.spo2}%
-                </span>
+                <div className="text-right font-mono text-xs text-slate-600 tabular-nums space-y-1">
+                  <span className="block">
+                    {vitals.systolic}/{vitals.diastolic} · {vitals.spo2}%
+                  </span>
+                  {edgeAi.estimatedHb !== undefined && (
+                    <span
+                      className={`inline-block rounded-md px-2 py-0.5 text-[11px] font-bold ${
+                        edgeAi.estimatedHb < 7.0
+                          ? 'bg-red-100 text-red-900'
+                          : edgeAi.estimatedHb < 10.0
+                          ? 'bg-amber-100 text-amber-950'
+                          : 'bg-emerald-100 text-emerald-900'
+                      }`}
+                    >
+                      Hb {edgeAi.estimatedHb.toFixed(1)} g/dL
+                      {edgeAi.estimatedHb < 10.0 ? ' · Anemia Risk' : ''}
+                    </span>
+                  )}
+                </div>
               </div>
 
               <p className="text-sm leading-relaxed text-slate-700">{triage.protocolEn}</p>
@@ -1249,6 +1613,9 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
                           BP {rec.vitals.systolic}/{rec.vitals.diastolic} mmHg · Oxygen{' '}
                           {rec.vitals.spo2}% · Temp {rec.vitals.temperature}°F · Pulse{' '}
                           {rec.vitals.heartRate} bpm
+                          {rec.edgeAi?.estimatedHb !== undefined
+                            ? ` · Hb ${rec.edgeAi.estimatedHb.toFixed(1)} g/dL`
+                            : ''}
                         </p>
                         <p className="text-xs text-slate-500">
                           {rec.timestamp} · {rec.syncStatus} · Health ID:{' '}
@@ -1287,6 +1654,7 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
             currentEdgeAi={edgeAi}
             patientName={patientName}
             patientAge={Number(patientAge) || 35}
+            explicitAiConsent={!isMinorPatient && explicitAiConsent}
             onApplyVoiceEntities={applyVoiceEntities}
           />
         </div>
@@ -1369,8 +1737,59 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
         currentEdgeAi={edgeAi}
         patientName={patientName}
         patientAge={Number(patientAge) || 35}
+        explicitAiConsent={!isMinorPatient && explicitAiConsent}
         onApplyVoiceEntities={applyVoiceEntities}
       />
+
+      {/* Anemia Eye Scanner / Hemoglobin Estimator Modal */}
+      {eyeScannerModalOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-xs"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="eye-scanner-modal-title"
+        >
+          <div className="custom-scrollbar max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-2xl border border-slate-200 bg-white text-slate-900 shadow-lg">
+            <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
+              <div className="flex items-center gap-2.5">
+                <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-teal-50 text-teal-700">
+                  <Eye className="h-5 w-5 shrink-0" />
+                </div>
+                <div>
+                  <h3 id="eye-scanner-modal-title" className="text-base font-bold text-slate-900">
+                    Anemia Eye Scanner &amp; Hemoglobin Estimator
+                  </h3>
+                  <p className="text-xs text-slate-600">
+                    Auto-fills Estimated Hemoglobin (g/dL) into the patient checkup form
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEyeScannerModalOpen(false)}
+                className="flex min-h-[38px] min-w-[38px] items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 hover:text-slate-900 cursor-pointer"
+                aria-label="Close Anemia Eye Scanner"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4">
+              <EdgeAiDiagnosticsPanel diagnostics={edgeAi} onChange={setEdgeAi} />
+
+              <div className="flex justify-end border-t border-slate-100 pt-3">
+                <button
+                  type="button"
+                  onClick={() => setEyeScannerModalOpen(false)}
+                  className="min-h-[42px] rounded-xl bg-teal-700 px-5 py-2 text-sm font-semibold text-white hover:bg-teal-800 cursor-pointer"
+                >
+                  Apply &amp; Return to Checkup
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Emergency Text Message (SMS) Modal */}
       {smsModalOpen && smsDraft && (

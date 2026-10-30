@@ -14,25 +14,86 @@ export interface OutboundSmsResult {
   dispatchLog: SmsDispatchLog;
 }
 
-export function getConfiguredSmsGatewayStatus(): {
+export class SmsAuthorizationError extends Error {
+  public readonly statusCode: number;
+  constructor(message: string, statusCode = 403) {
+    super(message);
+    this.name = 'SmsAuthorizationError';
+    this.statusCode = statusCode;
+  }
+}
+
+export function normalizeE164Phone(raw: string): string {
+  const cleaned = raw.trim().replace(/[\s()-]/g, '');
+  if (!cleaned) return '';
+  return cleaned.startsWith('+') ? cleaned : `+${cleaned}`;
+}
+
+export function maskPhoneNumber(rawPhone: string): string {
+  const clean = (rawPhone || '').trim();
+  if (clean.length <= 6) return '••••••';
+  return `${clean.slice(0, 3)}••••••${clean.slice(-4)}`;
+}
+
+export function getAllowedSmsRecipients(): string[] {
+  const primary = normalizeE164Phone(process.env.DMO_EMERGENCY_PHONE || '+9118001801104');
+  const allowlistRaw = process.env.ALLOWED_SMS_RECIPIENTS || '';
+  const extras = allowlistRaw
+    .split(',')
+    .map((p) => normalizeE164Phone(p))
+    .filter((p) => /^\+\d{8,15}$/.test(p));
+  return Array.from(new Set([primary, ...extras].filter((p) => /^\+\d{8,15}$/.test(p))));
+}
+
+export function validateOutboundEmergencySmsPayload(payloadText: string): void {
+  const trimmed = String(payloadText || '').trim();
+  if (!trimmed || trimmed.length > 160) {
+    throw new SmsAuthorizationError(
+      'Invalid SMS payload: Must be a compact HealthSync frame (max 160 characters).',
+      400
+    );
+  }
+  const decoded = decodeSMSPayload(trimmed);
+  if (!decoded.valid || !decoded.crcValid) {
+    throw new SmsAuthorizationError(
+      'Rejected SMS payload: Frame failed HealthSync CRC-16 integrity verification.',
+      400
+    );
+  }
+  if (decoded.severity !== 'emergency') {
+    throw new SmsAuthorizationError(
+      'Forbidden: Outbound carrier SMS gateway is restricted strictly to emergency (TR3) patient alerts.',
+      403
+    );
+  }
+}
+
+export function getConfiguredSmsGatewayStatus(options?: {includeSensitive?: boolean}): {
   configured: boolean;
   provider: 'twilio' | 'fast2sms' | 'unconfigured';
-  dmoEmergencyPhone: string;
+  maskedRecipient: string;
+  dmoEmergencyPhone?: string;
 } {
-  const dmoEmergencyPhone = (process.env.DMO_EMERGENCY_PHONE || '+9118001801104').trim();
+  const dmoEmergencyPhone = normalizeE164Phone(process.env.DMO_EMERGENCY_PHONE || '+9118001801104');
+  const maskedRecipient = maskPhoneNumber(dmoEmergencyPhone);
   const hasTwilio = Boolean(
     process.env.TWILIO_ACCOUNT_SID?.trim() &&
       process.env.TWILIO_AUTH_TOKEN?.trim() &&
       process.env.TWILIO_FROM_NUMBER?.trim()
   );
-  if (hasTwilio) {
-    return {configured: true, provider: 'twilio', dmoEmergencyPhone};
-  }
   const hasFast2Sms = Boolean(process.env.FAST2SMS_API_KEY?.trim());
-  if (hasFast2Sms) {
-    return {configured: true, provider: 'fast2sms', dmoEmergencyPhone};
-  }
-  return {configured: false, provider: 'unconfigured', dmoEmergencyPhone};
+  const provider: 'twilio' | 'fast2sms' | 'unconfigured' = hasTwilio
+    ? 'twilio'
+    : hasFast2Sms
+    ? 'fast2sms'
+    : 'unconfigured';
+
+  return {
+    configured: provider !== 'unconfigured',
+    provider,
+    maskedRecipient,
+    ...(options?.includeSensitive ? {dmoEmergencyPhone} : {}),
+  };
 }
 
 export function buildNativeSmsUri(toPhone: string, body: string): string {
@@ -44,10 +105,34 @@ export async function dispatchEmergencySms(params: {
   db: HealthSyncDatabase;
   payloadText: string;
   recordId?: string | null;
-  overrideToPhone?: string;
+  requestedToPhone?: string;
 }): Promise<OutboundSmsResult> {
-  const gateway = getConfiguredSmsGatewayStatus();
-  const toPhone = (params.overrideToPhone || gateway.dmoEmergencyPhone).trim();
+  validateOutboundEmergencySmsPayload(params.payloadText);
+
+  const allowedRecipients = getAllowedSmsRecipients();
+  let toPhone = allowedRecipients[0] || '+9118001801104';
+
+  if (params.requestedToPhone !== undefined && params.requestedToPhone.trim() !== '') {
+    const candidate = normalizeE164Phone(params.requestedToPhone);
+    if (!allowedRecipients.includes(candidate)) {
+      throw new SmsAuthorizationError(
+        'Forbidden: Arbitrary toPhone overrides are prohibited. SMS alerts can only be sent to verified hospital emergency numbers.',
+        403
+      );
+    }
+    toPhone = candidate;
+  }
+
+  const dailyGlobalCap = Math.max(5, Number(process.env.SMS_DAILY_GLOBAL_LIMIT) || 100);
+  if (params.db.countRecentOutboundSms(24 * 60 * 60 * 1000) >= dailyGlobalCap) {
+    throw new SmsAuthorizationError(
+      'Carrier SMS daily safety cap reached. Use native device GSM text fallback or contact DMO administration.',
+      429
+    );
+  }
+
+  const gateway = getConfiguredSmsGatewayStatus({includeSensitive: true});
+  const maskedPhone = maskPhoneNumber(toPhone);
   const nativeSmsUri = buildNativeSmsUri(toPhone, params.payloadText);
 
   if (gateway.provider === 'twilio') {
@@ -82,7 +167,7 @@ export async function dispatchEmergencySms(params: {
         const errMsg = json.message || `Twilio HTTP ${resp.status}`;
         const log = params.db.logSmsDispatch({
           recordId: params.recordId ?? null,
-          toPhone,
+          toPhone: maskedPhone,
           provider: 'twilio',
           status: 'failed',
           providerMessageId: null,
@@ -93,7 +178,7 @@ export async function dispatchEmergencySms(params: {
           sent: false,
           gatewayConfigured: true,
           provider: 'twilio',
-          toPhone,
+          toPhone: maskedPhone,
           providerMessageId: null,
           nativeSmsUri,
           statusMessage: `Twilio SMS error: ${errMsg}`,
@@ -103,7 +188,7 @@ export async function dispatchEmergencySms(params: {
 
       const log = params.db.logSmsDispatch({
         recordId: params.recordId ?? null,
-        toPhone,
+        toPhone: maskedPhone,
         provider: 'twilio',
         status: 'sent',
         providerMessageId: json.sid ?? null,
@@ -115,7 +200,7 @@ export async function dispatchEmergencySms(params: {
         sent: true,
         gatewayConfigured: true,
         provider: 'twilio',
-        toPhone,
+        toPhone: maskedPhone,
         providerMessageId: json.sid ?? null,
         nativeSmsUri,
         statusMessage: `Delivered to Twilio carrier gateway (SID: ${json.sid ?? 'OK'})`,
@@ -125,7 +210,7 @@ export async function dispatchEmergencySms(params: {
       const errMsg = err instanceof Error ? err.message : String(err);
       const log = params.db.logSmsDispatch({
         recordId: params.recordId ?? null,
-        toPhone,
+        toPhone: maskedPhone,
         provider: 'twilio',
         status: 'failed',
         providerMessageId: null,
@@ -136,7 +221,7 @@ export async function dispatchEmergencySms(params: {
         sent: false,
         gatewayConfigured: true,
         provider: 'twilio',
-        toPhone,
+        toPhone: maskedPhone,
         providerMessageId: null,
         nativeSmsUri,
         statusMessage: `Twilio network failure: ${errMsg}`,
@@ -184,7 +269,7 @@ export async function dispatchEmergencySms(params: {
           : json.message || `Fast2SMS HTTP ${resp.status}`;
         const log = params.db.logSmsDispatch({
           recordId: params.recordId ?? null,
-          toPhone,
+          toPhone: maskedPhone,
           provider: 'fast2sms',
           status: 'failed',
           providerMessageId: null,
@@ -195,7 +280,7 @@ export async function dispatchEmergencySms(params: {
           sent: false,
           gatewayConfigured: true,
           provider: 'fast2sms',
-          toPhone,
+          toPhone: maskedPhone,
           providerMessageId: null,
           nativeSmsUri,
           statusMessage: `Fast2SMS error: ${errMsg}`,
@@ -205,7 +290,7 @@ export async function dispatchEmergencySms(params: {
 
       const log = params.db.logSmsDispatch({
         recordId: params.recordId ?? null,
-        toPhone,
+        toPhone: maskedPhone,
         provider: 'fast2sms',
         status: 'sent',
         providerMessageId: json.request_id ?? null,
@@ -217,7 +302,7 @@ export async function dispatchEmergencySms(params: {
         sent: true,
         gatewayConfigured: true,
         provider: 'fast2sms',
-        toPhone,
+        toPhone: maskedPhone,
         providerMessageId: json.request_id ?? null,
         nativeSmsUri,
         statusMessage: `Delivered via Fast2SMS gateway (Request ID: ${json.request_id ?? 'OK'})`,
@@ -227,7 +312,7 @@ export async function dispatchEmergencySms(params: {
       const errMsg = err instanceof Error ? err.message : String(err);
       const log = params.db.logSmsDispatch({
         recordId: params.recordId ?? null,
-        toPhone,
+        toPhone: maskedPhone,
         provider: 'fast2sms',
         status: 'failed',
         providerMessageId: null,
@@ -238,7 +323,7 @@ export async function dispatchEmergencySms(params: {
         sent: false,
         gatewayConfigured: true,
         provider: 'fast2sms',
-        toPhone,
+        toPhone: maskedPhone,
         providerMessageId: null,
         nativeSmsUri,
         statusMessage: `Fast2SMS network failure: ${errMsg}`,
@@ -250,7 +335,7 @@ export async function dispatchEmergencySms(params: {
   // Honest unconfigured carrier state: logs payload in SQLite and provides native device sms: URI
   const log = params.db.logSmsDispatch({
     recordId: params.recordId ?? null,
-    toPhone,
+    toPhone: maskedPhone,
     provider: 'unconfigured',
     status: 'queued_no_credentials',
     providerMessageId: null,
@@ -263,7 +348,7 @@ export async function dispatchEmergencySms(params: {
     sent: false,
     gatewayConfigured: false,
     provider: 'unconfigured',
-    toPhone,
+    toPhone: maskedPhone,
     providerMessageId: null,
     nativeSmsUri,
     statusMessage:

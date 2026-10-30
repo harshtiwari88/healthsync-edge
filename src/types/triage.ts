@@ -63,6 +63,19 @@ export interface EdgeAiDiagnostics {
   coughMetrics?: CoughAudioMetrics;
 }
 
+export type LawfulBasisType = 'explicit_consent' | 'medical_emergency_vital_interest';
+
+export interface PatientConsentMetadata {
+  lawfulBasis: LawfulBasisType;
+  consentGranted: boolean;
+  consentTimestampMs: number;
+  isMinor: boolean;
+  guardianName?: string;
+  guardianRelationship?: 'Mother' | 'Father' | 'Legal Guardian';
+  verifiableGuardianConsent?: boolean;
+  aiProcessingConsent?: boolean;
+}
+
 export interface TriageRecord {
   id: string;
   patientId: string;
@@ -86,6 +99,7 @@ export interface TriageRecord {
   dispatchStatus: AmbulanceDispatchStatus;
   ambulanceUnit?: string;
   etaMinutes?: number;
+  patientConsent?: PatientConsentMetadata;
 }
 
 export interface IncentiveEntry {
@@ -193,9 +207,22 @@ export function evaluateTriage(
   if (symptoms.includes('Dizziness')) {
     yellowReasons.push('Dizziness / Syncope Warning');
   }
-  if (edgeAi?.anemiaSuspected) {
+  const estimatedHb =
+    typeof edgeAi?.estimatedHb === 'number' && Number.isFinite(edgeAi.estimatedHb)
+      ? edgeAi.estimatedHb
+      : undefined;
+  const hasAnemiaRisk =
+    (estimatedHb !== undefined && estimatedHb < 10.0) || Boolean(edgeAi?.anemiaSuspected);
+
+  if (estimatedHb !== undefined && estimatedHb < 7.0) {
+    redReasons.push(
+      `Severe Anemia Risk (Est. Hb ${estimatedHb.toFixed(1)} g/dL < 7.0 g/dL)`
+    );
+  } else if (hasAnemiaRisk) {
     yellowReasons.push(
-      `Camera Pallor Detected (Est. Hb ${edgeAi.estimatedHb?.toFixed(1) ?? '< 8.5'} g/dL)`
+      `Anemia Risk Flagged (Est. Hb ${
+        estimatedHb !== undefined ? `${estimatedHb.toFixed(1)} g/dL < 10.0` : '< 10.0'
+      } g/dL)`
     );
   }
   if (edgeAi?.respiratoryRiskHigh) {
@@ -275,6 +302,15 @@ export const SUB_CENTER_DIRECTORY: VillageSubCenter[] = [
   },
 ];
 
+export const ALLOWED_VILLAGE_CODES: ReadonlySet<string> = new Set([
+  ...SUB_CENTER_DIRECTORY.map((c) => c.code),
+  'VIL-108',
+]);
+
+export function isAllowedVillageCode(code: string): boolean {
+  return ALLOWED_VILLAGE_CODES.has(code.trim().toUpperCase());
+}
+
 export function maskHealthId(abhaId: string): string {
   const clean = (abhaId || '').trim();
   if (clean.length < 6) return 'Protected ID';
@@ -282,4 +318,5 @@ export function maskHealthId(abhaId: string): string {
   const suffix = clean.slice(-4);
   return `${prefix}-••••-••••-${suffix}`;
 }
+
 

@@ -23,6 +23,7 @@ interface TopRoleToolbarProps {
   onSelectDmoTab?: (tab: DmoNavTab) => void;
   onSelectNetwork: (mode: NetworkState) => void;
   onLogout: () => void;
+  onLogoutAllDevices?: () => void;
 }
 
 export const TopRoleToolbar: React.FC<TopRoleToolbarProps> = ({
@@ -40,6 +41,7 @@ export const TopRoleToolbar: React.FC<TopRoleToolbarProps> = ({
   onSelectDmoTab,
   onSelectNetwork,
   onLogout,
+  onLogoutAllDevices,
 }) => {
   return (
     <div className="w-full shrink-0">
@@ -284,6 +286,16 @@ export const TopRoleToolbar: React.FC<TopRoleToolbarProps> = ({
                 Offline
               </button>
             </div>
+
+            {isAuthenticated && !isLocalSession && onLogoutAllDevices && (
+              <button
+                type="button"
+                onClick={onLogoutAllDevices}
+                className="min-h-[34px] rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-600 transition-colors hover:bg-slate-50 hover:text-slate-900 whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                Sign Out All Devices
+              </button>
+            )}
 
             {isAuthenticated && <PWAInstallButton compact />}
           </div>

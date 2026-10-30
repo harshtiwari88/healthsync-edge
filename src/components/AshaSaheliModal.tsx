@@ -8,7 +8,7 @@ import {
   parseClinicalTranscript,
   speakClinicalGuidance,
 } from '../utils/speechEngine';
-import {safeReadJson} from '../utils/safeFetchJson';
+import {fetchCareSummaryWithFallback} from '../utils/clinicalSummaryClient';
 
 interface ChatTurn {
   id: string;
@@ -29,6 +29,7 @@ interface AshaSaheliModalProps {
   currentEdgeAi: EdgeAiDiagnostics;
   patientName: string;
   patientAge: number;
+  explicitAiConsent?: boolean;
   onApplyVoiceEntities: (
     vitalsPatch: Partial<VitalsSnapshot>,
     symptoms: SymptomKey[],
@@ -53,6 +54,7 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
   currentEdgeAi,
   patientName,
   patientAge,
+  explicitAiConsent = false,
   onApplyVoiceEntities,
 }) => {
   const [speechLang, setSpeechLang] = useState<'hi-IN' | 'en-IN'>('en-IN');
@@ -148,13 +150,6 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
   };
 
   const handleRequestGeminiSummary = async () => {
-    if (networkState === 'offline' || sessionToken === 'OFFLINE_LOCAL_SESSION') {
-      setSpeechStatus(
-        'Care Summary requires an internet connection. Your checkup form still works completely offline.'
-      );
-      return;
-    }
-
     abortControllerRef.current?.abort();
     const controller = new AbortController();
     abortControllerRef.current = controller;
@@ -163,44 +158,22 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
     setSpeechStatus('');
 
     try {
-      const resp = await fetch('/api/gemini/clinical-summary', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${sessionToken}`,
-        },
+      const allowIdentifiableName = Boolean(explicitAiConsent) && Number(patientAge) >= 18;
+      const data = await fetchCareSummaryWithFallback({
+        sessionToken,
+        networkState,
+        patientName: allowIdentifiableName ? patientName.trim() : undefined,
+        age: patientAge,
+        vitals: currentVitals,
+        symptoms: currentSymptoms,
+        edgeAi: currentEdgeAi,
+        transcript: liveTranscript || undefined,
+        language: speechLang === 'hi-IN' ? 'hi' : 'en',
+        explicitAiConsent: allowIdentifiableName,
         signal: controller.signal,
-        body: JSON.stringify({
-          patientName: patientName || 'Patient',
-          age: patientAge,
-          vitals: currentVitals,
-          symptoms: currentSymptoms,
-          edgeAi: currentEdgeAi,
-          transcript: liveTranscript || undefined,
-          language: speechLang === 'hi-IN' ? 'hi' : 'en',
-        }),
       });
-      const parsed = await safeReadJson<{
-        error?: string;
-        handoffSummary?: string;
-        redFlags?: string[];
-        stabilizationSteps?: string[];
-        hindiGuidance?: string;
-        disclaimer?: string;
-      }>(resp);
 
       if (!isMountedRef.current) return;
-
-      if (!parsed.isJson) {
-        throw new Error(
-          'Care Summary service is unavailable on this connection. Voice readings and local checkup guidance remain active.'
-        );
-      }
-
-      const data = parsed.data || {};
-      if (!resp.ok || !data.handoffSummary) {
-        throw new Error(data.error || 'Could not generate Care Summary right now.');
-      }
 
       const formatted = [
         `Doctor Handoff Summary:\n${data.handoffSummary}`,
@@ -374,7 +347,7 @@ export const AshaSaheliModal: React.FC<AshaSaheliModalProps> = ({
           <button
             type="button"
             onClick={handleRequestGeminiSummary}
-            disabled={isCallingGemini || networkState === 'offline'}
+            disabled={isCallingGemini}
             className="flex min-h-[46px] items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-800 transition-colors hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap cursor-pointer"
           >
             <FileText className="h-4 w-4 shrink-0 text-teal-700" />

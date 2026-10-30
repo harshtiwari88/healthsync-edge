@@ -68,6 +68,10 @@ export type RealtimeEventMessage =
       record: TriageRecord;
     }
   | {
+      type: 'record:deleted';
+      recordId: string;
+    }
+  | {
       type: 'sync:init';
       records: TriageRecord[];
       connectedPeers: number;
@@ -305,6 +309,8 @@ export class HealthSyncRealtimeClient {
   private ws: WebSocket | null = null;
   private bc: BroadcastChannel | null = null;
   private reconnectTimer: number | null = null;
+  private httpPollTimer: number | null = null;
+  private lastDeltaSyncMs = 0;
   private reconnectAttempts = 0;
   private destroyed = false;
   private sessionToken: string;
@@ -330,6 +336,58 @@ export class HealthSyncRealtimeClient {
     }
   }
 
+  public updateSessionToken(newToken: string): void {
+    if (!newToken || this.destroyed) return;
+    this.sessionToken = newToken;
+  }
+
+  private startServerlessHttpDeltaPolling(): void {
+    if (
+      this.destroyed ||
+      this.httpPollTimer !== null ||
+      typeof window === 'undefined' ||
+      !this.sessionToken ||
+      this.sessionToken === 'OFFLINE_LOCAL_SESSION'
+    ) {
+      return;
+    }
+    this.httpPollTimer = window.setInterval(async () => {
+      if (
+        this.destroyed ||
+        !this.sessionToken ||
+        this.sessionToken === 'OFFLINE_LOCAL_SESSION' ||
+        (typeof navigator !== 'undefined' && !navigator.onLine)
+      ) {
+        return;
+      }
+      try {
+        const sinceParam = this.lastDeltaSyncMs > 0 ? `?since=${this.lastDeltaSyncMs}` : '';
+        const resp = await fetch(`/api/records${sinceParam}`, {
+          headers: {Authorization: `Bearer ${this.sessionToken}`},
+        });
+        if (!resp.ok) return;
+        const parsed = await safeReadJson<{records?: TriageRecord[]}>(resp);
+        if (parsed.isJson && Array.isArray(parsed.data?.records) && parsed.data.records.length > 0) {
+          this.lastDeltaSyncMs = Date.now() - 2_000;
+          this.onMessageCallback({
+            type: 'sync:init',
+            records: parsed.data.records,
+            connectedPeers: 1,
+          });
+        }
+      } catch {
+        // Ignore transient offline errors during delta polling
+      }
+    }, 15_000);
+  }
+
+  private stopServerlessHttpDeltaPolling(): void {
+    if (this.httpPollTimer !== null && typeof window !== 'undefined') {
+      window.clearInterval(this.httpPollTimer);
+      this.httpPollTimer = null;
+    }
+  }
+
   private connectWebSocket() {
     if (
       this.destroyed ||
@@ -350,6 +408,7 @@ export class HealthSyncRealtimeClient {
 
       socket.onopen = () => {
         if (this.destroyed || socket.readyState !== WebSocket.OPEN) return;
+        this.stopServerlessHttpDeltaPolling();
         socket.send(
           JSON.stringify({
             type: 'auth',
@@ -363,6 +422,7 @@ export class HealthSyncRealtimeClient {
           const parsed = JSON.parse(String(event.data)) as RealtimeEventMessage;
           if (parsed.type === 'sync:init') {
             this.reconnectAttempts = 0;
+            this.lastDeltaSyncMs = Date.now() - 2_000;
           }
           this.onMessageCallback(parsed);
         } catch (err) {
@@ -371,24 +431,40 @@ export class HealthSyncRealtimeClient {
       };
 
       socket.onclose = (event) => {
-        if (!this.destroyed && event.code !== 4001 && this.reconnectAttempts < 8) {
+        if (this.destroyed || event.code === 4001 || event.code === 4003) {
+          return;
+        }
+        if (this.reconnectAttempts < 8) {
           const delayMs = Math.min(30_000, 3_000 * 2 ** this.reconnectAttempts);
           this.reconnectAttempts += 1;
+          if (this.reconnectAttempts >= 2) {
+            // Fall back to authenticated HTTP delta-sync on serverless runtimes without persistent WebSockets
+            this.startServerlessHttpDeltaPolling();
+          }
           this.reconnectTimer = window.setTimeout(() => {
             this.connectWebSocket();
           }, delayMs);
+        } else {
+          this.startServerlessHttpDeltaPolling();
         }
       };
     } catch (err) {
       console.error('[HealthSync WS] Failed to initialize WebSocket transport:', err);
+      this.startServerlessHttpDeltaPolling();
     }
   }
 
-  public async publishRecordCreated(
+   public async publishRecordCreated(
     record: TriageRecord,
     triggerEmergencySiren: boolean,
     incentive?: IncentiveEntry
-  ): Promise<{ok: boolean; record?: TriageRecord; error?: string; retryable?: boolean}> {
+  ): Promise<{
+    ok: boolean;
+    record?: TriageRecord;
+    incentive?: IncentiveEntry;
+    error?: string;
+    retryable?: boolean;
+  }> {
     const payload: RealtimeEventMessage = {
       type: 'record:created',
       record,
@@ -425,6 +501,7 @@ export class HealthSyncRealtimeClient {
       const parsed = await safeReadJson<{
         ok?: boolean;
         record?: TriageRecord;
+        incentive?: IncentiveEntry;
         error?: string;
       }>(resp);
 
@@ -463,7 +540,7 @@ export class HealthSyncRealtimeClient {
         recordId: savedRecord.id,
         record: savedRecord,
       });
-      return {ok: true, record: savedRecord};
+      return {ok: true, record: savedRecord, incentive: body.incentive};
     } catch (err) {
       const errMsg =
         err instanceof Error ? err.message : 'Network error while syncing triage record.';
@@ -509,6 +586,7 @@ export class HealthSyncRealtimeClient {
 
   public destroy() {
     this.destroyed = true;
+    this.stopServerlessHttpDeltaPolling();
     if (this.reconnectTimer !== null) {
       window.clearTimeout(this.reconnectTimer);
     }

@@ -7,12 +7,14 @@ import {
   encryptVaultData,
   generateRandomSalt,
   isEncryptedVaultEnvelope,
+  timingSafeEqualBytes,
+  validateClientPasscode,
 } from '../utils/cryptoVault';
 
-describe('Web Crypto PBKDF2-SHA256 + AES-256-GCM Client Vault', () => {
+describe('Web Crypto PBKDF2-SHA256 + AES-256-GCM Client Vault & Hardened Offline Verifier', () => {
   it('encrypts patient PHI so zero plaintext strings exist in serialized storage envelope', async () => {
     const salt = generateRandomSalt(16);
-    const key = await deriveAesGcmVaultKey('ASHA-8842-UP', '9472', salt);
+    const key = await deriveAesGcmVaultKey('ASHA-8842-UP', 'AshaPass#9472', salt);
 
     const sensitiveRecords = [
       {
@@ -39,7 +41,7 @@ describe('Web Crypto PBKDF2-SHA256 + AES-256-GCM Client Vault', () => {
 
   it('produces distinct ciphertexts and IVs across repeated encryptions of identical data', async () => {
     const salt = generateRandomSalt(16);
-    const key = await deriveAesGcmVaultKey('ASHA-8842-UP', '9472', salt);
+    const key = await deriveAesGcmVaultKey('ASHA-8842-UP', 'AshaPass#9472', salt);
     const payload = {patientId: 'PT-9001', spo2: 88};
 
     const env1 = await encryptVaultData(key, salt, payload);
@@ -49,14 +51,14 @@ describe('Web Crypto PBKDF2-SHA256 + AES-256-GCM Client Vault', () => {
     expect(env1.ciphertextB64).not.toBe(env2.ciphertextB64);
   });
 
-  it('rejects decryption when given an incorrect PIN or tampered ciphertext', async () => {
+  it('rejects decryption when given an incorrect passcode or tampered ciphertext', async () => {
     const salt = generateRandomSalt(16);
-    const validKey = await deriveAesGcmVaultKey('ASHA-8842-UP', '9472', salt);
-    const wrongPinKey = await deriveAesGcmVaultKey('ASHA-8842-UP', '0000', salt);
+    const validKey = await deriveAesGcmVaultKey('ASHA-8842-UP', 'AshaPass#9472', salt);
+    const wrongPassKey = await deriveAesGcmVaultKey('ASHA-8842-UP', 'WrongPass#0000', salt);
 
     const envelope = await encryptVaultData(validKey, salt, {secretNote: 'Critical hypoxia'});
 
-    await expect(decryptVaultData(wrongPinKey, envelope)).rejects.toThrow();
+    await expect(decryptVaultData(wrongPassKey, envelope)).rejects.toThrow();
 
     // Flip a byte in the AES-GCM ciphertext/tag and verify authenticated tag failure
     const rawCipher = base64ToBytes(envelope.ciphertextB64);
@@ -69,7 +71,15 @@ describe('Web Crypto PBKDF2-SHA256 + AES-256-GCM Client Vault', () => {
     await expect(decryptVaultData(validKey, tamperedEnvelope)).rejects.toThrow();
   });
 
-  it('isolates encrypted offline vaults per user on shared rural devices without destroying other workers data', async () => {
+  it('enforces strong 8+ char alphanumeric passcode policy, encrypts worker metadata in localStorage, and locks out after 5 failed offline attempts', async () => {
+    expect(validateClientPasscode('1234').valid).toBe(false);
+    expect(validateClientPasscode('12345678').valid).toBe(false);
+    expect(validateClientPasscode('password123').valid).toBe(false);
+    expect(validateClientPasscode('onlyletters').valid).toBe(false);
+    expect(validateClientPasscode('Sunita#2026').valid).toBe(true);
+    expect(timingSafeEqualBytes(new Uint8Array([1, 2, 3]), new Uint8Array([1, 2, 3]))).toBe(true);
+    expect(timingSafeEqualBytes(new Uint8Array([1, 2, 3]), new Uint8Array([1, 2, 4]))).toBe(false);
+
     const store = new Map<string, string>();
     const mockLocalStorage = {
       getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
@@ -100,15 +110,33 @@ describe('Web Crypto PBKDF2-SHA256 + AES-256-GCM Client Vault', () => {
       );
       type TriageRecord = import('../types/triage').TriageRecord;
 
-      // Worker A logs in online, caches offline verifier, and saves 2 offline records
+      // Weak 4-digit PIN MUST be rejected by saveOfflineLoginVerifier
+      await expect(
+        saveOfflineLoginVerifier({
+          identifier: 'ASHA-1001-UP',
+          role: 'ASHA',
+          displayName: 'Sunita Devi',
+          villageCode: 'VIL-204',
+          secret: '4829',
+        })
+      ).rejects.toThrow(/at least 8 characters/);
+
+      // Worker A logs in online, caches offline verifier, and saves offline records
       const workerAAuth = await saveOfflineLoginVerifier({
         identifier: 'ASHA-1001-UP',
         role: 'ASHA',
         displayName: 'Sunita Devi',
         villageCode: 'VIL-204',
-        secret: '4829',
+        secret: 'Sunita#4829',
       });
       const scopeA = buildUserVaultScope('ASHA', 'ASHA-1001-UP');
+
+      // Verify zero plaintext worker names, IDs, or village codes appear inside the localStorage verifier map!
+      const rawV2Verifier = store.get('healthsync_auth_verifiers_v2') || '';
+      expect(rawV2Verifier.length).toBeGreaterThan(20);
+      expect(rawV2Verifier).not.toContain('Sunita Devi');
+      expect(rawV2Verifier).not.toContain('ASHA-1001-UP');
+      expect(rawV2Verifier).not.toContain('VIL-204');
 
       const workerARecords = [
         {
@@ -142,7 +170,7 @@ describe('Web Crypto PBKDF2-SHA256 + AES-256-GCM Client Vault', () => {
         role: 'ASHA',
         displayName: 'Geeta Kumari',
         villageCode: 'VIL-108',
-        secret: '9153',
+        secret: 'Geeta#9153',
       });
       const scopeB = buildUserVaultScope('ASHA', 'ASHA-2002-UP');
       expect(scopeB).not.toBe(scopeA);
@@ -161,16 +189,35 @@ describe('Web Crypto PBKDF2-SHA256 + AES-256-GCM Client Vault', () => {
       ] as TriageRecord[];
       await persistEncryptedRecords(workerBAuth.vaultKey, workerBAuth.salt, workerBRecords, scopeB);
 
-      // Worker A logs back in completely offline and recovers 100% of Worker A's offline records intact!
+      // Worker A logs back in completely offline and recovers 100% of Worker A's offline records & encrypted profile!
       const workerAOffline = await verifyOfflineLogin({
         identifier: 'ASHA-1001-UP',
         role: 'ASHA',
-        secret: '4829',
+        secret: 'Sunita#4829',
       });
+      expect(workerAOffline.user.displayName).toBe('Sunita Devi');
       const recoveredForA = await loadEncryptedRecords(workerAOffline.vaultKey, [], scopeA);
       expect(recoveredForA.length).toBe(1);
       expect(recoveredForA[0].patientName).toBe('Radha Bai');
       expect(recoveredForA[0].id).toBe('rec-worker-a-1');
+
+      // Brute-force Worker B's offline verifier 5 times -> 6th attempt even with VALID passcode MUST be locked out!
+      for (let i = 0; i < 5; i++) {
+        await expect(
+          verifyOfflineLogin({
+            identifier: 'ASHA-2002-UP',
+            role: 'ASHA',
+            secret: `WrongGuess#${i}`,
+          })
+        ).rejects.toThrow();
+      }
+      await expect(
+        verifyOfflineLogin({
+          identifier: 'ASHA-2002-UP',
+          role: 'ASHA',
+          secret: 'Geeta#9153',
+        })
+      ).rejects.toThrow(/temporarily locked/);
     } finally {
       if (prevDescriptor) {
         Object.defineProperty(globalThis, 'localStorage', prevDescriptor);

@@ -8,6 +8,7 @@ import {
   purgeLegacyPlaintextStorage,
   RealtimeEventMessage,
 } from './utils/realtimeSync';
+import {persistActiveAuthToken} from './utils/clinicalSummaryClient';
 import {safeReadJson} from './utils/safeFetchJson';
 import {sirenEngine} from './utils/sirenAudio';
 import {
@@ -129,10 +130,14 @@ export function App() {
   const networkStateRef = useRef<NetworkState>(networkState);
   networkStateRef.current = networkState;
 
+  const isAshaVerifiedRef = useRef<boolean>(authUser?.isVerified !== false);
+  isAshaVerifiedRef.current = authUser?.isVerified !== false;
+
   const flushOfflineQueue = useCallback(() => {
     // Defer network side-effects outside React state updaters so StrictMode/concurrent renders never double-fire
     window.setTimeout(() => {
       if (networkStateRef.current === 'offline') return;
+      if (userRoleRef.current === 'ASHA' && !isAshaVerifiedRef.current) return;
       const queued = recordsRef.current.filter((rec) => rec.syncStatus === 'Queued Offline');
       if (queued.length === 0) return;
 
@@ -143,11 +148,20 @@ export function App() {
         };
         const incentive =
           userRoleRef.current === 'ASHA' ? buildIncentiveForRecord(rec) : undefined;
-        void realtimeRef.current?.publishRecordCreated(
-          candidateSynced,
-          candidateSynced.severity === 'emergency',
-          incentive
-        );
+        void realtimeRef.current
+          ?.publishRecordCreated(
+            candidateSynced,
+            candidateSynced.severity === 'emergency',
+            incentive
+          )
+          .then((res) => {
+            if (res?.ok && res.incentive) {
+              setIncentives((prev) => {
+                const filtered = prev.filter((inc) => inc.id !== `inc-${rec.id}`);
+                return mergeIncentivesById([res.incentive!], filtered);
+              });
+            }
+          });
       }
     }, 0);
   }, []);
@@ -174,7 +188,11 @@ export function App() {
 
   // Authenticated WebSocket + BroadcastChannel Real-Time Transport
   useEffect(() => {
-    if (!isAuthenticated || !sessionToken) {
+    if (
+      !isAuthenticated ||
+      !sessionToken ||
+      (userRole === 'ASHA' && authUser?.isVerified === false)
+    ) {
       realtimeRef.current?.destroy();
       realtimeRef.current = null;
       return;
@@ -219,6 +237,8 @@ export function App() {
           }
           return prev.map((r) => (r.id === msg.record.id ? msg.record : r));
         });
+      } else if (msg.type === 'record:deleted') {
+        setRecords((prev) => prev.filter((r) => r.id !== msg.recordId));
       } else if (msg.type === 'sync:ack') {
         setRecords((prev) => {
           if (!prev.some((r) => r.id === msg.recordId)) return prev;
@@ -240,7 +260,6 @@ export function App() {
           if (!prev.some((r) => r.id === msg.recordId)) return prev;
           return prev.map((r) => {
             if (r.id === msg.recordId && r.syncStatus !== 'SMS Delivered') {
-              // Only leave in offline retry queue if the server marked the error as transient/retryable
               return {
                 ...r,
                 syncStatus: msg.retryable ? ('Queued Offline' as const) : ('Synced' as const),
@@ -259,7 +278,39 @@ export function App() {
       client.destroy();
       realtimeRef.current = null;
     };
-  }, [isAuthenticated, sessionToken, flushOfflineQueue]);
+  }, [isAuthenticated, sessionToken, userRole, authUser?.isVerified, flushOfflineQueue]);
+
+  // Periodic shift session token rotation (every 30 minutes while online)
+  useEffect(() => {
+    if (
+      !isAuthenticated ||
+      !sessionToken ||
+      sessionToken === 'OFFLINE_LOCAL_SESSION' ||
+      networkState === 'offline'
+    ) {
+      return;
+    }
+    const rotateTimer = window.setInterval(async () => {
+      try {
+        const resp = await fetch('/api/auth/rotate-session', {
+          method: 'POST',
+          headers: {Authorization: `Bearer ${sessionToken}`},
+        });
+        const parsed = await safeReadJson<{token?: string}>(resp);
+        if (resp.ok && parsed.isJson && parsed.data?.token) {
+          const nextTok = parsed.data.token;
+          persistActiveAuthToken(nextTok);
+          realtimeRef.current?.updateSessionToken(nextTok);
+          setSessionToken(nextTok);
+        }
+      } catch {
+        // Ignore transient rotation errors
+      }
+    }, 30 * 60 * 1000);
+    return () => {
+      window.clearInterval(rotateTimer);
+    };
+  }, [isAuthenticated, sessionToken, networkState]);
 
   const handleSelectNetwork = (nextMode: NetworkState) => {
     const wasOffline = networkState === 'offline';
@@ -280,6 +331,7 @@ export function App() {
     authIdentifierRef.current = session.user.identifier;
     isAuthRef.current = true;
     userRoleRef.current = session.user.role;
+    persistActiveAuthToken(session.token);
     setSessionToken(session.token);
     setAuthUser(session.user);
     setIsAuthenticated(true);
@@ -300,8 +352,12 @@ export function App() {
         setIncentives(localDerivedIncentives);
       }
 
-      // 2. Sync authoritative records & incentives from SQLite server when online
-      if (networkState !== 'offline' && session.token !== 'OFFLINE_LOCAL_SESSION') {
+      // 2. Sync authoritative records & incentives from SQLite server when online and verified
+      if (
+        networkState !== 'offline' &&
+        session.token !== 'OFFLINE_LOCAL_SESSION' &&
+        (session.user.role !== 'ASHA' || session.user.isVerified !== false)
+      ) {
         const [recordsRes, incentivesRes] = await Promise.all([
           fetch('/api/records', {
             headers: {Authorization: `Bearer ${session.token}`},
@@ -378,13 +434,7 @@ export function App() {
     }
   };
 
-  const handleLogout = () => {
-    if (sessionToken && sessionToken !== 'OFFLINE_LOCAL_SESSION') {
-      void fetch('/api/auth/logout', {
-        method: 'POST',
-        headers: {Authorization: `Bearer ${sessionToken}`},
-      }).catch(() => {});
-    }
+  const clearClientSessionState = () => {
     isVaultHydratedRef.current = false;
     isAuthRef.current = false;
     userRoleRef.current = null;
@@ -396,6 +446,7 @@ export function App() {
     authIdentifierRef.current = '';
     sirenEngine.stopSiren();
     setSirenActive(false);
+    persistActiveAuthToken(null);
     setSessionToken('');
     setAuthUser(null);
     setRecords([]);
@@ -403,6 +454,54 @@ export function App() {
     setIsAuthenticated(false);
     setUserRole(null);
     setCurrentView('LOGIN');
+  };
+
+  const handleLogout = () => {
+    if (sessionToken && sessionToken !== 'OFFLINE_LOCAL_SESSION') {
+      void fetch('/api/auth/logout', {
+        method: 'POST',
+        headers: {Authorization: `Bearer ${sessionToken}`},
+      }).catch(() => {});
+    }
+    clearClientSessionState();
+  };
+
+  const handleLogoutAllDevices = () => {
+    if (sessionToken && sessionToken !== 'OFFLINE_LOCAL_SESSION') {
+      void fetch('/api/auth/logout-all', {
+        method: 'POST',
+        headers: {Authorization: `Bearer ${sessionToken}`},
+      }).catch(() => {});
+    }
+    clearClientSessionState();
+  };
+
+  const handleAshaVerified = (rotatedToken?: string) => {
+    setAuthUser((prev) => (prev ? {...prev, isVerified: true} : prev));
+    if (rotatedToken) {
+      persistActiveAuthToken(rotatedToken);
+      setSessionToken(rotatedToken);
+    }
+    flushOfflineQueue();
+  };
+
+  const handleDeleteRecord = async (recordId: string) => {
+    if (!sessionToken || sessionToken === 'OFFLINE_LOCAL_SESSION' || userRole !== 'DMO') return;
+    try {
+      const resp = await fetch(`/api/records/${encodeURIComponent(recordId)}`, {
+        method: 'DELETE',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify({reason: 'DPDP Section 8 authorized DMO erasure'}),
+      });
+      if (resp.ok) {
+        setRecords((prev) => prev.filter((r) => r.id !== recordId));
+      }
+    } catch {
+      // Ignore transient errors
+    }
   };
 
   const handleSaveRecord = (newRecord: TriageRecord, isEmergencySms: boolean) => {
@@ -422,13 +521,26 @@ export function App() {
       return [newIncentive, ...prev];
     });
 
-    if (networkState !== 'offline' && sessionToken !== 'OFFLINE_LOCAL_SESSION') {
+    if (
+      networkState !== 'offline' &&
+      sessionToken !== 'OFFLINE_LOCAL_SESSION' &&
+      authUser?.isVerified !== false
+    ) {
       const triggerSiren = isEmergencySms || newRecord.severity === 'emergency';
       const serverPayload: TriageRecord = {
         ...newRecord,
         syncStatus: isEmergencySms ? 'SMS Delivered' : 'Synced',
       };
-      void realtimeRef.current?.publishRecordCreated(serverPayload, triggerSiren, newIncentive);
+      void realtimeRef.current
+        ?.publishRecordCreated(serverPayload, triggerSiren, newIncentive)
+        .then((res) => {
+          if (res?.ok && res.incentive) {
+            setIncentives((prev) => {
+              const withoutDraft = prev.filter((inc) => inc.id !== newIncentive.id);
+              return mergeIncentivesById([res.incentive!], withoutDraft);
+            });
+          }
+        });
       if (triggerSiren) {
         setSirenActive(true);
         if (!sirenMuted) {
@@ -501,6 +613,7 @@ export function App() {
         onSelectDmoTab={setDmoTab}
         onSelectNetwork={handleSelectNetwork}
         onLogout={handleLogout}
+        onLogoutAllDevices={handleLogoutAllDevices}
       />
 
       {/* STRICT ROUTING GUARD: Unauthenticated users ONLY ever see LOGIN */}
@@ -513,6 +626,8 @@ export function App() {
             ashaDisplayName={authUser.displayName}
             villageCode={authUser.villageCode}
             sessionToken={sessionToken}
+            isAshaVerified={authUser.isVerified !== false}
+            onAshaVerified={handleAshaVerified}
             networkState={networkState}
             records={records}
             incentives={incentives}
@@ -536,6 +651,7 @@ export function App() {
             onTriggerTestSiren={handleTriggerTestSiren}
             onToggleMuteSiren={handleToggleMuteSiren}
             onDispatchAmbulance={handleDispatchAmbulance}
+            onDeleteRecord={handleDeleteRecord}
           />
         ) : (
           <LoginPage networkState={networkState} onAuthenticated={handleAuthenticated} />

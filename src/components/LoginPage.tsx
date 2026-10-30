@@ -16,6 +16,7 @@ import {NetworkState, SUB_CENTER_DIRECTORY} from '../types/triage';
 import {
   hasOfflineLoginVerifier,
   saveOfflineLoginVerifier,
+  validateClientPasscode,
   verifyOfflineLogin,
 } from '../utils/cryptoVault';
 import {isBackendUnavailableResponse, safeReadJson} from '../utils/safeFetchJson';
@@ -28,6 +29,7 @@ export interface AuthenticatedSessionPayload {
     role: 'ASHA' | 'DMO';
     displayName: string;
     villageCode: string;
+    isVerified?: boolean;
   };
   vaultKey: CryptoKey;
   salt: Uint8Array;
@@ -47,11 +49,10 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
   const [displayName, setDisplayName] = useState<string>('');
   const [villageCode, setVillageCode] = useState<string>('VIL-204');
   const [dmoProvisioningCode, setDmoProvisioningCode] = useState<string>('');
+  const [ashaEnrollmentCode, setAshaEnrollmentCode] = useState<string>('');
   const [showSecret, setShowSecret] = useState<boolean>(false);
 
   const [submitting, setSubmitting] = useState<boolean>(false);
-  const [firstRunNotice, setFirstRunNotice] = useState<boolean>(false);
-  const [dmoProvisioningEnabled, setDmoProvisioningEnabled] = useState<boolean | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -60,24 +61,14 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
     fetch('/api/auth/status')
       .then(async (r) => {
         if (!r.ok) return null;
-        const parsed = await safeReadJson<{
-          hasRegisteredUsers?: boolean;
-          dmoProvisioningEnabled?: boolean;
-        }>(r);
-        return parsed.isJson ? parsed.data : null;
+        await safeReadJson<{status?: string}>(r);
+        return null;
       })
-      .then((data) => {
-        if (!cancelled && data) {
-          if (typeof data.dmoProvisioningEnabled === 'boolean') {
-            setDmoProvisioningEnabled(data.dmoProvisioningEnabled);
-          }
-          if (data.hasRegisteredUsers === false) {
-            setFirstRunNotice(true);
-            setAuthMode('REGISTER');
-          }
+      .catch(() => {
+        if (!cancelled) {
+          // Offline / unreachable status probe ignored gracefully
         }
-      })
-      .catch(() => {});
+      });
     return () => {
       cancelled = true;
     };
@@ -97,13 +88,14 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
       return;
     }
 
-    const minSecretLen = activeRole === 'ASHA' ? 4 : 6;
-    if (secret.length < minSecretLen) {
-      setAuthError(
-        activeRole === 'ASHA'
-          ? 'Your PIN must be at least 4 characters long.'
-          : 'Your password must be at least 6 characters long.'
-      );
+    if (authMode === 'REGISTER') {
+      const policy = validateClientPasscode(secret);
+      if (!policy.valid) {
+        setAuthError(policy.error || 'Please enter a stronger passcode (8+ characters with letters & numbers).');
+        return;
+      }
+    } else if (secret.length < 8) {
+      setAuthError('Passcodes and passwords must be at least 8 characters long.');
       return;
     }
 
@@ -120,7 +112,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
     try {
       const provisionLocalAshaAccount = async () => {
         const normalizedId = cleanId.toUpperCase();
-        if (hasOfflineLoginVerifier(normalizedId, 'ASHA')) {
+        if (await hasOfflineLoginVerifier(normalizedId, 'ASHA')) {
           throw new Error(
             `Account "${normalizedId}" is already created on this device. Switch to "Sign In" above.`
           );
@@ -141,6 +133,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
             role: 'ASHA',
             displayName: effectiveName,
             villageCode: effectiveVillage,
+            isVerified: false,
           },
           vaultKey,
           salt,
@@ -148,7 +141,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
       };
 
       const signInWithLocalVerifier = async () => {
-        if (!hasOfflineLoginVerifier(cleanId, activeRole)) {
+        if (!(await hasOfflineLoginVerifier(cleanId, activeRole))) {
           throw new Error(
             activeRole === 'ASHA'
               ? `No saved account found for "${cleanId.toUpperCase()}" on this device while the server is unavailable. Switch to "Create Account" above to set up your Health Worker profile.`
@@ -197,6 +190,9 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
             ...(authMode === 'REGISTER' && activeRole === 'DMO'
               ? {dmoProvisioningCode: dmoProvisioningCode.trim()}
               : {}),
+            ...(authMode === 'REGISTER' && activeRole === 'ASHA' && ashaEnrollmentCode.trim()
+              ? {ashaEnrollmentCode: ashaEnrollmentCode.trim()}
+              : {}),
           }),
         });
       } catch {
@@ -222,6 +218,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
           role: 'ASHA' | 'DMO';
           displayName: string;
           villageCode: string;
+          isVerified?: boolean;
         };
       }>(resp);
 
@@ -242,13 +239,11 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
 
       const data = parsed.data || {};
       if (!resp.ok || !data.token || !data.user) {
-        // If an ASHA worker created her account offline on this device and is now signing in online
-        // for the first time, verify her local PBKDF2-600K PIN and upgrade her account on the server.
         if (
           authMode === 'LOGIN' &&
           activeRole === 'ASHA' &&
           resp.status === 401 &&
-          hasOfflineLoginVerifier(cleanId, 'ASHA')
+          (await hasOfflineLoginVerifier(cleanId, 'ASHA'))
         ) {
           const verifiedLocal = await verifyOfflineLogin({
             identifier: cleanId,
@@ -273,6 +268,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
               role: 'ASHA' | 'DMO';
               displayName: string;
               villageCode: string;
+              isVerified?: boolean;
             };
           }>(syncRegResp);
           if (syncRegResp.ok && syncParsed.isJson && syncParsed.data?.token && syncParsed.data?.user) {
@@ -286,13 +282,13 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
           }
           onAuthenticated({
             token: 'OFFLINE_LOCAL_SESSION',
-            user: verifiedLocal.user,
+            user: {...verifiedLocal.user, isVerified: false},
             vaultKey: verifiedLocal.vaultKey,
             salt: verifiedLocal.salt,
           });
           return;
         }
-        throw new Error(data.error || 'Could not sign in. Please check your ID and password.');
+        throw new Error(data.error || 'Could not sign in. Please check your ID and passcode.');
       }
 
       const {vaultKey, salt} = await saveOfflineLoginVerifier({
@@ -426,19 +422,6 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
               </button>
             </div>
 
-            {firstRunNotice && authMode === 'REGISTER' && (
-              <div
-                role="status"
-                className="mt-4 flex items-start gap-2.5 rounded-xl border border-teal-200 bg-teal-50/70 p-3.5 text-xs leading-relaxed text-teal-900"
-              >
-                <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-teal-700" />
-                <span>
-                  Welcome! Health Workers can create their account directly below. Medical Officer
-                  accounts require District Hospital Admin authorization.
-                </span>
-              </div>
-            )}
-
             {/* Role Selection */}
             <div className="mt-5">
               <span className="mb-2 block text-xs font-semibold text-slate-700">Your Role</span>
@@ -456,6 +439,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
                     setIdentifier('');
                     setSecret('');
                     setDmoProvisioningCode('');
+                    setAshaEnrollmentCode('');
                     setAuthError(null);
                   }}
                   className={`flex min-h-[48px] items-center gap-2.5 rounded-xl border px-3.5 py-2.5 text-left text-sm transition-colors cursor-pointer ${
@@ -481,6 +465,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
                     setIdentifier('');
                     setSecret('');
                     setDmoProvisioningCode('');
+                    setAshaEnrollmentCode('');
                     setAuthError(null);
                   }}
                   className={`flex min-h-[48px] items-center gap-2.5 rounded-xl border px-3.5 py-2.5 text-left text-sm transition-colors cursor-pointer ${
@@ -572,6 +557,30 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
                 </div>
               )}
 
+              {authMode === 'REGISTER' && activeRole === 'ASHA' && (
+                <div>
+                  <label
+                    htmlFor="auth-asha-code-input"
+                    className="mb-1.5 block text-sm font-medium text-slate-800"
+                  >
+                    Clinic Enrollment Code{' '}
+                    <span className="font-normal text-slate-500">(Optional)</span>
+                  </label>
+                  <input
+                    id="auth-asha-code-input"
+                    type="password"
+                    value={ashaEnrollmentCode}
+                    onChange={(e) => setAshaEnrollmentCode(e.target.value)}
+                    placeholder="Enter clinic code for instant verification (or request DMO approval)"
+                    className="min-h-[48px] w-full rounded-xl border border-slate-300 bg-white px-3.5 text-base text-slate-900 placeholder:text-slate-400 focus:border-teal-700 focus:outline-none"
+                  />
+                  <p className="mt-1 text-xs text-slate-500">
+                    Unverified accounts remain pending until verified by a Clinic Enrollment Code or
+                    District Medical Officer.
+                  </p>
+                </div>
+              )}
+
               {authMode === 'REGISTER' && activeRole === 'DMO' && (
                 <div>
                   <label
@@ -590,9 +599,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
                     className="min-h-[48px] w-full rounded-xl border border-slate-300 bg-white px-3.5 text-base text-slate-900 placeholder:text-slate-400 focus:border-teal-700 focus:outline-none"
                   />
                   <p className="mt-1 text-xs text-slate-500">
-                    {dmoProvisioningEnabled === false
-                      ? 'Hospital admin note: Set DMO_PROVISIONING_SECRET (12+ chars) in server Secrets to authorize new Medical Officer registrations.'
-                      : 'Required to verify official Medical Officer privileges before account creation.'}
+                    Required to verify official Medical Officer privileges before account creation.
                   </p>
                 </div>
               )}
@@ -602,7 +609,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
                   htmlFor="auth-secret-input"
                   className="mb-1.5 block text-sm font-medium text-slate-800"
                 >
-                  {activeRole === 'ASHA' ? '4-Digit Security PIN' : 'Account Password'}
+                  {activeRole === 'ASHA' ? 'Security Passcode' : 'Account Password'}
                 </label>
                 <div className="relative">
                   <input
@@ -610,12 +617,9 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
                     type={showSecret ? 'text' : 'password'}
                     value={secret}
                     onChange={(e) => setSecret(e.target.value)}
-                    placeholder={
-                      activeRole === 'ASHA'
-                        ? 'At least 4 digits or characters'
-                        : 'At least 6 characters'
-                    }
+                    placeholder="At least 8 characters (letters & numbers)"
                     required
+                    minLength={8}
                     className="min-h-[48px] w-full rounded-xl border border-slate-300 bg-white pl-3.5 pr-12 text-base text-slate-900 placeholder:text-slate-400 focus:border-teal-700 focus:outline-none"
                   />
                   <button
